@@ -8,6 +8,7 @@ find_package(CUDA)
 find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
+find_package(grid_map_core REQUIRED)
 
 if(NOT ${CUDA_FOUND})
   message(WARNING "cuda was not found, so only autoware::occupancy_grid_map::LaserscanBasedOccupancyGridMapNode will be built.")
@@ -15,11 +16,14 @@ else()
   add_definitions(-DUSE_CUDA)
 endif()
 
+get_target_property(_grid_map_core_includes grid_map_core::grid_map_core INTERFACE_INCLUDE_DIRECTORIES)
+
 include_directories(
   include
   SYSTEM
     ${EIGEN3_INCLUDE_DIR}
     ${grid_map_ros_INCLUDE_DIRS}
+    ${_grid_map_core_includes}
 )
 
 if(${CUDA_FOUND})

@@ -157,6 +157,15 @@
       <let name="input/detection06/channel" value="none"/>
       <!-- camera vru is not used -->
       <let name="input/detection07/channel" value="none"/>
+      <!-- 2026-05-23: Wire euclidean-cluster (lidar_rule_detector) output as detection02
+           channel "lidar_clustering" so that UNKNOWN blobs reach the multi-channel tracker.
+           Previously detection02 was "none" in lidar mode (short-range model slot), which
+           meant euclidean-cluster objects went through lidar_merger → detection/objects but
+           the multi-channel tracker never subscribed to that merged topic — blobs were
+           effectively orphaned. input_channels.param.yaml already defines "lidar_clustering"
+           with can_spawn_new_tracker: true. -->
+      <let name="input/detection02/channel" value="lidar_clustering"/>
+      <let name="input/detection02/objects" value="/perception/object_recognition/detection/clustering/objects"/>
     </group>
 
     <!-- radar -->

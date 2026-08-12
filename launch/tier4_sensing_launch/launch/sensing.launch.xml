@@ -3,6 +3,8 @@
   <arg name="sensor_model" default="sample_sensor_kit" description="sensor model name"/>
   <arg name="vehicle_mirror_param_file" default="$(find-pkg-share autoware_vehicle_info_utils)/config/vehicle_mirror.param.yaml" description="path to the file of vehicle mirror position yaml"/>
   <arg name="pointcloud_container_name" default="pointcloud_container"/>
+  <arg name="map_path" default=""/>
+  <arg name="lanelet2_map_file" default="lanelet2_map.osm"/>
 
   <let name="sensor_launch_pkg" value="$(find-pkg-share $(var sensor_model)_launch)"/>
 
@@ -14,6 +16,8 @@
       <arg name="launch_driver" value="$(var launch_driver)"/>
       <arg name="vehicle_mirror_param_file" value="$(var vehicle_mirror_param_file)"/>
       <arg name="pointcloud_container_name" value="$(var pointcloud_container_name)"/>
+      <arg name="map_path" value="$(var map_path)"/>
+      <arg name="lanelet2_map_file" value="$(var lanelet2_map_file)"/>
     </include>
   </group>
 </launch>

@@ -1,0 +1,128 @@
+/**:
+  ros__parameters:
+    # -------------------------------------------------------------------
+    # Timer rate
+    # -------------------------------------------------------------------
+    update_rate_hz: 10.0                # [Hz] FSM tick frequency
+
+    # -------------------------------------------------------------------
+    # IDLE → ARMED_CROSSWALK trigger
+    # -------------------------------------------------------------------
+    arm_hops_max: 3                     # look-ahead hops via getNextLanelets() to find tagged lanelets
+
+    # -------------------------------------------------------------------
+    # ARMED_CROSSWALK → CROSSWALK_OK / REROUTING_TO_ALT
+    # -------------------------------------------------------------------
+    crosswalk_min_confidence: 0.5       # [-] CrosswalkDetection.confidence threshold
+    fail_distance_m: 2.0                # [m] ego-to-crossing-entry distance below which the
+                                        #     reroute_after_sec timer starts (robot near/stopped at pre)
+    reroute_after_sec: 15.0             # [s] how long to wait at the pre stop without crosswalk
+                                        #     detection before initiating reroute.
+                                        #     (Replaces old fail_consecutive_sec: 2.0 s which was
+                                        #      too aggressive; 15 s gives the detector a fair window.)
+
+    # -------------------------------------------------------------------
+    # WAIT_GREEN: counter berbasis waktu untuk kondisi "tidak mendeteksi lampu"
+    # -------------------------------------------------------------------
+    light_detect_timeout_sec: 10.0      # [s] durasi terus-menerus TIDAK mendeteksi lampu (NONE atau
+                                        #     detektor diam) sebelum nyerah & lanjut/GO.
+                                        #     Deteksi RED/GREEN/BLANK mereset counter ini sehingga
+                                        #     selama lampu merah robot menunggu GREEN selamanya (benar).
+                                        #     Hanya persistent tidak-deteksi yang memicu fallback GO.
+
+    # -------------------------------------------------------------------
+    # GREEN states (PedestrianLightState.state values treated as go)
+    # 2=GREEN, 3=COUNTDOWN_GREEN
+    # -------------------------------------------------------------------
+    green_states: [2, 3]
+
+    # -------------------------------------------------------------------
+    # Re-route to alternate crossing (two-phase reroute)
+    # Phase A (REROUTING_TO_ALT): send robot to nearest alternate_road_crossing lanelet.
+    # Phase B (REROUTING_TO_GOAL): restore original goal once ego has left the pre stop.
+    # -------------------------------------------------------------------
+    reroute_enabled: true               # if false, skip REROUTING_TO_ALT and fall through to ARMED_LIGHT
+    reroute_cooldown_sec: 60.0          # [s] minimum interval between re-routes (prevents rapid retries)
+    reroute_min_time_sec: 5.0           # [s] minimum elapsed time in REROUTING_TO_ALT step3 (robot
+                                        #     moving toward alternate) before transitioning to
+                                        #     REROUTING_TO_GOAL.  Prevents immediate snap-back when
+                                        #     the route changes but the robot hasn't physically moved yet.
+    reroute_min_dist_m: 5.0             # [m] minimum distance ego must have moved from the pre entry
+                                        #     before transitioning to REROUTING_TO_GOAL.  Measured by
+                                        #     distanceToPreEntry() (grows as ego moves away from pre).
+                                        #     If active_pre_id_ is null (no pre lanelet), this gate
+                                        #     is bypassed and only reroute_min_time_sec applies.
+    engage_retry_sec: 2.0               # [s] minimum interval between change_to_autonomous retry calls
+                                        #     in reroute step-2.  Engage is retried periodically until
+                                        #     operation mode is confirmed AUTONOMOUS (mode==2).
+                                        #     Prevents spamming the service every 0.1 s tick.
+
+    # -------------------------------------------------------------------
+    # Topic / service names (defaults match the interface contract)
+    # -------------------------------------------------------------------
+    topic_crosswalk_detection:   "/perception/road_crossing/crosswalk_detection"
+    topic_pedestrian_light:      "/perception/road_crossing/pedestrian_light"
+    topic_gate:                  "/planning/road_crossing/gate"
+    topic_fsm_state:             "/planning/road_crossing/fsm_state"
+    topic_route:                 "/planning/mission_planning/route"
+    topic_map:                   "/map/vector_map"
+    topic_ego_pose:              "/localization/kinematic_state"
+    srv_crosswalk_detector:      "/perception/road_crossing/crosswalk_detector/enable"
+    srv_ped_light_detector:      "/perception/road_crossing/pedestrian_light_detector/enable"
+    srv_rotary_aimer:            "/rotary_aimer/enable"
+
+    # -------------------------------------------------------------------
+    # Rotary aimer spam-enable (skema baru)
+    # Kirim enable berulang ke rotary_aimer setiap aim_enable_retry_sec selama robot
+    # berada di pre lanelet (waiting state) dan aimer belum publishing (cmd stale).
+    # "at_pre" ditentukan dari topologi lanelet: current lanelet harus pre_road_crossing
+    # DAN next lanelet dalam route harus road_crossing — deterministic, bukan heuristik kecepatan.
+    # Berhenti spam setelah aimer publish pesan (cmd fresh → running confirmed).
+    # -------------------------------------------------------------------
+    topic_rotary_angle_cmd:  "/control/rotary_angle_cmd"
+                                        # Topik output rotary aimer (std_msgs/Float32).
+                                        # Dipakai untuk deteksi apakah aimer sudah running.
+    aim_cmd_fresh_sec:       0.5        # [s] pesan aim_cmd dianggap fresh jika lebih muda dari ini.
+                                        # Jika fresh → aimer running → spam enable berhenti.
+    aim_enable_retry_sec:    0.3        # [s] interval minimum antar kiriman enable ke rotary_aimer.
+                                        # Cukup sering agar enable tidak missed, tidak terlalu padat.
+
+    # -------------------------------------------------------------------
+    # Rotary aimer APPROACH phase (baru)
+    # Sebelum robot tiba di pre, FSM sudah mengaktifkan aimer dan mengirim centroid
+    # road_crossing sebagai target eksternal ke /rotary_aimer/aim_target agar kamera
+    # langsung menghadap crosswalk (YOLO always-on bisa mendeteksi sejak jauh).
+    # Begitu robot masuk pre (at_pre), pengiriman target berhenti → aimer fallback ke
+    # tf_pedestrian_light (perilaku lama tidak berubah).
+    # -------------------------------------------------------------------
+    aim_approach_dist_m:  10.0          # [m] jarak dari pre entry di mana FSM mulai aim centroid
+                                        # road_crossing (fase APPROACH). Aimer diaktifkan dan
+                                        # centroid crosswalk dikirim ke topic_aim_target.
+                                        # Di pre: kirim target berhenti → aimer aim lampu.
+    topic_aim_target:  "/rotary_aimer/aim_target"
+                                        # Topik PointStamped (map frame) target eksternal aimer.
+
+    # -------------------------------------------------------------------
+    # Crosswalk detector lazy-enable by distance
+    # Enable crosswalk_detector saat robot dalam jarak crosswalk_enable_dist_m dari pre
+    # entry — LEBIH AWAL dari aimer (aim_approach_dist_m=10 m) sehingga detektor sudah
+    # running dan warm sebelum kamera aim ke crosswalk.
+    # ~2× aim_approach_dist_m adalah nilai yang reasonable untuk head-start detection.
+    # Jika crossing tagged disable_crosswalk_check, enable TIDAK dikirim (sama seperti dulu).
+    # -------------------------------------------------------------------
+    crosswalk_enable_dist_m:  20.0      # [m] jarak ke pre entry untuk mulai enable crosswalk_detector
+                                        # — ~2× aim_approach_dist_m, biar detektor sudah jalan
+                                        # sebelum kamera aim ke crosswalk.
+
+    # -------------------------------------------------------------------
+    # Position gates (mencegah FSM maju sebelum robot tiba di lokasi)
+    # Memperbaiki bug: FSM balapan ke CROSSING saat robot masih di start (jauh dari crossing).
+    # -------------------------------------------------------------------
+    pre_arrive_dist_m:       3.0        # [m] ego dianggap "sudah di pre" jika distanceToPreEntry()
+                                        #     berada di rentang [0, pre_arrive_dist_m].
+                                        #     Harus >= pre_stop_dist_m (≈2.0 m) agar gate aktif
+                                        #     saat robot sudah berhenti di pre-stop.
+                                        #     Gate ARMED_CROSSWALK: tahan sampai at_pre = true.
+    crossing_arrive_dist_m:  1.5        # [m] ego dianggap "sudah di crossing" jika
+                                        #     distanceToCrossingEntry() berada di [0, crossing_arrive_dist_m].
+                                        #     Gate WAIT_GREEN: tahan sampai at_crossing = true.

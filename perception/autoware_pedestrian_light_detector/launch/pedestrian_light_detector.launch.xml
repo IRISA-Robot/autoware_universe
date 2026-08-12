@@ -1,0 +1,42 @@
+<!--
+  Copyright 2024 azzamwildan462
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+
+  Launch: autoware_pedestrian_light_detector (Phase 1 MOCK)
+
+  Node runs under namespace /perception/road_crossing so that the node name
+  becomes /perception/road_crossing/pedestrian_light_detector.
+  Service and topic use absolute names (prefixed '/') so they resolve to
+  exactly the contract paths regardless of any namespace.
+-->
+<launch>
+  <arg name="use_sim_time" default="false"/>
+  <arg name="param_file"
+       default="$(find-pkg-share autoware_pedestrian_light_detector)/config/pedestrian_light_detector.param.yaml"/>
+  <!-- backend selector: run script baca dari param_file lalu pass ke sini (atau via env
+       RC_PL_BACKEND). Selalu di-set (override param_file dgn nilai yang sama). Default 'hsv'
+       buat pemakaian standalone tanpa run script. -->
+  <arg name="backend" default="hsv"/>
+
+  <node
+    pkg="autoware_pedestrian_light_detector"
+    exec="pedestrian_light_detector_node"
+    name="pedestrian_light_detector"
+    namespace="/perception/road_crossing"
+    output="screen">
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
+    <param from="$(var param_file)"/>
+    <param name="backend" value="$(var backend)"/>
+  </node>
+</launch>

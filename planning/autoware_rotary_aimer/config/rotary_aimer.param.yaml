@@ -1,0 +1,63 @@
+/**:
+  ros__parameters:
+    # Path to the lanelet2 OSM map file containing tf_pedestrian=true ways.
+    map_path: "/home/ubuntu/sim_ws/maps/map1/lanelet2_map.osm"
+
+    # TF frames
+    base_frame: "base_link"
+    map_frame: "map"
+
+    # Output topic — Float32 (rad) consumed by irisa_aio -> gama_mw PID
+    output_topic: "/control/rotary_angle_cmd"
+
+    # Rotary position feedback topic — Float32 (rad), same sign convention as output_topic.
+    # Published by gama_mw_interface (real HW) and gama_hw_mock (simulation).
+    # Used to seed the slew ramp on activation so the platform never jumps on enable.
+    feedback_topic: "/gama/feedback/rotary"
+
+    # Service name for enable/disable (relative to node namespace by default)
+    enable_service: "~/enable"
+
+    # Control loop rate [Hz]
+    rate_hz: 10.0
+
+    # Subtract from raw bearing if front camera is NOT aligned with platform +X axis.
+    # Positive = camera is rotated CCW from +X by this many radians.
+    # Default 0.0 = front camera is exactly along platform +X.
+    front_cam_offset_rad: 0.0
+
+    # If true, negate the output angle (mechanical sign flip).
+    # Default false.  Set true if platform rotates in the wrong direction.
+    invert_sign: false
+
+    # If true, start the aim loop immediately at node startup (no service call needed).
+    start_enabled: false
+
+    # If true, publish 0.0 (platform back to front) when disabled.
+    zero_on_disable: true
+
+    # Number of times to repeat the 0.0 command when disabling.
+    zero_repeat_count: 5
+
+    # Interval (seconds) between repeated 0.0 commands.
+    zero_repeat_period_s: 0.1
+
+    # Laju ramp aim ke lampu [rad/s] — kecepatan sudut saat platform mengarah ke traffic light.
+    # Naik = pergerakan cepat tapi kasar; turun = halus tapi lambat.
+    # Nilai 0.1 rad/s (~5.7 deg/s) — 10x lebih lambat dari default lama (1.0).
+    max_angle_rate_rad_s: 0.3
+
+    # Laju ramp balik ke 0 pas selesai/disable [rad/s] — sengaja sangat lambat biar smooth.
+    # Contoh: dari 0.8 rad ke 0 butuh ~20 detik — ini disengaja agar transisi halus.
+    zero_rate_rad_s: 0.04
+
+    # Topik external target dari FSM saat approach ke crosswalk (geometry_msgs/PointStamped,
+    # frame map).  FSM mempublish centroid lanelet road_crossing ke sini supaya kamera
+    # diarahkan ke titik lintasan sebelum mulai baca lampu.
+    # Kalau ga ada target fresh (timeout), node fallback ke lampu tf_pedestrian dari OSM.
+    target_topic: "~/aim_target"
+
+    # Durasi maksimum [detik] sebuah external target dianggap masih fresh.
+    # Kalau FSM berhenti publish (misal sudah lewat fase approach), target expired
+    # dan node otomatis fallback ke mode lampu tf_pedestrian.
+    target_fresh_sec: 0.5

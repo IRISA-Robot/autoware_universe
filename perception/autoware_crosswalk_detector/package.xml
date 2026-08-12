@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>autoware_crosswalk_detector</name>
+  <version>0.2.0</version>
+  <description>
+    Phase 2 REAL crosswalk detector — YOLOv8 via TensorRT (TrtCommon) untuk pipeline road-crossing v2.
+    Mempublikasikan CrosswalkDetection ke /perception/road_crossing/crosswalk_detection.
+    Menggantikan Phase 1 mock (ament_python) dengan node C++ ament_cmake.
+  </description>
+
+  <maintainer email="azzamwildan5@gmail.com">azzamwildan462</maintainer>
+
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
+  <buildtool_depend>autoware_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>image_transport</depend>
+  <depend>autoware_road_crossing_msgs</depend>
+  <depend>autoware_tensorrt_common</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

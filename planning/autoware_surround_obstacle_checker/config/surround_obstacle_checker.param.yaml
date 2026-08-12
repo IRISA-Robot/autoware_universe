@@ -4,12 +4,12 @@
     # surround_check_*_distance: if objects exist in this distance, transit to "exist-surrounding-obstacle" status [m]
     # surround_check_hysteresis_distance: if no object exists in this hysteresis distance added to the above distance, transit to "non-surrounding-obstacle" status [m]
     pointcloud:
-      enable_check: false
+      enable_check: true  # 2026-05-23: defensive net — any non-ground point within 0.5m stops resume-from-stop, catches unknowns that never get tracked
       surround_check_front_distance: 0.5
       surround_check_side_distance: 0.5
       surround_check_back_distance: 0.5
     unknown:
-      enable_check: false
+      enable_check: true  # 2026-05-23: was false — sidewalk unknowns (trees, poles, chairs) must block resumption from stop
       surround_check_front_distance: 0.5
       surround_check_side_distance: 0.5
       surround_check_back_distance: 0.5

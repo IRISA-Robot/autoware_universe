@@ -13,7 +13,12 @@
     # If the number of consecutive invalid trajectory exceeds this threshold, the Diag will be set to ERROR.
     # (For example, threshold = 1 means, even if the trajectory is invalid, Diag will not be ERROR if
     #  the next trajectory is valid.)
-    diag_error_count_threshold: 0
+    # At 10 Hz planning rate, threshold=3 means a transient must persist ≥300 ms before escalating
+    # to ERROR in diag_graph → prevents single-frame MPC glitches from cascading into MRM cycling.
+    # This is the debounce / hysteresis gate for trajectory_validation diagnostics.
+    # Tunable via tuning-engineer; default 3 balances safety (0.3 s) vs. responsiveness.
+    # Also exposed as "min_consecutive_invalid_count" alias in launch param overrides.
+    diag_error_count_threshold: 3
     display_on_terminal: true # show error msg on terminal
 
     # if handling type is 2 (use last valid traj with soft stop), the following parameters are used to

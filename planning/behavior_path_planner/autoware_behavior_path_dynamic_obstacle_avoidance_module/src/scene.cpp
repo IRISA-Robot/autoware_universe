@@ -23,6 +23,7 @@
 #include <autoware_lanelet2_extension/utility/utilities.hpp>
 #include <autoware_utils/geometry/geometry.hpp>
 
+#include <boost/geometry/algorithms/area.hpp>
 #include <boost/geometry/algorithms/buffer.hpp>
 #include <boost/geometry/algorithms/convex_hull.hpp>
 #include <boost/geometry/algorithms/correct.hpp>
@@ -1899,6 +1900,14 @@ DynamicObstacleAvoidanceModule::calcEgoPathReservePoly(const PathWithLaneId & eg
     boost::geometry::buffer(
       ego_path_lines, path_poly, path_expand_strategy, strategy::side_straight(),
       strategy::join_round(), strategy::end_flat(), strategy::point_circle());
+    // GUARD (2026-05-26): degenerate ego_path_lines (single/coincident points) produces
+    // an empty buffer result. Returning empty Polygon2d is safe downstream (used as the
+    // second argument to boost::geometry::difference which is a no-op against empty).
+    // Without this guard, output_poly[0] below would SIGSEGV. See crash A in
+    // docs/research/autoware-planner-crash-fix.md.
+    if (path_poly.empty()) {
+      return {};
+    }
 
     // reserve area steer to the avoidance path
     autoware_utils::LineString2d steer_lines;
@@ -1914,14 +1923,32 @@ DynamicObstacleAvoidanceModule::calcEgoPathReservePoly(const PathWithLaneId & eg
       // boost::geometry::append(steer_lines, bg_point);
     }
     autoware_utils::MultiPolygon2d steer_poly;
-    boost::geometry::buffer(
-      steer_lines, steer_poly, steer_expand_strategy, strategy::side_straight(),
-      strategy::join_round(), strategy::end_flat(), strategy::point_circle());
+    // GUARD: steer_lines is always empty in the current implementation (the
+    // boost::geometry::append calls above are intentionally commented out).
+    // Buffer of empty LineString2d yields empty steer_poly. Skip the buffer call
+    // entirely to avoid corner cases inside boost::geometry on degenerate input.
+    if (!steer_lines.empty()) {
+      boost::geometry::buffer(
+        steer_lines, steer_poly, steer_expand_strategy, strategy::side_straight(),
+        strategy::join_round(), strategy::end_flat(), strategy::point_circle());
+    }
 
     autoware_utils::MultiPolygon2d output_poly;
     boost::geometry::union_(path_poly, steer_poly, output_poly);
-    if (output_poly.size() != 1) {
-      assert(false);
+    // GUARD: union of two non-empty polygons can still produce 0 (numerically degenerate)
+    // or >1 (disjoint) results — both must not crash.
+    if (output_poly.empty()) {
+      // Fall back to the path polygon directly; path_poly is non-empty per guard above.
+      return path_poly.front();
+    }
+    if (output_poly.size() > 1) {
+      // Disjoint components — pick the largest (most conservative reserve area).
+      const auto largest = std::max_element(
+        output_poly.begin(), output_poly.end(),
+        [](const auto & a, const auto & b) {
+          return boost::geometry::area(a) < boost::geometry::area(b);
+        });
+      return *largest;
     }
     return output_poly[0];
   };

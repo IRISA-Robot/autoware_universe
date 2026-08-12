@@ -1,0 +1,38 @@
+/**:
+  ros__parameters:
+    road_crossing:
+      # State machine
+      stop_distance_threshold: 5.0      # [m] APPROACHING → STOPPING when ego is within this of stop_line
+      stop_arrival_threshold: 0.2       # [m] STOPPING → CHECKING when ego is this close to stop_line
+      stop_state_speed: 0.05            # [m/s] "ego stopped" threshold
+      sustained_clear_sec: 1.5          # [s] hysteresis: stay clear this long before releasing
+      timeout_sec: 30.0                 # [s] after this much waiting, log WARN
+
+      # Prediction check
+      predict_horizon_sec: 3.0          # [s] how far ahead to scan predicted_paths
+      min_confidence: 0.5               # [-] drop predicted_paths below this confidence
+      enable_dynamic_horizon: true      # extend horizon to cover full crossing time (max of static + L/v)
+      crossing_speed_for_horizon: 0.833 # [m/s] used when computing dynamic horizon (≈3 km/h)
+
+      # Object class filter — only these labels block the crossing.
+      # ObjectClassification enum: UNKNOWN=0 CAR=1 TRUCK=2 BUS=3 TRAILER=4 MOTORCYCLE=5 BICYCLE=6 PEDESTRIAN=7
+      # Per design: vehicles only (we cross alongside pedestrians/bicycles)
+      block_on_car: true
+      block_on_truck: true
+      block_on_bus: true
+      block_on_trailer: true
+      block_on_motorcycle: true
+      block_on_bicycle: false
+      block_on_pedestrian: false
+      block_on_unknown: true  # true: perception platform ini output UNKNOWN untuk semua object, jadi harus block UNKNOWN supaya stop berfungsi
+      stop_margin: 0.5        # [m] jarak stop sebelum stop_line untuk instance ROAD — wiring field PlannerParam::stop_margin
+      pre_stop_dist_m: 2.0    # [tuned] 1.0→2.0: robot stop 2m sebelum pre (buffer lebih besar dari residual gerak/localization jitter; tetap di parent/fork buat reroute alternate). [m] jarak fisik bagian depan robot ke entry polygon pre_road_crossing. Robot berhenti di parent lanelet (titik fork) supaya reroute ke alternate masih bisa dilakukan. (Hanya berlaku untuk instance PRE; instance ROAD tetap pakai stop_margin.)
+
+      # FSM gate integration
+      # require_fsm_gate: false → original behaviour (backward compatible).
+      # require_fsm_gate: true  → CHECKING → CROSSING only when FSM gate == GO.
+      require_fsm_gate: true  # [phase2-test] true: aktifkan dua gated-stop (pre + road). WAJIB jalankan road_crossing_v2.launch.xml (FSM node), kalau tidak robot nyangkut di stop nunggu gate.
+      gate_topic: "/planning/road_crossing/gate"
+      # [ROAD, hijau] tunggu maksimal N detik kalau predicted-path kendaraan nge-block sebelum nyebrang anyway;
+      # 0.0 = langsung nyebrang pas hijau; besar = nunggu kendaraan clear lebih lama.
+      green_block_timeout_sec: 2.0

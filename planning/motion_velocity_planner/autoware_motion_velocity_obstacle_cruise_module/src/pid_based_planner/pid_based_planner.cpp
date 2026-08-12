@@ -38,8 +38,8 @@ namespace autoware::motion_velocity_planner
 namespace
 {
 VelocityLimit create_velocity_limit_message(
-  const rclcpp::Time & current_time, const double vel, const double acc, const double max_jerk,
-  const double min_jerk)
+  const rclcpp::Time & current_time, const double vel, const double acc, const double max_accel,
+  const double max_jerk, const double min_jerk)
 {
   VelocityLimit msg;
   msg.stamp = current_time;
@@ -50,6 +50,10 @@ VelocityLimit create_velocity_limit_message(
   if (acc < 0) {
     msg.constraints.min_acceleration = acc;
   }
+  // Always set max_acceleration to the vehicle's configured limit so the velocity
+  // smoother can still accelerate up to the cruise speed cap. Leaving it at the
+  // message default of 0.0 permanently forbids acceleration from standstill.
+  msg.constraints.max_acceleration = max_accel;
   msg.constraints.max_jerk = max_jerk;
   msg.constraints.min_jerk = min_jerk;
 
@@ -460,7 +464,8 @@ VelocityLimit PIDBasedPlanner::plan_cruise_with_velocity_limit(
 
   // set target longitudinal motion
   const auto velocity_limit = create_velocity_limit_message(
-    clock_->now(), positive_target_vel, target_acc, common_param_.max_jerk, common_param_.min_jerk);
+    clock_->now(), positive_target_vel, target_acc, common_param_.max_accel,
+    common_param_.max_jerk, common_param_.min_jerk);
 
   return velocity_limit;
 }

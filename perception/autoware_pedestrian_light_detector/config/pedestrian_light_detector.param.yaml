@@ -1,0 +1,185 @@
+/**:
+  ros__parameters:
+    # ==========================================================================
+    # Parameter lama (tetap ada untuk kompatibilitas FSM)
+    # ==========================================================================
+
+    # start_enabled: jika true, node langsung mulai publish saat start tanpa
+    # perlu memanggil service /enable.
+    # Naikkan ke true untuk testing; di produksi biarkan false (FSM yang enable).
+    start_enabled: false
+
+    # force_state: state yang dipublish saat backend='force' (mock mode).
+    # 0=NONE, 1=RED, 2=GREEN, 3=COUNTDOWN_GREEN, 4=COUNTDOWN_BLANK
+    force_state: 2
+
+    # force_confidence: confidence yang dipublish saat backend='force'.
+    force_confidence: 0.9
+
+    # publish_rate_hz: frekuensi timer publish UTAMA (Hz) — klasifikasi + state msg.
+    # Turunkan jika CPU tinggi; naikkan untuk respons lebih cepat ke FSM.
+    publish_rate_hz: 10.0
+
+    # ==========================================================================
+    # Parameter Fase 1 — HSV + camera pipeline
+    # ==========================================================================
+
+    # backend: pilih mode classifier.
+    #   'hsv'   -> HSV color classification real dari camera (default)
+    #   'force' -> mock: publish force_state tetap, tanpa camera sub
+    #   'lytnet'-> belum tersedia (Fase 3)
+    backend: "hsv"
+
+    # camera_topic: topic Image yang digunakan saat roi_source=full|static
+    # (Fase 1, single-camera path). Diabaikan jika roi_source=map.
+    camera_topic: "/camera/front/image_raw"
+
+    # roi_source: cara menentukan region-of-interest pada frame.
+    #   'full'   -> seluruh frame diproses
+    #   'static' -> crop statis dari param static_roi
+    #   'map'    -> Fase 2: proyeksi dari lanelet2 map + multi-camera (default baru)
+    # Turunkan ke 'static' jika tf tidak tersedia (robot offline / tanpa localization).
+    roi_source: "map"
+
+    # static_roi: [x, y, w, h] crop box untuk roi_source=static.
+    # Jika semua nilai <= 1.0: FRAKSI dari dimensi frame.
+    # Jika ada nilai > 1.0: PIKSEL absolut.
+    static_roi: [0.25, 0.0, 0.5, 0.5]
+
+    # ==========================================================================
+    # Parameter HSV classifier
+    # ==========================================================================
+
+    # -----------------------------------------------------------------------
+    # TUNING NOTE (2026-06-06):
+    # Merah dilebarin krn rentang hue merah sempit + lampu sim agak oranye /
+    # terang-desaturasi sehingga jatuh di luar mask lama.
+    # Nilai ini bisa di-fine-tune live lewat GUI tuner sambil lihat border
+    # debug berubah ke merah (enable_debug_image: true).
+    # -----------------------------------------------------------------------
+
+    # red_hue_lo_max: batas atas hue merah di rentang rendah (0..N).
+    # Dinaikkan 10→18 agar oranye-ish (H≈11-18) masuk sebagai merah.
+    # Turunkan kembali jika false positive orange meningkat.
+    red_hue_lo_max: 18
+
+    # red_hue_hi_min: batas bawah hue merah di rentang tinggi (N..179).
+    # Diturunkan 170→160 agar pink/magenta-ish (H≈160-169) masuk sebagai merah.
+    red_hue_hi_min: 160
+
+    # green_hue_lo: batas bawah hue hijau.
+    green_hue_lo: 40
+
+    # green_hue_hi: batas atas hue hijau.
+    green_hue_hi: 90
+
+    # s_min: saturasi minimum (0-255). Filter warna pudar/putih/abu.
+    # Diturunkan 80→60 agar inti lampu merah yang terang-desaturasi tetap lolos.
+    s_min: 60
+
+    # v_min: value (kecerahan) minimum (0-255). Filter area gelap.
+    # Diturunkan 80→60 agar reds yang sedikit lebih gelap ikut terdeteksi.
+    v_min: 60
+
+    # min_area: luas blob minimum dalam piksel^2 (noise filter).
+    min_area: 20
+
+    # ==========================================================================
+    # Anti-flicker smoothing
+    # ==========================================================================
+
+    # stable_frames: jumlah frame berturut-turut yang harus sepakat
+    # sebelum state di-commit ke output.
+    stable_frames: 3
+
+    # min_confidence: confidence minimum agar state baru di-commit.
+    # 0.0 = tidak ada syarat confidence.
+    min_confidence: 0.0
+
+    # ==========================================================================
+    # Debug
+    # ==========================================================================
+
+    # enable_debug_image: publish frame dengan overlay ROI/bbox + label
+    # ke topic ~/debug/image. Matikan di produksi untuk hemat bandwidth.
+    enable_debug_image: true
+
+    # debug_all_cameras: publish debug image untuk SEMUA kamera yang dikonfigurasi
+    # (~/debug/<cam>/image) sehingga user bisa melihat di kamera mana proyeksi
+    # lampu pejalan kaki tidak sejajar ("mbleset"). Hanya aktif di roi_source=map.
+    # Sekarang AMAN di-nyalakan karena dibatasi oleh debug_rate_hz (lihat bawah).
+    # Set false untuk benar-benar mematikan overhead di produksi.
+    debug_all_cameras: true
+
+    # debug_rate_hz: frekuensi timer lambat khusus debug_all_cameras (Hz).
+    # Decode cv_bridge + draw + publish semua kamera dilakukan di timer ini,
+    # BUKAN di image callback, sehingga beban berat terbatas di:
+    #   debug_rate_hz x jumlah_kamera  (mis. 2 x 4 = 8 decode/s)
+    # Naikkan debug_rate_hz kalau mau lebih real-time tapi lebih berat;
+    # all-camera debug emang berat — matiin debug_all_cameras buat produksi.
+    debug_rate_hz: 2.0
+
+    # debug_downscale: faktor skala resolusi output debug image (0 < nilai <= 1.0).
+    # Mis. 0.5 = setengah resolusi sebelum dipublish ke ~/debug/<cam>/image.
+    # Potong bandwidth dan biaya render RViz; 1.0 = resolusi penuh (tidak di-resize).
+    debug_downscale: 1.0
+
+    # ==========================================================================
+    # Parameter Fase 2 — map-based ROI projector (roi_source=map)
+    # ==========================================================================
+
+    # map_path: path absolut ke file lanelet2 OSM.
+    # Node akan mem-parse way dengan tag tf_pedestrian="true" dari file ini.
+    # Parse dilakukan sekali saat startup (map dianggap statis).
+    map_path: "/home/ubuntu/sim_ws/maps/map1/lanelet2_map.osm"
+
+    # cameras: daftar nama kamera yang dimonitor untuk proyeksi.
+    # Untuk setiap nama N, node men-subscribe:
+    #   /camera/<N>/camera_info  (selalu, saat enabled — ringan)
+    #   /camera/<N>/image_raw    (hanya kamera TERPILIH — hemat BW; untuk klasifikasi)
+    #   /camera/<N>/image_raw    (semua kamera, tapi HANYA simpan raw msg — ringan)
+    # Kamera dipilih berdasarkan lampu paling dekat yang masuk FOV-nya.
+    # Kurangi list jika beberapa kamera tidak tersedia untuk hemat resource.
+    cameras: ["front", "left", "rear", "right"]
+
+    # roi_margin_px: margin piksel yang ditambahkan ke setiap sisi bbox proyeksi
+    # (padded bbox untuk crop ke classifier). Naikkan jika lampu terpotong.
+    # Geometric gate memastikan objek besar di margin ini tetap ditolak.
+    roi_margin_px: 40
+
+    # ==========================================================================
+    # Parameter Geometric Gate — anti false-positive oleh objek melintas
+    # ==========================================================================
+
+    # light_radius_m: radius fisik muka lampu pejalan kaki dalam meter.
+    # Dipakai untuk membangun tight_bbox (kotak ketat proyeksi lampu fisik)
+    # dari depth kamera + focal length. Lampu pejalan kaki khas: 0.15–0.20 m.
+    # Turunkan jika tight_bbox terlalu lebar; naikkan jika centroid tidak masuk.
+    light_radius_m: 0.15
+
+    # geom_gate_enabled: aktifkan geometric gate.
+    # True (default) = blob warna harus lolos validasi geometris (centroid + ukuran).
+    # False = perilaku lama tanpa gate (hanya untuk debug/fallback).
+    geom_gate_enabled: true
+
+    # geom_require_centroid: jika true, centroid blob terbesar HARUS berada di
+    # dalam tight_bbox. Bus melintas punya centroid di luar area lampu.
+    # False = gate hanya cek fraksi ukuran (lebih longgar).
+    geom_require_centroid: true
+
+    # geom_max_blob_fraction: fraksi maksimum luas tight_bbox yang boleh ditempati
+    # blob warna. Bus/kendaraan hijau mengisi > 0.75 → ditolak.
+    # Lampu bulat pada jarak 5–15 m biasanya mengisi ~0.05–0.4 tight_bbox.
+    # Naikkan sedikit jika lampu besar atau jarak sangat dekat.
+    geom_max_blob_fraction: 0.75
+
+    # geom_min_blob_fraction: fraksi minimum blob terhadap tight_bbox.
+    # Di bawah ini dianggap noise — bukan lampu asli. 0.0 = tidak ada syarat.
+    # Classifier min_area biasanya sudah cukup; ini lapisan tambahan.
+    geom_min_blob_fraction: 0.02
+
+    # tight_box_height_scale: skala tinggi tight-box utk lampu figur 2-lamp
+    # [merah atas/hijau bawah]; pakai 2.0 biar nutupin dua-duanya; kalau way
+    # punya tag height [meter], itu yg dipakai dan scale diabaikan.
+    # Nilai di bawah 1.0 di-clamp ke 1.0 di node.
+    tight_box_height_scale: 2.0

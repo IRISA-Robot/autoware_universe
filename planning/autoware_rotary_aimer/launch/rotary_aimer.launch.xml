@@ -1,0 +1,38 @@
+<!-- rotary_aimer.launch.xml
+     Launches rotary_aimer_node with its default parameter file.
+     The node starts DISABLED (start_enabled: false) by default.
+     Enable manually with:
+       ros2 service call /rotary_aimer/enable std_srvs/srv/SetBool "{data: true}"
+-->
+<launch>
+  <!-- Optional: override param file via launch arg -->
+  <arg name="param_file"
+       default="$(find-pkg-share autoware_rotary_aimer)/config/rotary_aimer.param.yaml"/>
+
+  <!-- Optional: override map path via launch arg (convenience shortcut) -->
+  <arg name="map_path"
+       default="/home/ubuntu/sim_ws/maps/map1/lanelet2_map.osm"/>
+
+  <!-- Optional: start enabled -->
+  <arg name="start_enabled" default="false"/>
+
+  <!-- Sim time (true saat jalan di Isaac sim) -->
+  <arg name="use_sim_time" default="false"/>
+
+  <!-- External aim target topic dari FSM (road_crossing approach phase).
+       Default kosong = pakai nilai dari param file (~/aim_target).
+       Override kalau FSM publish ke namespace lain. -->
+  <arg name="target_topic" default="~/aim_target"/>
+
+  <node pkg="autoware_rotary_aimer"
+        exec="rotary_aimer_node"
+        name="rotary_aimer"
+        output="screen">
+    <param from="$(var param_file)"/>
+    <!-- Allow CLI overrides for common params -->
+    <param name="map_path"      value="$(var map_path)"/>
+    <param name="start_enabled" value="$(var start_enabled)"/>
+    <param name="use_sim_time"  value="$(var use_sim_time)"/>
+    <param name="target_topic"  value="$(var target_topic)"/>
+  </node>
+</launch>

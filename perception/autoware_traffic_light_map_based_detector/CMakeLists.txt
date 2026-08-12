@@ -5,16 +5,20 @@ find_package(autoware_cmake REQUIRED)
 autoware_package()
 
 find_package(Eigen3 REQUIRED)
+find_package(OpenCV REQUIRED)
 
 include_directories(
   SYSTEM
     ${EIGEN3_INCLUDE_DIR}
+    ${OpenCV_INCLUDE_DIRS}
 )
 
 ament_auto_add_library(${PROJECT_NAME} SHARED
   src/traffic_light_map_based_detector_node.cpp
   src/traffic_light_map_based_detector_process.cpp
 )
+
+target_link_libraries(${PROJECT_NAME} ${OpenCV_LIBS})
 
 rclcpp_components_register_node(${PROJECT_NAME}
   PLUGIN "autoware::traffic_light::MapBasedDetector"

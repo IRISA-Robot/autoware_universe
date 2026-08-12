@@ -592,6 +592,15 @@ std::vector<PolygonPoint> getPolygonPointsInsideBounds(
       valid_inside_polygon.insert(valid_inside_polygon.end(), end_point);
     }
   }
+
+  // NOTE: A degenerate polygon with fewer than 3 points (a line or point) cannot meaningfully
+  // replace a section of the drivable-area bound and will cause invalid erase indices in
+  // updateBoundary when start_idx > end_idx after the bound-segment lookup. Drop it here so
+  // that updateBoundary never receives a sub-3-point polygon.
+  if (valid_inside_polygon.size() < 3) {
+    return std::vector<PolygonPoint>();
+  }
+
   return valid_inside_polygon;
 }
 
@@ -613,23 +622,44 @@ std::vector<Point> updateBoundary(
     const auto & start_poly = polygon.front();
     const auto & end_poly = polygon.back();
 
+    // Clamp bound_seg_idx to the current updated_bound size before use.
+    // bound_seg_idx was computed against the original bound; previous polygon iterations may have
+    // inserted or erased nodes, shrinking or growing updated_bound. An unclamped index that now
+    // equals updated_bound.size() - 1 or beyond causes calcLongitudinalOffsetToSegment to read
+    // past the last valid segment.
+    const size_t max_seg_idx =
+      updated_bound.size() > 1 ? updated_bound.size() - 2 : 0;
+    const size_t clamped_start_seg_idx = std::min(start_poly.bound_seg_idx, max_seg_idx);
+    const size_t clamped_end_seg_idx = std::min(end_poly.bound_seg_idx, max_seg_idx);
+
     const double front_offset = autoware::motion_utils::calcLongitudinalOffsetToSegment(
-      updated_bound, start_poly.bound_seg_idx, start_poly.point);
+      updated_bound, clamped_start_seg_idx, start_poly.point);
 
     const size_t removed_start_idx =
-      0 < front_offset ? start_poly.bound_seg_idx + 1 : start_poly.bound_seg_idx;
-    const size_t removed_end_idx = end_poly.bound_seg_idx;
+      0 < front_offset ? clamped_start_seg_idx + 1 : clamped_start_seg_idx;
+    const size_t removed_end_idx = clamped_end_seg_idx;
 
-    // Validate indices before erasing
-    if (
-      removed_start_idx >= updated_bound.size() || removed_end_idx >= updated_bound.size() ||
-      removed_start_idx > removed_end_idx) {
+    // Hard out-of-bounds guard (should not trigger after clamping above, kept as safety net).
+    if (removed_start_idx >= updated_bound.size() || removed_end_idx >= updated_bound.size()) {
       auto clock{rclcpp::Clock{RCL_ROS_TIME}};
       RCLCPP_WARN_STREAM_THROTTLE(
         rclcpp::get_logger("behavior_path_planner").get_child("utils"), clock, 5000,
-        "Invalid erase indices: start_idx=" << removed_start_idx << ", end_idx=" << removed_end_idx
-                                            << ", vector_size=" << updated_bound.size()
-                                            << ". Skipping this polygon.");
+        "Out-of-bounds erase indices after clamping: start_idx="
+          << removed_start_idx << ", end_idx=" << removed_end_idx
+          << ", vector_size=" << updated_bound.size() << ". Skipping this polygon.");
+      continue;
+    }
+
+    // When removed_start_idx > removed_end_idx the obstacle footprint is so narrow
+    // longitudinally that both the front and back polygon points fall within the same bound
+    // segment (or front_offset > 0 pushed start one node beyond end). There are no existing
+    // bound nodes to erase, but the polygon points still need to be inserted so that the
+    // drivable-area boundary is carved around the obstacle — without this insert the avoidance
+    // module never forms a shift line and the vehicle does not avoid the obstacle.
+    if (removed_start_idx > removed_end_idx) {
+      const auto obj_points = convertToGeometryPoints(polygon);
+      updated_bound.insert(
+        updated_bound.begin() + removed_start_idx, obj_points.begin(), obj_points.end());
       continue;
     }
 

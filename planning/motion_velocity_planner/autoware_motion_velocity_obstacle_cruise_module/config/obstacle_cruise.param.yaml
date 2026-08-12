@@ -86,7 +86,7 @@
             pedestrian: false
 
           outside:
-            unknown: false
+            unknown: true  # 2026-05-23: was false — unknown obstacles encroaching from outside trajectory must also cause cruise/stop
             car: true
             truck: true
             bus: true

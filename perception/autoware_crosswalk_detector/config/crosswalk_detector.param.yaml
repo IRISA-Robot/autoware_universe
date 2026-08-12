@@ -1,0 +1,54 @@
+/**:
+  ros__parameters:
+    # ---------------------------------------------------------------
+    # Phase 2 YOLOv8 TensorRT parameters
+    # (override via autoware_launch/config/road_crossing/crosswalk_detector.param.yaml)
+    # ---------------------------------------------------------------
+
+    # Path ke file ONNX model; '~' di-expand ke $HOME oleh node.
+    # Engine TensorRT (.engine) di-cache di lokasi yang sama secara otomatis
+    # oleh TrtCommon (replace ext .onnx → .engine).
+    model_path: "~/autoware_data/crosswalk_detector/crosswalk_kitakyushu.onnx"
+
+    # Precision TRT: fp16 (default), fp32, int8
+    precision: "fp16"
+
+    # Ukuran sisi input model (pixels) — harus sesuai dengan model ONNX
+    input_size: 512
+
+    # Threshold confidence deteksi YOLO
+    conf_thr: 0.4
+
+    # IoU threshold untuk Non-Maximum Suppression
+    nms_iou: 0.5
+
+    # Topic image kamera (BGR8, sensor QoS best-effort)
+    camera_topic: "/camera/front/image_raw"
+
+    # Fraksi vertikal minimum posisi center-y bbox (0.0 = atas, 1.0 = bawah).
+    # Bbox yang center-nya di atas batas ini diabaikan (filter objek jauh/langit).
+    # 0.35 = hanya objek di 65% bawah frame yang diterima.
+    roi_y_min_frac: 0.35
+
+    # Fraksi luas minimum bbox terhadap luas frame total.
+    # Bbox yang terlalu kecil (noise) diabaikan.
+    min_area_frac: 0.01
+
+    # Jumlah frame berturut-turut yang diperlukan untuk commit state baru.
+    # Naikkan untuk lebih stabil (lebih lambat bereaksi), turunkan untuk lebih responsif.
+    stable_frames: 3
+
+    # Frekuensi timer publish (Hz) — bukan rate inference.
+    publish_rate_hz: 10.0
+
+    # Aktifkan publish debug image (annotated frame dengan bbox dan ROI line).
+    enable_debug_image: true
+
+    # Frekuensi maksimum publish debug image (Hz) — terpisah dari publish_rate_hz.
+    debug_rate_hz: 2.0
+
+    # Apakah node langsung aktif saat startup (tanpa menunggu service /enable).
+    start_enabled: false
+
+    # Mode build-only: build engine lalu keluar (untuk pra-cache engine).
+    build_only: false

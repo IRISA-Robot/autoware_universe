@@ -15,6 +15,7 @@
   <arg name="enable_all_modules_auto_mode"/>
   <arg name="is_simulation"/>
   <arg name="launch_remaining_distance_time_calculator" default="false"/>
+  <arg name="launch_planning_evaluator" default="false" description="launch planning_evaluator metrics node (off by default to reduce CPU load)"/>
   <!-- Input topic parameters -->
   <arg name="input_objects_topic_name"/>
   <arg name="input_pointcloud_topic_name"/>
@@ -63,8 +64,8 @@
       </include>
     </group>
 
-    <!-- planning evaluator -->
-    <group>
+    <!-- planning evaluator (metrics only; off by default — see launch_planning_evaluator) -->
+    <group if="$(var launch_planning_evaluator)">
       <include file="$(find-pkg-share autoware_planning_evaluator)/launch/planning_evaluator.launch.xml"/>
     </group>
 

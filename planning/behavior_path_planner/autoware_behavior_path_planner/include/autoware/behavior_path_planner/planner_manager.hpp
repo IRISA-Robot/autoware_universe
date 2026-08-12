@@ -207,8 +207,27 @@ public:
 
   void reset()
   {
-    approved_module_ptrs_.clear();
-    candidate_module_ptrs_.clear();
+    // FIX (2026-05-26): deferred-destroy pattern to break rclcpp Executor race condition
+    // described in docs/research/autoware-planner-crash-fix.md (Crash B).
+    //
+    // Problem: calling .clear() on the strong-ref vectors drops the last shared_ptr to
+    // each scene module, which fires ~SceneModuleInterface() inline on this thread.
+    // The destructor finalizes ROS guard conditions while the MultiThreadedExecutor
+    // is concurrently iterating its wait set on another thread → stale pointer →
+    // throw_from_rcl_error → terminate → SIGABRT.
+    //
+    // Fix: move the modules into a "graveyard" instead of destroying them inline.
+    // The previous graveyard contents (from the prior reset) are destroyed first —
+    // by that point the executor has rotated its wait set thousands of times and the
+    // race window is closed. Memory bound: 2x active modules (~20 instances) which
+    // is negligible. Modules in the graveyard still consume some CPU via timers /
+    // callbacks until destroyed, but onExit() has already been called via the
+    // SceneModuleManagerInterface::reset() path, so they are inactive.
+    graveyard_approved_module_ptrs_.clear();   // destroys the PREVIOUS graveyard
+    graveyard_candidate_module_ptrs_.clear();
+    graveyard_approved_module_ptrs_.swap(approved_module_ptrs_);
+    graveyard_candidate_module_ptrs_.swap(candidate_module_ptrs_);
+    // approved_module_ptrs_ and candidate_module_ptrs_ are now empty (post-swap).
   }
 
 private:
@@ -361,6 +380,13 @@ private:
   std::vector<SceneModulePtr> approved_module_ptrs_;
 
   std::vector<SceneModulePtr> candidate_module_ptrs_;
+
+  // Deferred-destroy graveyard for modules removed by reset(). Modules sit here for
+  // one reset cycle so their destructors run when the rclcpp Executor's wait set is
+  // no longer iterating over their guard conditions. See reset() body for context.
+  std::vector<SceneModulePtr> graveyard_approved_module_ptrs_;
+
+  std::vector<SceneModulePtr> graveyard_candidate_module_ptrs_;
 
   ModuleUpdateInfo & debug_info_;
 };

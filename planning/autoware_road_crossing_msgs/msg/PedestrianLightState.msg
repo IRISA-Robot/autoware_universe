@@ -1,0 +1,9 @@
+std_msgs/Header header
+uint8 NONE=0
+uint8 RED=1
+uint8 GREEN=2
+uint8 COUNTDOWN_GREEN=3
+uint8 COUNTDOWN_BLANK=4
+uint8 state
+float32 confidence
+bool blocked

@@ -198,7 +198,7 @@
           truck: true                                   # [-]
           bus: true                                     # [-]
           trailer: true                                 # [-]
-          unknown: false                                # [-]
+          unknown: true                                 # [-] 2026-05-23: was false — include unknowns in avoidance safety check (trees, poles, etc.)
           bicycle: true                                 # [-]
           motorcycle: true                              # [-]
           pedestrian: true                              # [-]

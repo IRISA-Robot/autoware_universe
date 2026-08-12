@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>autoware_road_crossing_fsm</name>
+  <version>0.1.0</version>
+  <description>
+    Standalone FSM node that orchestrates road-crossing for sidewalk robots.
+    Subscribes to crosswalk and pedestrian-light detection results (from perception),
+    manages detector enable/disable via service clients, publishes gate commands to
+    the behavior_velocity road_crossing module, and triggers alternate re-routing via
+    set_waypoint_route when the crosswalk is not detected.
+  </description>
+
+  <maintainer email="azzamwildan5@gmail.com">azzamwildan462</maintainer>
+  <license>Apache License 2.0</license>
+
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
+  <buildtool_depend>autoware_cmake</buildtool_depend>
+
+  <!-- Core ROS2 -->
+  <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
+
+  <!-- Autoware msgs -->
+  <depend>autoware_adapi_v1_msgs</depend>
+  <depend>autoware_internal_debug_msgs</depend>
+  <depend>autoware_map_msgs</depend>
+  <depend>autoware_planning_msgs</depend>
+  <depend>autoware_road_crossing_msgs</depend>
+
+  <!-- Standard msgs / srvs -->
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_srvs</depend>
+
+  <!-- Autoware libraries -->
+  <depend>autoware_lanelet2_extension</depend>
+  <depend>autoware_route_handler</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>autoware_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

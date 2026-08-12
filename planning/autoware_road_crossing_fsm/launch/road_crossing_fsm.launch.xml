@@ -1,0 +1,24 @@
+<launch>
+  <!-- Road-crossing FSM standalone node.
+       Include from tier4_planning_component.launch.xml or run standalone for testing.
+
+       Usage (standalone):
+         ros2 launch autoware_road_crossing_fsm road_crossing_fsm.launch.xml
+
+       Arguments:
+         use_intra_process_comms  (default: false)
+         road_crossing_fsm_param_path  override to custom param file
+  -->
+
+  <arg name="use_intra_process_comms" default="false"/>
+  <arg name="road_crossing_fsm_param_path"
+       default="$(find-pkg-share autoware_road_crossing_fsm)/config/road_crossing_fsm.param.yaml"/>
+
+  <node pkg="autoware_road_crossing_fsm"
+        exec="road_crossing_fsm_node"
+        name="road_crossing_fsm"
+        output="screen">
+    <param name="use_intra_process_comms" value="$(var use_intra_process_comms)"/>
+    <param from="$(var road_crossing_fsm_param_path)"/>
+  </node>
+</launch>

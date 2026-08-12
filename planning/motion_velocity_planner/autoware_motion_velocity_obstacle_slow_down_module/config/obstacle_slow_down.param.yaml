@@ -44,7 +44,7 @@
 
       obstacle_filtering:
         object_type:
-          unknown: false
+          unknown: true  # 2026-05-23: was false — unknown sidewalk obstacles should trigger slow-down before stop
           car: true
           truck: true
           bus: true
