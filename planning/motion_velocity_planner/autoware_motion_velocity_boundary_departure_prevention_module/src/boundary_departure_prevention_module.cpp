@@ -603,12 +603,26 @@ BoundaryDeparturePreventionModule::plan_slow_down_intervals(
     motion_utils::calcSignedArcLength(raw_trajectory_points, 0UL, curr_pose.pose.position);
   toc_curr_watch("chk_ego_dist_on_traj");
 
-  const auto lon_offset_m = [&vehicle_info](const bool take_front_offset) {
-    return take_front_offset ? vehicle_info.max_longitudinal_offset_m
-                             : vehicle_info.min_longitudinal_offset_m;
+  // Leading-edge offset: the bumper that is first to reach a given point along the direction
+  // of travel. Front bumper when driving forward, rear bumper when driving in reverse. Always a
+  // positive addition to the arc-length position, since the trajectory's arc-length coordinate
+  // increases in the direction of travel regardless of vehicle heading.
+  const auto leading_edge_offset_m = [&vehicle_info](const bool is_driving_forward) {
+    return is_driving_forward ? vehicle_info.max_longitudinal_offset_m
+                               : -vehicle_info.min_longitudinal_offset_m;
   };
-  const auto ego_dist_on_traj_with_offset_m = [&](const bool take_front_offset) {
-    return ego_dist_on_traj_m + lon_offset_m(take_front_offset);
+  // Trailing-edge offset: the bumper that is last to clear a given point along the direction of
+  // travel. Rear bumper when driving forward, front bumper when driving in reverse. Always a
+  // negative addition (i.e. behind the leading edge) to the arc-length position.
+  const auto trailing_edge_offset_m = [&vehicle_info](const bool is_driving_forward) {
+    return is_driving_forward ? vehicle_info.min_longitudinal_offset_m
+                               : -vehicle_info.max_longitudinal_offset_m;
+  };
+  const auto ego_dist_on_traj_with_leading_offset_m = [&](const bool is_driving_forward) {
+    return ego_dist_on_traj_m + leading_edge_offset_m(is_driving_forward);
+  };
+  const auto ego_dist_on_traj_with_trailing_offset_m = [&](const bool is_driving_forward) {
+    return ego_dist_on_traj_m + trailing_edge_offset_m(is_driving_forward);
   };
 
   std::vector<double> pred_traj_idx_to_ref_traj_lon_dist;
@@ -643,7 +657,7 @@ BoundaryDeparturePreventionModule::plan_slow_down_intervals(
   if (output_.departure_intervals.empty() && is_departure_persist) {
     output_.departure_intervals = utils::init_departure_intervals(
       *ref_traj_pts_opt, output_.departure_points,
-      ego_dist_on_traj_with_offset_m(!planner_data->is_driving_forward),
+      ego_dist_on_traj_with_trailing_offset_m(planner_data->is_driving_forward),
       node_param_.slow_down_types);
   }
 
@@ -666,7 +680,7 @@ BoundaryDeparturePreventionModule::plan_slow_down_intervals(
     utils::update_departure_intervals(
       departure_intervals_mut, output_.departure_points, *ref_traj_pts_opt,
       vehicle_info.vehicle_length_m, raw_trajectory_points,
-      ego_dist_on_traj_with_offset_m(!planner_data->is_driving_forward),
+      ego_dist_on_traj_with_trailing_offset_m(planner_data->is_driving_forward),
       node_param_.th_pt_shift_dist_m, node_param_.th_pt_shift_angle_rad,
       node_param_.slow_down_types, is_reset_interval, is_departure_persist);
 
@@ -688,7 +702,7 @@ BoundaryDeparturePreventionModule::plan_slow_down_intervals(
   output_.slowdown_intervals = utils::get_slow_down_intervals(
     *ref_traj_pts_opt, output_.departure_intervals, *slow_down_interpolator_ptr_,
     curr_odom.twist.twist.linear.x, planner_data->current_acceleration.accel.accel.linear.x,
-    ego_dist_on_traj_with_offset_m(planner_data->is_driving_forward));
+    ego_dist_on_traj_with_leading_offset_m(planner_data->is_driving_forward));
 
   std::vector<SlowdownInterval> slowdown_intervals;
   for (auto && [idx, slowdown_interval] : output_.slowdown_intervals | ranges::views::enumerate) {
