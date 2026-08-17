@@ -62,6 +62,10 @@ void ObstacleVelocityLimiterModule::init(rclcpp::Node & node, const std::string 
   const auto vehicle_info = vehicle_info_utils::VehicleInfoUtils(node).getVehicleInfo();
   vehicle_lateral_offset_ = static_cast<double>(vehicle_info.max_lateral_offset_m);
   vehicle_front_offset_ = static_cast<double>(vehicle_info.max_longitudinal_offset_m);
+  // min_longitudinal_offset_m is the (negative) rear overhang; negate it to get the positive
+  // "distance from base_link to leading edge" magnitude used when reversing (rear bumper becomes
+  // the leading edge). Same idiom as dynamic_obstacle_stop_module's `ego_rear_longitudinal_offset`.
+  vehicle_rear_offset_ = -static_cast<double>(vehicle_info.min_longitudinal_offset_m);
   distance_buffer_ = node.declare_parameter<double>("distance_buffer");
 
   projection_params_.wheel_base = vehicle_info.wheel_base_m;
@@ -157,6 +161,15 @@ VelocityPlanningResult ObstacleVelocityLimiterModule::plan(
     obstacle_velocity_limiter::calculateSteeringAngles(
       original_traj_points, projection_params_.wheel_base);
   velocity_params_.current_ego_velocity = planner_data->current_odometry.twist.twist.linear.x;
+  // Offset from base_link to ego's currently-leading edge: front bumper while driving forward,
+  // rear bumper while reversing (the rear bumper is what actually sweeps forward-in-time first
+  // while backing up). `forwardSimulatedSegment()`/`bicycleProjectionLine()` (forward_projection)
+  // rely on both `projection_params_.is_driving_forward` and this direction-correct `extra_length`
+  // to build their swept envelope towards ego's real leading edge instead of always the front.
+  projection_params_.is_driving_forward = planner_data->is_driving_forward;
+  const auto ego_leading_edge_offset =
+    planner_data->is_driving_forward ? vehicle_front_offset_ : vehicle_rear_offset_;
+  projection_params_.extra_length = ego_leading_edge_offset + distance_buffer_;
   const auto start_idx = obstacle_velocity_limiter::calculateStartIndex(
     original_traj_points, *ego_idx, preprocessing_params_.start_distance);
   const auto end_idx = obstacle_velocity_limiter::calculateEndIndex(
@@ -205,9 +218,10 @@ VelocityPlanningResult ObstacleVelocityLimiterModule::plan(
   const auto slowdowns_us = stopwatch.toc("slowdowns");
 
   for (auto & wall : virtual_walls) {
-    wall.longitudinal_offset = vehicle_front_offset_;
+    wall.longitudinal_offset = ego_leading_edge_offset;
     wall.text = ns_;
     wall.style = autoware::motion_utils::VirtualWallType::slowdown;
+    wall.is_driving_forward = planner_data->is_driving_forward;
   }
   virtual_wall_marker_creator.add_virtual_walls(virtual_walls);
   virtual_wall_publisher_->publish(virtual_wall_marker_creator.create_markers(clock_->now()));

@@ -76,6 +76,10 @@ private:
   double distance_buffer_{};
   double vehicle_lateral_offset_{};
   double vehicle_front_offset_{};
+  // Offset from base_link to ego's rear bumper (positive magnitude, i.e.
+  // -vehicle_info.min_longitudinal_offset_m). Used in place of `vehicle_front_offset_` as the
+  // "leading edge" offset while reversing, since the rear bumper becomes the leading edge then.
+  double vehicle_rear_offset_{};
 };
 }  // namespace autoware::motion_velocity_planner
 

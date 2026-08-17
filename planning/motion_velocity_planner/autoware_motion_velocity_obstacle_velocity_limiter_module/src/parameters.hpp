@@ -124,6 +124,14 @@ struct ProjectionParameters
   double extra_length{};
   double velocity{};
   double heading{};
+  // Direction ego is currently driving along the trajectory (set once per planning cycle from
+  // `planner_data->is_driving_forward`, not touched by `update()`). Forward projection assumed
+  // ego always sweeps towards +heading; when reversing ego actually sweeps towards -heading, so
+  // `forwardSimulatedSegment()`/`bicycleProjectionLine()` must flip the projected direction (and
+  // the leading-edge `extra_length` term, which the caller is responsible for setting to the rear
+  // bumper offset when reversing) accordingly. Defaults to true so any call site that doesn't
+  // explicitly set it keeps the historical forward-only behavior.
+  bool is_driving_forward{true};
   // parameters specific to the bicycle model
   int64_t points_per_projection = 5;
   double wheel_base{};

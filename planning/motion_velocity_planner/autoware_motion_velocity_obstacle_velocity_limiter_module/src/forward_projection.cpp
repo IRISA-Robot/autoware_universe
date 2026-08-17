@@ -30,7 +30,17 @@ namespace autoware::motion_velocity_planner::obstacle_velocity_limiter
 segment_t forwardSimulatedSegment(
   const geometry_msgs::msg::Point & origin, const ProjectionParameters & params)
 {
-  const auto length = params.velocity * params.duration + params.extra_length;
+  // `params.heading` is the trajectory point's pose orientation, i.e. the nominal path
+  // direction, not necessarily ego's actual direction of travel: when reversing, ego moves
+  // towards -heading. `params.velocity` is treated as a speed magnitude (not assumed to already
+  // carry a reversing sign, matching this module's other trajectory-point reads, e.g.
+  // trajectory_preprocessing.cpp's `longitudinal_velocity_mps > 0.0` checks) and `extra_length`
+  // is the (always-positive) margin from the trajectory point to ego's currently-leading bumper
+  // (front when forward, rear when reversing -- selected by the caller). Both terms must be
+  // flipped together so the projected segment sweeps towards ego's real leading edge.
+  const auto direction_sign = params.is_driving_forward ? 1.0 : -1.0;
+  const auto length =
+    direction_sign * (std::abs(params.velocity) * params.duration + params.extra_length);
   const auto from = point_t{origin.x, origin.y};
   const auto heading = params.heading;
   const auto to =
@@ -58,11 +68,18 @@ linestring_t bicycleProjectionLine(
   line.reserve(params.points_per_projection);
   line.emplace_back(origin.x, origin.y);
   const auto dt = params.duration / (params.points_per_projection - 1);
-  const auto rotation_rate = params.velocity * std::tan(steering_angle) / params.wheel_base;
+  // Same direction-of-travel caveat as forwardSimulatedSegment(): the bicycle model's yaw rate
+  // (v/L * tan(steer)) and the swept length both depend on the *signed* velocity in ego's actual
+  // direction of travel, not the nominal path heading direction. Rebuild that signed velocity
+  // from the (assumed-magnitude) `params.velocity` and the direction flag so both the curvature
+  // and the sweep distance reverse together when backing up.
+  const auto direction_sign = params.is_driving_forward ? 1.0 : -1.0;
+  const auto signed_velocity = direction_sign * std::abs(params.velocity);
+  const auto rotation_rate = signed_velocity * std::tan(steering_angle) / params.wheel_base;
   for (auto i = 1; i < params.points_per_projection; ++i) {
     const auto t = i * dt;
     const auto heading = params.heading + rotation_rate * t;
-    const auto length = params.velocity * t + params.extra_length;
+    const auto length = signed_velocity * t + direction_sign * params.extra_length;
     line.emplace_back(origin.x + length * std::cos(heading), origin.y + length * std::sin(heading));
   }
   return line;
