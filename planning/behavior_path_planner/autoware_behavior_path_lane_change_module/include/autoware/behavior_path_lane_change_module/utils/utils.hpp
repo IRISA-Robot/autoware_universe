@@ -209,10 +209,14 @@ rclcpp::Logger getLogger(const std::string & type);
  *
  * @param common_data_ptr Shared pointer to CommonData that holds necessary ego vehicle's
  * dimensions and pose information.
+ * @param is_driving_forward true if ego is driving in the reference path's point-ordering
+ * direction; false when reversing (bidirectional driving), in which case the leading edge of
+ * the footprint uses the rear overhang instead of the front overhang.
  *
  * @return Polygon2d A polygon representing the current 2D footprint of the ego vehicle.
  */
-Polygon2d get_ego_footprint(const Pose & ego_pose, const VehicleInfo & ego_info);
+Polygon2d get_ego_footprint(
+  const Pose & ego_pose, const VehicleInfo & ego_info, const bool is_driving_forward = true);
 
 Point getEgoFrontVertex(const Pose & ego_pose, const VehicleInfo & ego_info, bool left);
 

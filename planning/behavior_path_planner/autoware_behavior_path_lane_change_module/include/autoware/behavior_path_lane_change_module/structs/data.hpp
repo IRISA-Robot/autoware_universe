@@ -254,6 +254,12 @@ struct TransientData
 
   bool in_turn_direction_lane{false};
   bool in_intersection{false};
+
+  // true if ego is traveling in the same direction as the reference path's point ordering
+  // (increasing arc-length). false when the reference path is reversed (bidirectional driving).
+  // Needed because arc-length sign along `current_lanes_path`/`current_lanes_ref_path` is not by
+  // itself indicative of "ahead of ego" in ego's actual direction of travel.
+  bool is_driving_forward{true};
 };
 
 using RouteHandlerPtr = std::shared_ptr<RouteHandler>;

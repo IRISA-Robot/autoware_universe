@@ -48,11 +48,17 @@ geometry_msgs::msg::Point32 create_point32(const geometry_msgs::msg::Pose & pose
 
 geometry_msgs::msg::Polygon create_execution_area(
   const autoware::vehicle_info_utils::VehicleInfo & vehicle_info,
-  const geometry_msgs::msg::Pose & pose, double additional_lon_offset, double additional_lat_offset)
+  const geometry_msgs::msg::Pose & pose, double additional_lon_offset, double additional_lat_offset,
+  bool is_driving_forward = true)
 {
-  const double & base_to_front = vehicle_info.max_longitudinal_offset_m;
+  // When reversing, the vehicle's leading edge (in the direction of travel) is the rear
+  // overhang, and the trailing edge is the front overhang -- swap them so this debug/execution
+  // area polygon's "forward"/"backward" extents match the actual direction of travel.
+  const double base_to_front =
+    is_driving_forward ? vehicle_info.max_longitudinal_offset_m : vehicle_info.rear_overhang_m;
   const double & width = vehicle_info.vehicle_width_m;
-  const double & base_to_rear = vehicle_info.rear_overhang_m;
+  const double base_to_rear =
+    is_driving_forward ? vehicle_info.rear_overhang_m : vehicle_info.max_longitudinal_offset_m;
 
   // if stationary object, extend forward and backward by the half of lon length
   const double forward_lon_offset = base_to_front + additional_lon_offset;
@@ -125,7 +131,8 @@ bool AvoidanceByLaneChange::specialRequiredCheck() const
 
   lane_change_debug_.execution_area = create_execution_area(
     getCommonParam().vehicle_info, getEgoPose(),
-    std::max(minimum_lane_change_length, minimum_avoid_length), calcLateralOffset());
+    std::max(minimum_lane_change_length, minimum_avoid_length), calcLateralOffset(),
+    common_data_ptr_->transient_data.is_driving_forward);
 
   RCLCPP_DEBUG(
     logger_, "Conditions ? %f, %f, %f", nearest_object.longitudinal, minimum_lane_change_length,

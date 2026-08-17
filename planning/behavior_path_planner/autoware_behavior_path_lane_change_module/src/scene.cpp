@@ -160,6 +160,13 @@ void NormalLaneChange::update_transient_data(const bool is_approved)
     prev_module_output_.path.points.at(nearest_seg_idx).point.longitudinal_velocity_mps;
   transient_data.current_path_seg_idx = nearest_seg_idx;
 
+  // Determine whether ego is actually driving forward along the reference path's point
+  // ordering (increasing arc-length), or reversed (bidirectional driving). Arc-length sign
+  // alone is not sufficient to determine "ahead of ego" without this.
+  const auto is_driving_forward_opt =
+    autoware::motion_utils::isDrivingForward(common_data_ptr_->current_lanes_path.points);
+  transient_data.is_driving_forward = is_driving_forward_opt ? *is_driving_forward_opt : true;
+
   const auto active_signal_duration =
     signal_activation_time_ ? (clock_.now() - signal_activation_time_.value()).seconds() : 0.0;
   transient_data.lane_change_prepare_duration =
@@ -197,7 +204,8 @@ void NormalLaneChange::update_transient_data(const bool is_approved)
     transient_data.dist_to_terminal_start < transient_data.max_prepare_length;
 
   transient_data.current_footprint = utils::lane_change::get_ego_footprint(
-    common_data_ptr_->get_ego_pose(), common_data_ptr_->bpp_param_ptr->vehicle_info);
+    common_data_ptr_->get_ego_pose(), common_data_ptr_->bpp_param_ptr->vehicle_info,
+    transient_data.is_driving_forward);
 
   transient_data.ego_to_terminal_end_proximity =
     utils::lane_change::calc_polygon_dist_range_from_terminal_end(
@@ -1035,8 +1043,15 @@ FilteredLanesObjects NormalLaneChange::filter_objects() const
     filtered_objects.others.push_back(ext_object);
   }
 
-  const auto dist_comparator = [](const auto & obj1, const auto & obj2) {
-    return obj1.dist_from_ego < obj2.dist_from_ego;
+  // `dist_from_ego` is signed arc length along the reference path's point ordering, which only
+  // matches ego's actual travel direction when driving forward -- flip the sign when reversing
+  // so "nearest ahead"/"nearest behind" ordering below is correct in ego's real travel direction.
+  const auto is_driving_forward = common_data_ptr_->transient_data.is_driving_forward;
+  const auto signed_dist_from_ego = [is_driving_forward](const auto & obj) {
+    return is_driving_forward ? obj.dist_from_ego : -obj.dist_from_ego;
+  };
+  const auto dist_comparator = [&signed_dist_from_ego](const auto & obj1, const auto & obj2) {
+    return signed_dist_from_ego(obj1) < signed_dist_from_ego(obj2);
   };
 
   // There are no use cases for other lane objects yet, so to save some computation time, we dont
@@ -1045,9 +1060,11 @@ FilteredLanesObjects NormalLaneChange::filter_objects() const
   ranges::sort(target_lane_leading.stopped_at_bound, dist_comparator);
   ranges::sort(target_lane_leading.stopped, dist_comparator);
   ranges::sort(target_lane_leading.moving, dist_comparator);
-  ranges::sort(filtered_objects.target_lane_trailing, [](const auto & obj1, const auto & obj2) {
-    return obj2.dist_from_ego < obj1.dist_from_ego;
-  });
+  ranges::sort(
+    filtered_objects.target_lane_trailing,
+    [&signed_dist_from_ego](const auto & obj1, const auto & obj2) {
+      return signed_dist_from_ego(obj2) < signed_dist_from_ego(obj1);
+    });
 
   lane_change_debug_.filtered_objects = filtered_objects;
 

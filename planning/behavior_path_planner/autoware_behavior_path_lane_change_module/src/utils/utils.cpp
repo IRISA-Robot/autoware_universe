@@ -577,10 +577,16 @@ rclcpp::Logger getLogger(const std::string & type)
   return rclcpp::get_logger("lane_change").get_child(type);
 }
 
-Polygon2d get_ego_footprint(const Pose & ego_pose, const VehicleInfo & ego_info)
+Polygon2d get_ego_footprint(
+  const Pose & ego_pose, const VehicleInfo & ego_info, const bool is_driving_forward)
 {
-  const auto base_to_front = ego_info.max_longitudinal_offset_m;
-  const auto base_to_rear = ego_info.rear_overhang_m;
+  // When reversing, the vehicle's leading edge (in the direction of travel) is the rear
+  // overhang, and the trailing edge is the front overhang -- swap them so the footprint's
+  // "forward"/"backward" extents match the actual direction of travel.
+  const auto base_to_front =
+    is_driving_forward ? ego_info.max_longitudinal_offset_m : ego_info.rear_overhang_m;
+  const auto base_to_rear =
+    is_driving_forward ? ego_info.rear_overhang_m : ego_info.max_longitudinal_offset_m;
   const auto width = ego_info.vehicle_width_m;
 
   return autoware_utils::to_footprint(ego_pose, base_to_front, base_to_rear, width);
@@ -714,13 +720,23 @@ EgoObjectProximity calc_ego_object_proximity(
   const ExtendedPredictedObject & object)
 {
   const auto & ego_info = common_data_ptr->bpp_param_ptr->vehicle_info;
+  const auto is_driving_forward = common_data_ptr->transient_data.is_driving_forward;
+  // Leading-edge magnitude in ego's actual direction of travel: front overhang when driving
+  // forward, rear overhang when reversing.
   const auto lon_dev = std::max(
-    ego_info.max_longitudinal_offset_m + ego_info.rear_overhang_m, object.shape.dimensions.x);
+    (is_driving_forward ? ego_info.max_longitudinal_offset_m : ego_info.rear_overhang_m) +
+      (is_driving_forward ? ego_info.rear_overhang_m : ego_info.max_longitudinal_offset_m),
+    object.shape.dimensions.x);
 
   // we don't always have to check the distance accurately.
   EgoObjectProximity ego_obj_proximity;
   if (std::abs(object.dist_from_ego) > lon_dev) {
-    ego_obj_proximity.is_ahead_of_ego = object.dist_from_ego >= 0.0;
+    // `dist_from_ego` is signed arc length along the reference path's point ordering
+    // (increasing index), which only matches ego's actual travel direction when driving
+    // forward. When reversing, flip the sign before treating it as "ahead of ego".
+    const auto signed_dist_from_ego =
+      is_driving_forward ? object.dist_from_ego : -object.dist_from_ego;
+    ego_obj_proximity.is_ahead_of_ego = signed_dist_from_ego >= 0.0;
     return ego_obj_proximity;
   }
 
@@ -730,9 +746,17 @@ EgoObjectProximity calc_ego_object_proximity(
     calc_polygon_dist_range_from_terminal_end(path, object.initial_polygon);
 
   if (ego_obj_proximity.ego_dist_to_terminal_end && ego_obj_proximity.object_dist_to_terminal_end) {
-    ego_obj_proximity.is_ahead_of_ego =
-      (ego_obj_proximity.ego_dist_to_terminal_end->min >=
-       ego_obj_proximity.object_dist_to_terminal_end->max);
+    const auto & ego_dist = *ego_obj_proximity.ego_dist_to_terminal_end;
+    const auto & object_dist = *ego_obj_proximity.object_dist_to_terminal_end;
+    // Both ranges measure distance-to-terminal-end (path.points.back()/goal), which is
+    // direction-agnostic by itself. When driving forward, the terminal end lies ahead of ego,
+    // so being closer to it (smaller distance) means being more ahead: object is ahead when
+    // even ego's closest boundary is farther from the terminal than the object's farthest
+    // boundary. When reversing, ego moves away from the terminal end, so being farther from it
+    // means being more ahead -- the roles of ego/object (and min/max) swap accordingly.
+    ego_obj_proximity.is_ahead_of_ego = is_driving_forward
+                                           ? (ego_dist.min >= object_dist.max)
+                                           : (object_dist.min >= ego_dist.max);
   }
 
   return ego_obj_proximity;
@@ -744,6 +768,7 @@ bool is_before_terminal(
 {
   const auto & route_handler_ptr = common_data_ptr->route_handler_ptr;
   const auto & lanes_ptr = common_data_ptr->lanes_ptr;
+  const auto is_driving_forward = common_data_ptr->transient_data.is_driving_forward;
   const auto terminal_position = (lanes_ptr->current_lane_in_goal_section)
                                    ? route_handler_ptr->getGoalPose().position
                                    : path.points.back().point.pose.position;
@@ -752,16 +777,23 @@ bool is_before_terminal(
   const auto & obj_position = object.initial_pose.position;
   const auto dist_to_base_link =
     autoware::motion_utils::calcSignedArcLength(path.points, obj_position, terminal_position);
+  // `calcSignedArcLength` is signed w.r.t. the path's point ordering (increasing index), which
+  // only matches ego's actual travel direction when driving forward. Flip the sign when
+  // reversing before treating it as "before terminal" in ego's direction of travel.
+  const auto signed_dist_to_base_link =
+    is_driving_forward ? dist_to_base_link : -dist_to_base_link;
   // we don't always have to check the distance accurately.
   if (std::abs(dist_to_base_link) > object.shape.dimensions.x) {
-    return dist_to_base_link >= 0.0;
+    return signed_dist_to_base_link >= 0.0;
   }
 
   for (const auto & polygon_p : object.initial_polygon.outer()) {
     const auto obj_p = autoware_utils::create_point(polygon_p.x(), polygon_p.y(), 0.0);
     const auto dist_obj_to_terminal =
       autoware::motion_utils::calcSignedArcLength(path.points, obj_p, terminal_position);
-    current_max_dist = std::max(dist_obj_to_terminal, current_max_dist);
+    const auto signed_dist_obj_to_terminal =
+      is_driving_forward ? dist_obj_to_terminal : -dist_obj_to_terminal;
+    current_max_dist = std::max(signed_dist_obj_to_terminal, current_max_dist);
   }
   return current_max_dist >= 0.0;
 }
