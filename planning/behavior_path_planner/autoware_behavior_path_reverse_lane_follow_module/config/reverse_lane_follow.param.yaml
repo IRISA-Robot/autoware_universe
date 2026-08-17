@@ -1,0 +1,7 @@
+/**:
+  ros__parameters:
+    reverse_lane_follow:
+      default_retrace_distance_m: 10.0
+      min_retrace_distance_m: 1.0
+      retrace_velocity_mps: 1.0
+      goal_reach_tolerance_m: 0.5

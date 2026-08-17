@@ -23,8 +23,4 @@ if(BUILD_TESTING)
   )
 endif()
 
-# NOTE: no config/ param yaml is installed yet -- all parameters are declared with in-code
-# defaults (see src/manager.cpp) so the package builds and unit-tests standalone. Once
-# tuning-engineer adds config/reverse_lane_follow.param.yaml, add it here:
-#   ament_auto_package(INSTALL_TO_SHARE config)
-ament_auto_package()
+ament_auto_package(INSTALL_TO_SHARE config)
