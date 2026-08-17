@@ -166,6 +166,38 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
       -std::abs(path_point.point.longitudinal_velocity_mps);
   }
 
+  // [BIDIR-BUG-FIX] Unlike reversePathForRetrace() (which always stops at the end of its tail
+  // path) or the normal forward-driving path (which goes through
+  // DefaultFixedGoalPlanner::modifyPathForSmoothGoalConnection() and always gets a hard
+  // zero-velocity point at the goal), this route-reversed-follow path is built purely from a
+  // sliding [ego - backward_distance_m, ego + forward_distance_m] window with no notion of the
+  // goal at all -- every point, including the last one, keeps riding at -abs(v). While this
+  // module is active (i.e. for the entire final approach whenever the last route leg into the
+  // goal is a reversed lanelet), its output *replaces* getPreviousModuleOutput() wholesale (see
+  // plan()), so the goal-connection zero-velocity point normally injected upstream never makes
+  // it into the trajectory -- root cause of "robot doesn't stop even after passing the goal" on
+  // reversed routes. Fix: if the goal lies within this window's lanelet sequence, truncate the
+  // path at the goal and force zero velocity there, mirroring reversePathForRetrace()'s idiom.
+  const bool sequence_contains_goal = std::any_of(
+    lanelet_sequence.begin(), lanelet_sequence.end(),
+    [&route_handler](const auto & llt) { return route_handler->isInGoalRouteSection(llt); });
+  if (sequence_contains_goal) {
+    const auto goal_pose = route_handler->getGoalPose();
+    const size_t goal_idx =
+      autoware::motion_utils::findNearestIndex(path.points, goal_pose.position);
+    if (goal_idx + 1 < path.points.size()) {
+      path.points.resize(goal_idx + 1);
+    }
+    if (!path.points.empty()) {
+      path.points.back().point.longitudinal_velocity_mps = 0.0F;
+    }
+    RCLCPP_WARN_THROTTLE(
+      logger, steady_clock, 2000,
+      "[BIDIR-DEBUG] buildRouteReversedFollowPath: goal is within this window's lanelet "
+      "sequence -- truncated path to goal_idx=%zu and forced zero velocity there",
+      goal_idx);
+  }
+
   RCLCPP_WARN_THROTTLE(
     logger, steady_clock, 2000,
     "[BIDIR-DEBUG] buildRouteReversedFollowPath: path built, %zu points, "
