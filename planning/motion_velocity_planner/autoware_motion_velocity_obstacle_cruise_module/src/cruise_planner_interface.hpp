@@ -81,9 +81,18 @@ protected:
     const size_t collision_segment_idx =
       autoware::motion_utils::findNearestSegmentIndex(traj_points, collision_point);
 
-    const auto dist_to_collision_point = autoware::motion_utils::calcSignedArcLength(
+    // `calcSignedArcLength` is anchored to the trajectory's own fixed point
+    // ordering, NOT to ego's actual direction of travel: a positive result only
+    // means "collision_point is at a higher index than ego", which is "ahead of
+    // ego" when driving forward but "behind ego" when reversing. Flip the sign
+    // when reversing so the result is always positive when the collision point
+    // is in ego's actual direction of travel (same idiom as
+    // `calc_distance_to_front_object()` in autoware_motion_velocity_planner_common).
+    const auto raw_dist_to_collision_point = autoware::motion_utils::calcSignedArcLength(
       traj_points, planner_data->current_odometry.pose.pose.position, ego_segment_idx,
       collision_point, collision_segment_idx);
+    const auto dist_to_collision_point =
+      planner_data->is_driving_forward ? raw_dist_to_collision_point : -raw_dist_to_collision_point;
 
     return dist_to_collision_point - offset;
   }
