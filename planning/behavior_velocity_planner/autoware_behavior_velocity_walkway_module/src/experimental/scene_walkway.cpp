@@ -138,7 +138,15 @@ bool WalkwayModule::modifyPathVelocity(
 {
   auto path_msg = planning_utils::fromTrajectory(path, left_bound, right_bound);
 
-  const auto & base_link2front = planner_data.vehicle_info_.max_longitudinal_offset_m;
+  // Offset from base_link to the vehicle's LEADING edge along the current
+  // direction of travel. Forward: front bumper (max_longitudinal_offset_m,
+  // positive). Reversing: the physically leading edge is the REAR bumper —
+  // min_longitudinal_offset_m is -rear_overhang_m, so negate it to get a
+  // positive "distance from base_link to leading edge" (see road_crossing's
+  // findEgoAndStopPoint() for the same idiom).
+  const auto base_link2front = planner_data.is_driving_forward
+                                  ? planner_data.vehicle_info_.max_longitudinal_offset_m
+                                  : -planner_data.vehicle_info_.min_longitudinal_offset_m;
 
   debug_data_ = DebugData(planner_data);
 
@@ -177,8 +185,8 @@ bool WalkwayModule::modifyPathVelocity(
     planning_factor_interface_->add(
       path_msg.points, planner_data.current_odometry->pose, stop_pose.value(),
       autoware_internal_planning_msgs::msg::PlanningFactor::STOP,
-      autoware_internal_planning_msgs::msg::SafetyFactorArray{}, true /*is_driving_forward*/,
-      0.0 /*velocity*/, 0.0 /*shift distance*/, "walkway_stop");
+      autoware_internal_planning_msgs::msg::SafetyFactorArray{},
+      planner_data.is_driving_forward, 0.0 /*velocity*/, 0.0 /*shift distance*/, "walkway_stop");
 
     // use arc length to identify if ego vehicle is in front of walkway stop or not.
     const double signed_arc_dist_to_stop_point =
