@@ -67,18 +67,23 @@ ResultWithReason MPC::calculateMPC(
   // reference path itself (behavior_path_planner / centerline) is the dominant noise source
   // (planning-layer issue). If k is smooth but lateral/yaw error oscillate, the issue is in the
   // MPC's own tracking (control-layer issue).
-  if (!m_is_forward_shift) {
+  // [BIDIR-DEBUG] Widened to log BOTH directions (tagged fwd/rev) so a single live test gives a
+  // true side-by-side baseline: is reverse tracking error actually larger than forward's on a
+  // comparably-curved segment, or is this steady-state magnitude normal for this MPC tuning and
+  // the "control jelek" complaint is really about something else (oscillation, rate limiting,
+  // steering command latency, etc. -- not captured by this steady-state error snapshot)?
+  {
     const size_t idx = mpc_data.nearest_idx;
     const size_t idx_prev = idx > 0 ? idx - 1 : idx;
     const size_t idx_next = idx + 1 < reference_trajectory.k.size() ? idx + 1 : idx;
     RCLCPP_WARN_THROTTLE(
       m_logger, *m_clock, 500,
-      "[BIDIR-DEBUG] reverse tracking: lateral_err=%.4f yaw_err=%.4f | k[prev,curr,next]=(%.4f, "
+      "[BIDIR-DEBUG] tracking(%s): lateral_err=%.4f yaw_err=%.4f | k[prev,curr,next]=(%.4f, "
       "%.4f, %.4f) smooth_k[prev,curr,next]=(%.4f, %.4f, %.4f)",
-      mpc_data.lateral_err, mpc_data.yaw_err, reference_trajectory.k.at(idx_prev),
-      reference_trajectory.k.at(idx), reference_trajectory.k.at(idx_next),
-      reference_trajectory.smooth_k.at(idx_prev), reference_trajectory.smooth_k.at(idx),
-      reference_trajectory.smooth_k.at(idx_next));
+      m_is_forward_shift ? "fwd" : "rev", mpc_data.lateral_err, mpc_data.yaw_err,
+      reference_trajectory.k.at(idx_prev), reference_trajectory.k.at(idx),
+      reference_trajectory.k.at(idx_next), reference_trajectory.smooth_k.at(idx_prev),
+      reference_trajectory.smooth_k.at(idx), reference_trajectory.smooth_k.at(idx_next));
   }
 
   // calculate initial state of the error dynamics
