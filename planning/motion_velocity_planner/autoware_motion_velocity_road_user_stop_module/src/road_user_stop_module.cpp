@@ -460,7 +460,14 @@ VelocityPlanningResult RoadUserStopModule::plan(
   // Extract parameters and current state
   const auto & trajectory_points = raw_trajectory_points;
   const auto current_time = clock_->now();
-  const double dist_to_bumper = planner_data->vehicle_info_.max_longitudinal_offset_m;
+  // Offset from base_link to ego's LEADING edge along the current direction of travel: forward ->
+  // front bumper (max_longitudinal_offset_m, positive); reversing -> the physically leading edge
+  // is the REAR bumper, and min_longitudinal_offset_m is -rear_overhang_m, so negate it to get a
+  // positive "distance from base_link to leading edge" (same idiom as
+  // calc_distance_to_front_object / obstacle_stop_module's calc_x_offset_to_bumper).
+  const double dist_to_bumper = planner_data->is_driving_forward
+                                   ? planner_data->vehicle_info_.max_longitudinal_offset_m
+                                   : -planner_data->vehicle_info_.min_longitudinal_offset_m;
 
   // 1. Prepare trajectory data for collision checking
   // 1.1 Decimate trajectory points to reduce computational cost
@@ -875,8 +882,15 @@ std::optional<Point> RoadUserStopModule::plan_stop(
     double dist_to_collide_on_ref_traj;
 
     if (stop_obstacle.is_lost) {
-      dist_to_collide_on_ref_traj = autoware::motion_utils::calcSignedArcLength(
+      // `calcSignedArcLength` is anchored to the trajectory's own fixed point order, not to ego's
+      // actual direction of travel: a positive result means "ahead" only when driving forward,
+      // "behind" when reversing (same idiom as calc_distance_to_front_object()). Flip the sign so
+      // this is always positive when the (lost) obstacle's last-known collision point is in
+      // ego's current direction of travel.
+      const double raw_dist_to_collide = autoware::motion_utils::calcSignedArcLength(
         trajectory_points, ego_segment_idx, stop_obstacle.collision_point);
+      dist_to_collide_on_ref_traj =
+        planner_data->is_driving_forward ? raw_dist_to_collide : -raw_dist_to_collide;
     } else {
       dist_to_collide_on_ref_traj =
         autoware::motion_utils::calcSignedArcLength(trajectory_points, 0, ego_segment_idx) +
@@ -1071,7 +1085,10 @@ std::optional<Point> RoadUserStopModule::calc_stop_point(
   const std::optional<double> & determined_zero_vel_dist)
 {
   auto output_traj_points = traj_points;
-  const double dist_to_bumper = planner_data->vehicle_info_.max_longitudinal_offset_m;
+  // Same leading-edge-offset idiom as in plan() -- see comment there.
+  const double dist_to_bumper = planner_data->is_driving_forward
+                                   ? planner_data->vehicle_info_.max_longitudinal_offset_m
+                                   : -planner_data->vehicle_info_.min_longitudinal_offset_m;
 
   // insert stop point - this function interpolates between trajectory points
   // to create a smooth stop position, avoiding discrete jumps
@@ -1253,12 +1270,20 @@ std::optional<double> RoadUserStopModule::calc_candidate_zero_vel_dist(
       return std::nullopt;
     }
 
+    // `calc_minimum_distance_to_stop` returns a physical (always-positive-magnitude) stopping
+    // distance along ego's actual direction of travel, while `calcSignedArcLength(traj_points, 0,
+    // ego_pos)` is a raw index-order distance from trajectory index 0 to ego. When reversing, ego
+    // travels toward decreasing index, so the projected stop position is *behind* (lower raw
+    // arc-length than) ego's current position, not ahead of it -- negate the stopping-distance
+    // magnitude in that case before combining the two (same idiom used throughout this
+    // migration, e.g. calc_distance_to_front_object()).
     const double acceptable_stop_pos =
       autoware::motion_utils::calcSignedArcLength(
         traj_points, 0, planner_data->current_odometry.pose.pose.position) +
-      calc_minimum_distance_to_stop(
-        planner_data->current_odometry.twist.twist.linear.x, common_param_.limit_max_accel,
-        acceptable_stop_acc.value());
+      (planner_data->is_driving_forward ? 1.0 : -1.0) *
+        calc_minimum_distance_to_stop(
+          planner_data->current_odometry.twist.twist.linear.x, common_param_.limit_max_accel,
+          acceptable_stop_acc.value());
 
     if (acceptable_stop_pos > candidate_zero_vel_dist) {
       candidate_zero_vel_dist = acceptable_stop_pos;
