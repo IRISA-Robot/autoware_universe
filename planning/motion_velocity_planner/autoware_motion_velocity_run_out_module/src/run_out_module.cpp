@@ -216,7 +216,8 @@ VelocityPlanningResult RunOutModule::plan(
   time_keeper_->start_track("plan()");
   time_keeper_->start_track("calc_ego_footprint()");
   const auto ego_footprint = calculate_trajectory_corner_footprint(
-    smoothed_trajectory_points, planner_data->vehicle_info_, params_);
+    smoothed_trajectory_points, planner_data->vehicle_info_, params_,
+    planner_data->is_driving_forward);
   time_keeper_->end_track("calc_ego_footprint()");
   time_keeper_->start_track("filter_objects()");
   const auto filtering_data = run_out::calculate_filtering_data(
@@ -225,13 +226,19 @@ VelocityPlanningResult RunOutModule::plan(
     planner_data->objects, ego_footprint, decisions_tracker_, filtering_data, params_);
   time_keeper_->end_track("filter_objects()");
   time_keeper_->start_track("calc_collisions()");
+  // `current_odometry.twist.twist.linear.x` is signed (negative while reversing); the
+  // ignore-collision heuristic below wants the ego SPEED (a magnitude, direction-agnostic) to
+  // estimate how long ego needs to stop -- using the raw signed value would produce a negative
+  // (effectively always-false) stop-time-limit while reversing, silently disabling this
+  // ignore-collision condition instead of applying it symmetrically.
+  const auto ego_speed = std::abs(planner_data->current_odometry.twist.twist.linear.x);
   params_.ignore_collision_conditions.if_ego_arrives_first_and_cannot_stop
     .calculated_stop_time_limit =
-    planner_data->current_odometry.twist.twist.linear.x /
+    ego_speed /
     params_.ignore_collision_conditions.if_ego_arrives_first_and_cannot_stop.deceleration_limit;
   run_out::calculate_collisions(
     filtered_objects, ego_footprint, filtering_data,
-    planner_data->vehicle_info_.max_longitudinal_offset_m, params_);
+    ego_footprint.leading_edge_longitudinal_offset, params_);
   time_keeper_->end_track("calc_collisions()");
   time_keeper_->start_track("calc_decisions()");
   const auto keep_stop_distance_range =
@@ -255,9 +262,12 @@ VelocityPlanningResult RunOutModule::plan(
   }
   time_keeper_->end_track("calc_decisions()");
   time_keeper_->start_track("calc_slowdowns()");
+  // Use the direction-agnostic ego speed magnitude here too: calculate_slowdowns()'s stop/slowdown
+  // distance math (e.g. `min_slow_arc_length = current_velocity * 0.1`,
+  // `current_velocity * current_velocity`) assumes a non-negative speed.
   const auto result = run_out::calculate_slowdowns(
-    decisions_tracker_, smoothed_trajectory_points,
-    planner_data->current_odometry.twist.twist.linear.x, unfeasible_stop_deceleration_, params_);
+    decisions_tracker_, smoothed_trajectory_points, ego_speed, unfeasible_stop_deceleration_,
+    params_);
   diagnostic_updater_->force_update();
   time_keeper_->end_track("calc_slowdowns()");
 
@@ -265,7 +275,7 @@ VelocityPlanningResult RunOutModule::plan(
   virtual_wall_marker_creator.add_virtual_walls(
     run_out::create_virtual_walls(
       result.velocity_planning_result, smoothed_trajectory_points,
-      planner_data->vehicle_info_.max_longitudinal_offset_m));
+      ego_footprint.leading_edge_longitudinal_offset, planner_data->is_driving_forward));
   virtual_wall_publisher_->publish(virtual_wall_marker_creator.create_markers(now));
   add_planning_factors(smoothed_trajectory_points, result, safety_factor_per_object);
   if (debug_publisher_->get_subscription_count() > 0) {

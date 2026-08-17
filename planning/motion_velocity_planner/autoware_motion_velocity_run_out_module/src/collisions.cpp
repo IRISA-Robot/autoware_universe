@@ -124,6 +124,15 @@ calculate_closest_interpolated_point_and_arc_length(
   pt.x = p.x();
   pt.y = p.y();
   const auto arc_length = motion_utils::calcSignedArcLength(trajectory, 0, pt);
+  // `arc_length` is anchored at trajectory index 0, a fixed time-ordered coordinate: index (and
+  // therefore this arc length) always increases forward in time regardless of ego's current gear.
+  // `p` is assumed to be a point on ego's LEADING edge (whichever bumper currently faces the
+  // direction of imminent travel), which -- by definition of "leading" -- always sits on the
+  // +arc_length side of base_link, whether driving forward (front bumper leads) or reversing
+  // (rear bumper leads). So subtracting the (direction-selected) leading-edge offset magnitude
+  // here to recover the base_link arc length is correct in both cases; only the magnitude of
+  // `longitudinal_offset` passed in by the caller needs to be direction-aware (front vs rear
+  // overhang), not the sign of this subtraction.
   const auto offset_arc_length = arc_length - longitudinal_offset;
   const auto pose = motion_utils::calcInterpolatedPose(trajectory, offset_arc_length);
   trajectory_point.pose = pose;
@@ -159,7 +168,7 @@ std::optional<FootprintIntersection> calculate_end_point_intersection(
   FootprintIntersection fi;
   fi.intersection = end_point;
   const auto [ego_point, arc_length] = calculate_closest_interpolated_point_and_arc_length(
-    footprint.ego_trajectory, fi.intersection, footprint.max_longitudinal_offset);
+    footprint.ego_trajectory, fi.intersection, footprint.leading_edge_longitudinal_offset);
   fi.arc_length = arc_length;
   fi.ego_time = rclcpp::Duration(ego_point.time_from_start).seconds();
   universe_utils::Segment2d object_segment;
@@ -338,8 +347,14 @@ void calculate_overlapping_collision(
     }
   } else if (is_opposite_direction(ego, params)) {
     // predict time when collision would occur by finding time when arc lengths are equal
-    const auto overlap_length =
-      ego.last_intersection.arc_length - ego.first_intersection.arc_length;
+    // `last_intersection` / `first_intersection` are picked by max/min *ego_time* (see
+    // create_overlap()), and arc_length is anchored at trajectory index 0 -- a fixed time-ordered
+    // coordinate that always increases forward in time regardless of ego's current gear. So
+    // `last_intersection.arc_length >= first_intersection.arc_length` always holds (no
+    // direction-dependent sign flip needed here); wrap in std::abs() purely as a defensive
+    // safety net against floating-point edge cases at near-zero overlap.
+    const auto overlap_length = std::abs(
+      ego.last_intersection.arc_length - ego.first_intersection.arc_length);
     const auto ego_overlap_duration =
       ego.last_intersection.ego_time - ego.first_intersection.ego_time;
     const auto object_overlap_duration =
@@ -462,6 +477,14 @@ std::vector<TimeOverlapIntervalPair> filter_time_overlap_intervals(
 {
   std::vector<TimeOverlapIntervalPair> filtered_overlap_intervals;
   for (const auto & interval : intervals) {
+    // `min_arc_length` is the caller-provided leading-edge offset magnitude (front bumper when
+    // driving forward, rear bumper when reversing -- see calculate_trajectory_corner_footprint()).
+    // Since arc_length is anchored at trajectory index 0 (fixed, time-ordered, always increasing
+    // forward in time regardless of gear) and ego's leading edge -- whichever bumper it is -- by
+    // definition sits on the +arc_length side of base_link, this comparison direction is the same
+    // for both forward and reverse: an intersection at or before the leading edge's own arc length
+    // is already within/behind the leading bumper and should be ignored, no direction-dependent
+    // sign flip needed.
     const auto is_before_min_arc_length =
       interval.ego.first_intersection.arc_length <= min_arc_length;
     const auto can_be_ignored =

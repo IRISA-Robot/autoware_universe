@@ -254,12 +254,17 @@ inline MarkerArray make_debug_decisions_markers(const ObjectDecisionsTracker & d
 inline motion_utils::VirtualWalls create_virtual_walls(
   const VelocityPlanningResult & result,
   const std::vector<autoware_planning_msgs::msg::TrajectoryPoint> & trajectory,
-  const double front_offset)
+  const double leading_edge_offset, const bool is_driving_forward)
 {
   motion_utils::VirtualWalls virtual_walls;
   motion_utils::VirtualWall wall;
   wall.text = "run_out";
-  wall.longitudinal_offset = front_offset;
+  // `leading_edge_offset` is the direction-selected leading-edge magnitude (front bumper when
+  // driving forward, rear bumper when reversing). VirtualWallMarkerCreator draws the wall on the
+  // correct side of `wall.pose` using `is_driving_forward` (marker_helper.cpp multiplies
+  // longitudinal_offset by -1 when reversing), so both fields must be set together.
+  wall.longitudinal_offset = leading_edge_offset;
+  wall.is_driving_forward = is_driving_forward;
   wall.style = motion_utils::VirtualWallType::stop;
   for (const auto & stop_point : result.stop_points) {
     const auto length = motion_utils::calcSignedArcLength(trajectory, 0, stop_point);

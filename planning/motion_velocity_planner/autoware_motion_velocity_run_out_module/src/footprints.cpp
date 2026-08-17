@@ -53,11 +53,23 @@ void prepare_trajectory_footprint_rtree(TrajectoryCornerFootprint & footprint)
 
 TrajectoryCornerFootprint calculate_trajectory_corner_footprint(
   const std::vector<autoware_planning_msgs::msg::TrajectoryPoint> & trajectory,
-  autoware::vehicle_info_utils::VehicleInfo vehicle_info, const Parameters & params)
+  autoware::vehicle_info_utils::VehicleInfo vehicle_info, const Parameters & params,
+  const bool is_driving_forward)
 {
   run_out::TrajectoryCornerFootprint trajectory_footprint;
   trajectory_footprint.ego_trajectory = trajectory;
+  trajectory_footprint.is_driving_forward = is_driving_forward;
+  // Ego's LEADING edge is the front bumper when driving forward, or the rear bumper when
+  // reversing. min_longitudinal_offset_m is the (negative) rear overhang, so negate it to get the
+  // positive "distance from base_link to leading edge" magnitude, same idiom used elsewhere in
+  // this bidirectional-driving migration (e.g. dynamic_obstacle_stop_module).
+  trajectory_footprint.leading_edge_longitudinal_offset =
+    is_driving_forward ? vehicle_info.max_longitudinal_offset_m
+                        : -vehicle_info.min_longitudinal_offset_m;
   auto & footprint = trajectory_footprint.predicted_path_footprint;
+  // NOTE: `createFootprint()` builds the full vehicle box (front AND rear overhang
+  // simultaneously), so this base footprint itself is direction-agnostic by construction -- no
+  // direction-awareness needed here, unlike the single leading-edge offset above.
   const auto base_footprint =
     vehicle_info.createFootprint(params.ego_lateral_margin, params.ego_longitudinal_margin);
   for (const auto & p : trajectory) {
@@ -81,7 +93,6 @@ TrajectoryCornerFootprint calculate_trajectory_corner_footprint(
       base_link.x() + rotated_rear_right_offset.x(), base_link.y() + rotated_rear_right_offset.y());
     footprint.corner_linestrings[rear_left].emplace_back(
       base_link.x() + rotated_rear_left_offset.x(), base_link.y() + rotated_rear_left_offset.y());
-    trajectory_footprint.max_longitudinal_offset = vehicle_info.max_longitudinal_offset_m;
   }
   for (auto i = 0UL; i + 1 < footprint.corner_linestrings[front_left].size(); ++i) {
     universe_utils::LinearRing2d front_polygon = {

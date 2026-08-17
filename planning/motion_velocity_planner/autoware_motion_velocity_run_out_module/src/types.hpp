@@ -150,7 +150,20 @@ struct TrajectoryCornerFootprint
     rear_polygons;  // polygons built from the rear linestrings
   PolygonRtree front_polygons_rtree;
   PolygonRtree rear_polygons_rtree;
-  double max_longitudinal_offset;  // [m] distance between baselink and the front of the vehicle
+  // [m] distance from base_link to ego's LEADING edge along its current direction of travel:
+  // the front bumper offset (+max_longitudinal_offset_m) when driving forward, or the rear bumper
+  // offset magnitude (-min_longitudinal_offset_m) when reversing. Used to convert a bumper-contact
+  // arc length into a base_link arc length (and vice versa) and to decide how close to ego's
+  // current position a collision must be before it is considered already-engulfed / ignorable.
+  double leading_edge_longitudinal_offset{};
+  // Direction ego is currently driving: true if consecutive `ego_trajectory` points move towards
+  // ego's front bumper (forward gear), false if they move towards the rear bumper (reverse gear).
+  // NOTE: arc lengths computed against `ego_trajectory` (e.g. via calcSignedArcLength(..., 0, p))
+  // are anchored at trajectory index 0, which is a fixed, time-ordered coordinate independent of
+  // `is_driving_forward` (index always increases forward in time, regardless of gear) -- so those
+  // arc lengths do NOT need sign-flipping here. What DOES depend on `is_driving_forward` is which
+  // physical bumper is "leading" (see `leading_edge_longitudinal_offset` above).
+  bool is_driving_forward{true};
   std::vector<autoware_planning_msgs::msg::TrajectoryPoint> ego_trajectory;
 
   /// @brief get the rear footprint segment of the given index

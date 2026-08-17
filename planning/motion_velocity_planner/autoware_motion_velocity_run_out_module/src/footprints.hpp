@@ -30,9 +30,15 @@ namespace autoware::motion_velocity_planner::run_out
 void prepare_trajectory_footprint_rtree(TrajectoryCornerFootprint & footprint);
 
 /// @brief Calculate the corner footprint of the given trajectory
+/// @param [in] trajectory the ego trajectory
+/// @param [in] vehicle_info ego vehicle dimensions
+/// @param [in] params module parameters
+/// @param [in] is_driving_forward whether ego is currently driving forward (true) or reversing
+/// (false) along `trajectory`; used to select which bumper (front/rear) is ego's leading edge
 TrajectoryCornerFootprint calculate_trajectory_corner_footprint(
   const std::vector<autoware_planning_msgs::msg::TrajectoryPoint> & trajectory,
-  autoware::vehicle_info_utils::VehicleInfo vehicle_info, const Parameters & params);
+  autoware::vehicle_info_utils::VehicleInfo vehicle_info, const Parameters & params,
+  const bool is_driving_forward);
 }  // namespace autoware::motion_velocity_planner::run_out
 
 #endif  // FOOTPRINTS_HPP_
