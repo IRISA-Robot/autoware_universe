@@ -8,10 +8,12 @@
   <arg name="set_waypoint_route_service_name" default="/planning/set_waypoint_route"/>
   <arg name="visualization_topic_name" default="/planning/mission_planning/route_marker"/>
   <arg name="mission_planner_param_path" default="$(find-pkg-share autoware_mission_planner_universe)/config/mission_planner.param.yaml"/>
+  <arg name="allow_reverse_route" default="false" description="Gates the bidirectional-driving reverse-route capability in mission_planner"/>
 
   <node_container pkg="rclcpp_components" exec="component_container_mt" name="mission_planner_container" namespace="">
     <composable_node pkg="autoware_mission_planner_universe" plugin="autoware::mission_planner_universe::MissionPlanner" name="mission_planner" namespace="">
       <param from="$(var mission_planner_param_path)"/>
+      <param name="allow_reverse_route" value="$(var allow_reverse_route)"/>
       <remap from="~/input/modified_goal" to="$(var modified_goal_topic_name)"/>
       <remap from="~/input/vector_map" to="$(var map_topic_name)"/>
       <remap from="~/input/odometry" to="/localization/kinematic_state"/>

@@ -3,6 +3,7 @@
 
   <!-- mission planner -->
   <arg name="mission_planner_param_path"/>
+  <arg name="allow_reverse_route" default="false"/>
   <!-- parking -->
   <arg name="freespace_planner_param_path"/>
   <!-- planning validator -->
@@ -34,6 +35,7 @@
       <push-ros-namespace namespace="mission_planning"/>
       <include file="$(find-pkg-share tier4_planning_launch)/launch/mission_planning/mission_planning.launch.xml">
         <arg name="mission_planner_param_path" value="$(var mission_planner_param_path)"/>
+        <arg name="allow_reverse_route" value="$(var allow_reverse_route)"/>
       </include>
     </group>
 
