@@ -46,8 +46,28 @@ struct ReverseLaneFollowParameters
   // this module activates because ego is on a route segment RouteHandler flags as reversed,
   // independent of any explicit retrace request. "forward" here means ahead of ego in the actual
   // direction of travel (i.e. along the inverted lanelet sequence), not map/centerline order.
-  double route_reversed_forward_distance_m{30.0};
-  double route_reversed_backward_distance_m{5.0};
+  //
+  // [BIDIR-QUALITY-FIX] These used to default to 30.0/5.0 -- a 35 m total sliding window centered
+  // on ego, rebuilt from scratch every planning cycle by buildRouteReversedFollowPath(). Compare
+  // to forward driving's utils::getReferencePath() (path_utils.cpp), which windows on
+  // forward_path_length/backward_path_length -- 300.0/5.0(+10 extra margin) in
+  // behavior_path_planner.param.yaml, i.e. ~315 m of lookahead. Downstream modules that run on
+  // top of this module's output in slot1+ (static_obstacle_avoidance, lane_change, goal_planner
+  // -- see scene_module_manager.param.yaml's slot0=reverse_lane_follow, slot2=avoidance/lane
+  // change, slot3=goal_planner) can only see/plan shift-lines within whatever window this module
+  // handed them. A 30 m forward window gives avoidance roughly 1/10th the runway it gets while
+  // driving forward to detect obstacles early and build a smooth, gradual lateral shift --
+  // directly reproducing "avoidance jelek"/"motion planning jelek" while reversing even though
+  // the module chain itself composes correctly (confirmed: slot0's output IS the previous-slot
+  // input for slot1..slot4, this is not a wholesale-replace-blocks-everything bug). Widened here
+  // to give avoidance meaningfully more room while staying reverse-scoped (no change to forward
+  // driving's own 300 m window, no change to avoidance/lane_change code). Still deliberately less
+  // than forward's 300 m: reverse maneuvers are typically short (parking/backing out of a
+  // dead-end), and a too-large window costs replanning stability (more of the window churns per
+  // cycle since it recenters on ego every tick) for diminishing benefit. Revisit if reverse routes
+  // routinely exceed ~100 m.
+  double route_reversed_forward_distance_m{150.0};
+  double route_reversed_backward_distance_m{15.0};
 };
 
 // This module's own "am I currently retracing" status flag -- the reverse-lane-follow analogue of
