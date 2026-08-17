@@ -162,9 +162,26 @@ BehaviorModuleOutput ReverseLaneFollowModule::plan()
   }
 
   if (!active_path) {
-    // Nothing to follow (yet/anymore) -- do not clobber the previous module's output.
+    // [BIDIR-DEBUG] Nothing to follow (yet/anymore) -- do not clobber the previous module's
+    // output. If this fires while ego is actually on a reversed route segment, the previous
+    // module's (positive-velocity, slot0-seed) output passes straight through to
+    // static_obstacle_avoidance and downstream control unmodified -- a likely root cause of
+    // "control moves the wrong way" if buildRouteReversedFollowPath() failed to activate.
+    RCLCPP_WARN_THROTTLE(
+      getLogger(), *clock_, 2000,
+      "[BIDIR-DEBUG] ReverseLaneFollowModule::plan(): no active_path -- passing through previous "
+      "module output unmodified (prev output has %zu points)",
+      getPreviousModuleOutput().path.points.size());
     return getPreviousModuleOutput();
   }
+
+  RCLCPP_WARN_THROTTLE(
+    getLogger(), *clock_, 2000,
+    "[BIDIR-DEBUG] ReverseLaneFollowModule::plan(): using %s path, %zu points, first_v=%.2f "
+    "last_v=%.2f",
+    (!status_.retrace_path.points.empty() ? "RETRACE" : "ROUTE_REVERSED"), active_path->points.size(),
+    active_path->points.front().point.longitudinal_velocity_mps,
+    active_path->points.back().point.longitudinal_velocity_mps);
 
   output.path = *active_path;
   output.reference_path = *active_path;

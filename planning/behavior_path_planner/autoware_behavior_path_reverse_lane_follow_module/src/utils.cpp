@@ -15,6 +15,7 @@
 #include "autoware/behavior_path_reverse_lane_follow_module/utils.hpp"
 
 #include <autoware/motion_utils/trajectory/trajectory.hpp>
+#include <rclcpp/rclcpp.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -90,16 +91,38 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
   const std::shared_ptr<RouteHandler> & route_handler, const Pose & ego_pose,
   const double backward_distance_m, const double forward_distance_m)
 {
+  // [BIDIR-DEBUG] temporary diagnostic logging for the "trajectory doesn't follow reversed
+  // lanelet / control goes the wrong way" investigation. Remove once root cause is confirmed
+  // fixed via live test.
+  static auto logger = rclcpp::get_logger("reverse_lane_follow_utils");
+  static rclcpp::Clock steady_clock{RCL_ROS_TIME};
+
   if (!route_handler) {
+    RCLCPP_WARN_THROTTLE(
+      logger, steady_clock, 2000,
+      "[BIDIR-DEBUG] buildRouteReversedFollowPath: null route_handler");
     return std::nullopt;
   }
 
   lanelet::ConstLanelet current_lanelet;
   if (!route_handler->getClosestLaneletWithinRoute(ego_pose, &current_lanelet)) {
+    RCLCPP_WARN_THROTTLE(
+      logger, steady_clock, 2000,
+      "[BIDIR-DEBUG] buildRouteReversedFollowPath: getClosestLaneletWithinRoute failed for ego "
+      "pose (%.2f, %.2f)",
+      ego_pose.position.x, ego_pose.position.y);
     return std::nullopt;
   }
 
-  if (!route_handler->isLaneletInvertedInRoute(current_lanelet)) {
+  const bool is_inverted = route_handler->isLaneletInvertedInRoute(current_lanelet);
+  RCLCPP_WARN_THROTTLE(
+    logger, steady_clock, 2000,
+    "[BIDIR-DEBUG] buildRouteReversedFollowPath: ego=(%.2f, %.2f) closest_lanelet_id=%ld "
+    "closest_lanelet.inverted()=%d isLaneletInvertedInRoute=%d",
+    ego_pose.position.x, ego_pose.position.y, current_lanelet.id(), current_lanelet.inverted(),
+    is_inverted);
+
+  if (!is_inverted) {
     // Not on a reversed route segment -- this activation trigger does not apply; the caller
     // should fall back to the (still-supported standalone) retrace-request trigger.
     return std::nullopt;
@@ -111,12 +134,30 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
   const auto lanelet_sequence = route_handler->getLaneletSequence(
     current_lanelet, ego_pose, backward_distance_m, forward_distance_m);
   if (lanelet_sequence.empty()) {
+    RCLCPP_WARN_THROTTLE(
+      logger, steady_clock, 2000,
+      "[BIDIR-DEBUG] buildRouteReversedFollowPath: getLaneletSequence returned EMPTY for "
+      "current_lanelet_id=%ld (inverted route segment detected but no sequence built!)",
+      current_lanelet.id());
     return std::nullopt;
+  }
+
+  {
+    std::string seq_str;
+    for (const auto & llt : lanelet_sequence) {
+      seq_str += std::to_string(llt.id()) + (llt.inverted() ? "(inv) " : "(fwd) ");
+    }
+    RCLCPP_WARN_THROTTLE(
+      logger, steady_clock, 2000,
+      "[BIDIR-DEBUG] buildRouteReversedFollowPath: lanelet_sequence = [ %s]", seq_str.c_str());
   }
 
   auto path =
     route_handler->getCenterLinePath(lanelet_sequence, 0.0, std::numeric_limits<double>::max());
   if (path.points.empty()) {
+    RCLCPP_WARN_THROTTLE(
+      logger, steady_clock, 2000,
+      "[BIDIR-DEBUG] buildRouteReversedFollowPath: getCenterLinePath returned EMPTY path");
     return std::nullopt;
   }
 
@@ -124,6 +165,16 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
     path_point.point.longitudinal_velocity_mps =
       -std::abs(path_point.point.longitudinal_velocity_mps);
   }
+
+  RCLCPP_WARN_THROTTLE(
+    logger, steady_clock, 2000,
+    "[BIDIR-DEBUG] buildRouteReversedFollowPath: path built, %zu points, "
+    "first=(%.2f,%.2f,v=%.2f) last=(%.2f,%.2f,v=%.2f)",
+    path.points.size(), path.points.front().point.pose.position.x,
+    path.points.front().point.pose.position.y,
+    path.points.front().point.longitudinal_velocity_mps,
+    path.points.back().point.pose.position.x, path.points.back().point.pose.position.y,
+    path.points.back().point.longitudinal_velocity_mps);
 
   return RouteReversedFollow{path, lanelet_sequence};
 }
