@@ -218,6 +218,26 @@ private:
   bool map_initialized_{false};
   bool route_initialized_{false};
 
+  // ------------------------------------------------------------------
+  // Bidirectional-driving support (Phase 3c).
+  //
+  // This node has no access to behavior_velocity_planner_common::PlannerData
+  // (that's a different process/package), so direction is derived locally
+  // from the subscribed Odometry's longitudinal velocity sign — mirroring
+  // what autoware::motion_utils::isDrivingForwardWithTwist() does for a
+  // single twist sample. Updated once per tick in updateDrivingDirection()
+  // (called from onTimer before any direction-dependent logic runs).
+  // Defaults to true (forward) and only flips when |vx| exceeds a small
+  // deadband, to avoid chattering while stopped/near-zero speed.
+  // ------------------------------------------------------------------
+  bool is_driving_forward_{true};
+  static constexpr double kDrivingDirectionDeadbandMps{0.05};
+
+  // Recompute is_driving_forward_ from last_odom_->twist.twist.linear.x.
+  // No-op (keeps previous value) if last_odom_ is null or speed is within
+  // the deadband (near-zero — direction is ambiguous while nearly stopped).
+  void updateDrivingDirection();
+
   // Ordered sequence of lanelet IDs extracted from the mission-planner route.
   // Populated in onRoute() from msg->segments[i].preferred_primitive.id (in route order).
   // Refreshed on every onRoute call so reroute acks update the sequence immediately.
@@ -414,6 +434,21 @@ private:
 
   // Reset reroute sub-step guards (call when entering a new reroute phase).
   void resetRerouteSubstep();
+
+  // Re-zero the rotary aimer at crossing/reroute transitions — direction-aware
+  // (Phase 3c fix site #4). When driving forward, behaves exactly as before:
+  // disables the aimer, which re-zeroes to the vehicle's physical nose
+  // (rotary angle 0 == base_link +X), correct because the nose leads.
+  // When reversing, the nose is trailing, so re-zeroing to it would point the
+  // sensor turret away from the direction of travel. The rotary_aimer node
+  // itself (a separate package, out of scope for this fix) has no
+  // direction-aware zero target — only a hardcoded 0.0. Rather than touching
+  // that node, we leave the aimer ENABLED in this case: its own tf_pedestrian
+  // light search is already TF/pose-based (not heading-hardcoded, see
+  // APPROACH-phase comments in onTimer), so it keeps correctly tracking the
+  // nearest light regardless of travel direction instead of snapping to a
+  // wrong fixed angle.
+  void reZeroAimerDirectionAware();
 
   // Publish gate command for active_crossing_id_ (ROAD lanelet).
   void publishGate(uint8_t command);

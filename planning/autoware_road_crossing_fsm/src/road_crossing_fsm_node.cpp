@@ -311,6 +311,17 @@ void RoadCrossingFsmNode::onAdApiOpMode(
 // FSM tick
 // ---------------------------------------------------------------------------
 
+void RoadCrossingFsmNode::updateDrivingDirection()
+{
+  if (!last_odom_) return;
+  const double vx = last_odom_->twist.twist.linear.x;
+  if (std::abs(vx) <= kDrivingDirectionDeadbandMps) {
+    // Near-zero speed — direction is ambiguous, keep previous value.
+    return;
+  }
+  is_driving_forward_ = vx > 0.0;
+}
+
 void RoadCrossingFsmNode::onTimer()
 {
   publishFsmState();
@@ -319,6 +330,10 @@ void RoadCrossingFsmNode::onTimer()
   if (!map_initialized_ || !route_initialized_ || !last_odom_) {
     return;
   }
+
+  // Refresh direction-of-travel signal before any direction-dependent logic
+  // (entry/exit resolution, route-order scans, aimer re-zero) runs this tick.
+  updateDrivingDirection();
 
   const rclcpp::Time now = this->now();
 
@@ -615,8 +630,9 @@ void RoadCrossingFsmNode::onTimer()
                   static_cast<int64_t>(alt_opt->id()));
                 // Keep PRE gate = HOLD while we search for alternate.
                 transitionTo(FsmState::REROUTING_TO_ALT);
-                // Robot mulai bergerak ke alternate — re-zero aimer agar lidar+kamera menghadap depan.
-                setDetectorEnabled(cli_rotary_aimer_, false, "rotary_aimer");
+                // Robot mulai bergerak ke alternate — re-zero aimer (direction-aware; see
+                // reZeroAimerDirectionAware()).
+                reZeroAimerDirectionAware();
                 resetRerouteSubstep();
               } else {
                 // No alternate — stay in ARMED_CROSSWALK, keep gate HOLD,
@@ -1117,8 +1133,9 @@ void RoadCrossingFsmNode::onTimer()
         no_detect_since_.reset();
         road_cross_is_green_ = false;   // bypass: trust-light shortcut must NOT fire
         transitionTo(FsmState::CROSSING);
-        // Robot mulai menyeberang — re-zero aimer agar lidar+kamera menghadap depan.
-        setDetectorEnabled(cli_rotary_aimer_, false, "rotary_aimer");
+        // Robot mulai menyeberang — re-zero aimer (direction-aware; see
+        // reZeroAimerDirectionAware()).
+        reZeroAimerDirectionAware();
         publishGate(autoware_road_crossing_msgs::msg::RoadCrossingGate::GO);
         break;
       }
@@ -1164,8 +1181,8 @@ void RoadCrossingFsmNode::onTimer()
           light_timeout_start_.reset();
           road_cross_is_green_ = true;   // persist GO_GREEN through CROSSING state
           transitionTo(FsmState::CROSSING);
-          // Robot mulai menyeberang (lampu HIJAU) — re-zero aimer.
-          setDetectorEnabled(cli_rotary_aimer_, false, "rotary_aimer");
+          // Robot mulai menyeberang (lampu HIJAU) — re-zero aimer (direction-aware).
+          reZeroAimerDirectionAware();
           publishGate(autoware_road_crossing_msgs::msg::RoadCrossingGate::GO_GREEN);
         } else {
           // RED(1) atau COUNTDOWN_BLANK(4) → HOLD, tunggu GREEN.
@@ -1202,8 +1219,8 @@ void RoadCrossingFsmNode::onTimer()
           no_detect_since_.reset();
           road_cross_is_green_ = false;   // timeout fallback: trust-light shortcut must NOT fire
           transitionTo(FsmState::CROSSING);
-          // Robot mulai menyeberang — re-zero aimer.
-          setDetectorEnabled(cli_rotary_aimer_, false, "rotary_aimer");
+          // Robot mulai menyeberang — re-zero aimer (direction-aware).
+          reZeroAimerDirectionAware();
           publishGate(autoware_road_crossing_msgs::msg::RoadCrossingGate::GO);
         } else {
           // Masih dalam batas — tahan, log setiap 1 detik.
@@ -1265,6 +1282,20 @@ bool RoadCrossingFsmNode::checkArmCondition()
 {
   if (!map_initialized_ || !route_initialized_ || !last_odom_) return false;
   if (route_lanelets_.empty()) return false;
+
+  // Bidirectional-driving guard (Phase 3c): the forward scan below assumes
+  // route_lanelets_ index order == direction of travel (i.e. ego's route
+  // index only increases). That holds while driving forward, but not while
+  // ego is backing away/retreating along the route (index would need to
+  // decrease). Rather than making the scan direction-aware (route-order
+  // semantics for a reversing ego are still under design), we take the
+  // simpler and safer option flagged in the audit: do not newly arm a
+  // crossing episode while ego is actively reversing. Any already-armed
+  // episode (active_crossing_id_ set) is unaffected — this only gates NEW
+  // arming decisions.
+  if (!is_driving_forward_) {
+    return false;
+  }
 
   // -----------------------------------------------------------------------
   // Step 1: resolve ego's current lanelet ID from the route.
@@ -1498,7 +1529,11 @@ double RoadCrossingFsmNode::distanceToCrossingEntry() const
 
     const auto & ego_pos = last_odom_->pose.pose.position;
     const lanelet::BasicPoint2d ego2d{ego_pos.x, ego_pos.y};
-    const lanelet::BasicPoint2d entry{cl.front().x(), cl.front().y()};
+    // Entry is the endpoint ego actually arrives at first: front() when driving
+    // forward (lanelet centerline direction matches travel direction), back()
+    // when reversing through this lanelet.
+    const auto & entry_pt = is_driving_forward_ ? cl.front() : cl.back();
+    const lanelet::BasicPoint2d entry{entry_pt.x(), entry_pt.y()};
 
     return boost::geometry::distance(ego2d, entry);
   } catch (const lanelet::NoSuchPrimitiveError &) {
@@ -1519,7 +1554,9 @@ double RoadCrossingFsmNode::distanceToPreEntry() const
 
     const auto & ego_pos = last_odom_->pose.pose.position;
     const lanelet::BasicPoint2d ego2d{ego_pos.x, ego_pos.y};
-    const lanelet::BasicPoint2d entry{cl.front().x(), cl.front().y()};
+    // See distanceToCrossingEntry(): entry endpoint swaps with travel direction.
+    const auto & entry_pt = is_driving_forward_ ? cl.front() : cl.back();
+    const lanelet::BasicPoint2d entry{entry_pt.x(), entry_pt.y()};
 
     return boost::geometry::distance(ego2d, entry);
   } catch (const lanelet::NoSuchPrimitiveError &) {
@@ -1539,8 +1576,9 @@ bool RoadCrossingFsmNode::egoPastCrossingExit() const
     if (cl.size() < 2) return false;
 
     const auto & ego_pos = last_odom_->pose.pose.position;
-    const auto & entry = cl.front();
-    const auto & exit = cl.back();
+    // Entry/exit swap with travel direction — see distanceToCrossingEntry().
+    const auto & entry = is_driving_forward_ ? cl.front() : cl.back();
+    const auto & exit = is_driving_forward_ ? cl.back() : cl.front();
 
     // Project (ego - exit) onto (entry → exit).
     const double cdx = exit.x() - entry.x();
@@ -1604,6 +1642,15 @@ std::optional<lanelet::ConstLanelet> RoadCrossingFsmNode::findAlternateInNextBra
   // -----------------------------------------------------------------------
 
   if (!map_initialized_) return std::nullopt;
+
+  // Bidirectional-driving guard (Phase 3c): same reasoning as checkArmCondition() —
+  // the fork-parent resolution below assumes route_lanelets_ index order == travel
+  // order (parent = pre_idx - 1). While ego is reversing that assumption doesn't
+  // hold, and picking the wrong fork parent could route the ARM_CROSSWALK reroute
+  // decision onto a wrong branch. Per the audit's simpler/safer option, reroute
+  // branch-finding is disabled entirely while ego is reversing — the FSM will hold
+  // at the pre stop and keep waiting for crosswalk detection instead.
+  if (!is_driving_forward_) return std::nullopt;
 
   lanelet::ConstLanelets parents;
 
@@ -1838,6 +1885,27 @@ void RoadCrossingFsmNode::setDetectorEnabled(
     });
 }
 
+void RoadCrossingFsmNode::reZeroAimerDirectionAware()
+{
+  if (is_driving_forward_) {
+    // Forward: unchanged behavior — disable triggers the aimer's own
+    // zero_on_disable ramp back to rotary angle 0 (nose), which is correct
+    // since the nose leads while driving forward.
+    setDetectorEnabled(cli_rotary_aimer_, false, "rotary_aimer");
+    return;
+  }
+
+  // Reversing: do NOT disable. See header comment on this function — the
+  // aimer's hardcoded "re-zero to nose" would point the turret away from the
+  // direction of travel while reversing. Leaving it enabled keeps it running
+  // its own TF/pose-based tf_pedestrian light search, which is direction-
+  // correct by construction (unlike the fixed-zero fallback).
+  RCLCPP_INFO(
+    get_logger(),
+    "reZeroAimerDirectionAware: ego reversing — skipping aimer disable/nose-zero, "
+    "leaving aimer enabled to keep tracking via TF/pose-based light search");
+}
+
 // ---------------------------------------------------------------------------
 // AdAPI reroute helpers
 // ---------------------------------------------------------------------------
@@ -2003,9 +2071,10 @@ void RoadCrossingFsmNode::resetEpisode()
   crosswalk_detector_lazy_enabled_ = false;
 
   // Disable rotary aimer setiap episode reset/abort-ke-IDLE agar platform re-zero
-  // (menghadap depan) saat penyeberangan dibatalkan atau selesai lewat jalur lain.
-  // Idempotent — SetBool false aman dikirim meski sudah disabled.
-  setDetectorEnabled(cli_rotary_aimer_, false, "rotary_aimer");
+  // saat penyeberangan dibatalkan atau selesai lewat jalur lain — direction-aware
+  // (see reZeroAimerDirectionAware()). Idempotent — SetBool false aman dikirim
+  // meski sudah disabled.
+  reZeroAimerDirectionAware();
 }
 
 }  // namespace autoware::road_crossing_fsm

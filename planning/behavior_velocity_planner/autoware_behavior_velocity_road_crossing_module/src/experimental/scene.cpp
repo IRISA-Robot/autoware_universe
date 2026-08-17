@@ -211,9 +211,18 @@ std::pair<double, std::optional<double>> RoadCrossingModule::findEgoAndStopPoint
     return {ego_s, std::nullopt};
   }
 
-  const double base_link2front = planner_data.vehicle_info_.max_longitudinal_offset_m;
+  // Offset from base_link to the vehicle's LEADING edge along the current
+  // direction of travel. When driving forward the leading edge is the front
+  // bumper (max_longitudinal_offset_m, positive). When reversing, the
+  // physically leading edge is the REAR bumper — min_longitudinal_offset_m
+  // is defined as -rear_overhang_m (see vehicle_info.cpp), so negate it to
+  // get a positive "distance from base_link to leading edge" consistent
+  // with the forward case.
+  const double leading_edge_offset = planner_data.is_driving_forward
+    ? planner_data.vehicle_info_.max_longitudinal_offset_m
+    : -planner_data.vehicle_info_.min_longitudinal_offset_m;
 
-  // For PRE instances, place the stop point so that the robot's front bumper
+  // For PRE instances, place the stop point so that the robot's leading edge
   // is pre_stop_dist_m BEFORE the polygon entry — keeping the robot in the
   // parent (fork) lanelet so an alternate-branch reroute is still reachable.
   // For ROAD instances, use the existing stop_margin gap (unchanged behaviour).
@@ -221,7 +230,7 @@ std::pair<double, std::optional<double>> RoadCrossingModule::findEgoAndStopPoint
     ? planner_param_.pre_stop_dist_m
     : planner_param_.stop_margin;
 
-  const double stop_s = *raw_entry_s - (base_link2front + clearance);
+  const double stop_s = *raw_entry_s - (leading_edge_offset + clearance);
   if (stop_s < 0.0) {
     // Stop point is behind ego (ego already very close to / past entry); skip
     return {ego_s, std::nullopt};
@@ -259,10 +268,15 @@ void RoadCrossingModule::updateState(
           // lanelet centerline; if arc length > centerline length, past.
           const auto centerline = crossing.centerline2d().basicLineString();
           if (centerline.size() >= 2) {
-            const auto & exit_pt = centerline.back();
+            // entry/exit are direction-of-travel dependent: when driving forward
+            // the lanelet's own front()/back() order matches travel direction, but
+            // when reversing the vehicle enters via back() and exits via front().
+            const auto & entry_pt =
+              planner_data.is_driving_forward ? centerline.front() : centerline.back();
+            const auto & exit_pt =
+              planner_data.is_driving_forward ? centerline.back() : centerline.front();
             const double dx = ego_pos.x - exit_pt.x();
             const double dy = ego_pos.y - exit_pt.y();
-            const auto & entry_pt = centerline.front();
             const double cdx = exit_pt.x() - entry_pt.x();
             const double cdy = exit_pt.y() - entry_pt.y();
             // Project (ego - exit) onto centerline direction. Positive = past exit.
@@ -427,8 +441,11 @@ void RoadCrossingModule::updateState(
       bool past_exit = false;
       const auto centerline = crossing.centerline2d().basicLineString();
       if (centerline.size() >= 2) {
-        const auto & entry = centerline.front();
-        const auto & exit = centerline.back();
+        // See APPROACHING case above: entry/exit swap with travel direction.
+        const auto & entry =
+          planner_data.is_driving_forward ? centerline.front() : centerline.back();
+        const auto & exit =
+          planner_data.is_driving_forward ? centerline.back() : centerline.front();
         const double cdx = exit.x() - entry.x();
         const double cdy = exit.y() - entry.y();
         // Vector from exit point to ego, dotted with (entry→exit) direction.
@@ -456,7 +473,11 @@ bool RoadCrossingModule::modifyPathVelocity(
   Trajectory & path, const std::vector<geometry_msgs::msg::Point> & left_bound,
   const std::vector<geometry_msgs::msg::Point> & right_bound, const PlannerData & planner_data)
 {
-  debug_data_.base_link2front = planner_data.vehicle_info_.max_longitudinal_offset_m;
+  // Debug/virtual-wall offset: distance from base_link to the leading edge in
+  // the current direction of travel (see findEgoAndStopPoint()).
+  debug_data_.base_link2front = planner_data.is_driving_forward
+    ? planner_data.vehicle_info_.max_longitudinal_offset_m
+    : -planner_data.vehicle_info_.min_longitudinal_offset_m;
   debug_data_.current_state = state_;
   debug_data_.stop_pose.reset();
 
@@ -496,7 +517,7 @@ bool RoadCrossingModule::modifyPathVelocity(
       path.restore(), planner_data.current_odometry->pose,
       path.compute(*stop_s).point.pose,
       autoware_internal_planning_msgs::msg::PlanningFactor::STOP,
-      autoware_internal_planning_msgs::msg::SafetyFactorArray{}, true /*is_driving_forward*/,
+      autoware_internal_planning_msgs::msg::SafetyFactorArray{}, planner_data.is_driving_forward,
       0.0, 0.0 /*shift distance*/, "road_crossing");
 
     debug_data_.stop_pose = path.compute(*stop_s).point.pose;
