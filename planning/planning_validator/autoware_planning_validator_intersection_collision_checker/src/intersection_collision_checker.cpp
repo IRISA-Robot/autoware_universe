@@ -219,6 +219,14 @@ bool IntersectionCollisionChecker::is_safe(DebugData & debug_data)
   return false;
 }
 
+bool IntersectionCollisionChecker::is_driving_forward() const
+{
+  // Small negative threshold so that near-zero velocity (e.g. momentarily stopped) is still
+  // treated as forward, matching the default assumption used elsewhere in the planning stack.
+  constexpr double reverse_vel_th = -1e-3;
+  return context_->data->current_kinematics->twist.twist.linear.x >= reverse_vel_th;
+}
+
 EgoTrajectory IntersectionCollisionChecker::get_ego_trajectory() const
 {
   EgoTrajectory ego_traj;
@@ -232,18 +240,27 @@ EgoTrajectory IntersectionCollisionChecker::get_ego_trajectory() const
   const auto ego_back_pose = autoware_utils::calc_offset_pose(
     context_->data->current_kinematics->pose.pose, base_to_back_offset, 0.0, 0.0);
 
+  // `front_traj`/`front_index` are consumed downstream as the physically-leading edge (the
+  // edge that reaches an overlap first), and `back_traj`/`back_index` as the trailing edge
+  // (the edge that leaves an overlap last). The front bumper is the leading edge when driving
+  // forward, but the rear bumper is the leading edge when reversing, so swap which physical
+  // bumper feeds each field in that case.
+  const auto is_forward = is_driving_forward();
+  const auto & leading_pose = is_forward ? ego_front_pose : ego_back_pose;
+  const auto & trailing_pose = is_forward ? ego_back_pose : ego_front_pose;
+
   const auto & trajectory_points = context_->data->resampled_current_trajectory->points;
   ego_traj.front_traj = trajectory_points;
   ego_traj.back_traj = trajectory_points;
   autoware::motion_utils::calculate_time_from_start(
-    ego_traj.front_traj, ego_front_pose.position, min_traj_vel);
+    ego_traj.front_traj, leading_pose.position, min_traj_vel);
   autoware::motion_utils::calculate_time_from_start(
-    ego_traj.back_traj, ego_back_pose.position, min_traj_vel);
+    ego_traj.back_traj, trailing_pose.position, min_traj_vel);
 
   ego_traj.front_index =
-    autoware::motion_utils::findNearestIndex(ego_traj.front_traj, ego_front_pose.position);
+    autoware::motion_utils::findNearestIndex(ego_traj.front_traj, leading_pose.position);
   ego_traj.back_index =
-    autoware::motion_utils::findNearestIndex(ego_traj.back_traj, ego_back_pose.position);
+    autoware::motion_utils::findNearestIndex(ego_traj.back_traj, trailing_pose.position);
 
   return ego_traj;
 }
@@ -252,9 +269,11 @@ void IntersectionCollisionChecker::get_lanelets(
   DebugData & debug_data, const EgoTrajectory & ego_trajectory) const
 {
   const auto & ego_pose = context_->data->current_kinematics->pose.pose;
+  const auto is_forward = is_driving_forward();
   try {
     collision_checker_utils::set_trajectory_lanelets(
-      ego_trajectory.front_traj, *context_->data->route_handler, ego_pose, debug_data.ego_lanelets);
+      ego_trajectory.front_traj, *context_->data->route_handler, ego_pose, is_forward,
+      debug_data.ego_lanelets);
   } catch (const std::logic_error & e) {
     RCLCPP_ERROR(logger_, "failed to get trajectory lanelets: %s", e.what());
     debug_data.turn_direction = Direction::NONE;
@@ -280,7 +299,7 @@ void IntersectionCollisionChecker::get_lanelets(
       time_horizon);
   } else {
     collision_checker_utils::set_left_turn_target_lanelets(
-      ego_trajectory, context_, params_, debug_data.ego_lanelets, target_lanelets_map_,
+      ego_trajectory, context_, params_, debug_data.ego_lanelets, target_lanelets_map_, is_forward,
       time_horizon);
   }
 

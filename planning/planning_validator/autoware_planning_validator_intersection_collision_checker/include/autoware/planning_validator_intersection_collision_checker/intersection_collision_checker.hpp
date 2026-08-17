@@ -51,6 +51,8 @@ private:
 
   [[nodiscard]] bool is_safe(DebugData & debug_data);
 
+  [[nodiscard]] bool is_driving_forward() const;
+
   [[nodiscard]] EgoTrajectory get_ego_trajectory() const;
 
   void get_lanelets(DebugData & debug_data, const EgoTrajectory & ego_trajectory) const;

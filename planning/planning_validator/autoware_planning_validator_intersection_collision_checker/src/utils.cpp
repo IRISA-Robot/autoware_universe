@@ -53,35 +53,68 @@ bool is_turn_lanelet(const lanelet::ConstLanelet & ll)
 {
   return ll.hasAttribute("turn_direction") && ll.attribute("turn_direction") != "straight";
 }
+
+// Lanelets physically ahead of `ll` along the ego's actual direction of travel: the
+// topological successors when driving forward, the topological predecessors when reversing.
+lanelet::ConstLanelets get_leading_lanelets(
+  const RouteHandler & route_handler, const lanelet::ConstLanelet & ll,
+  const bool is_driving_forward)
+{
+  return is_driving_forward ? route_handler.getNextLanelets(ll) : route_handler.getPreviousLanelets(ll);
+}
+
+// Same as above, but restricted to lanelets that are within the planned route (single result).
+bool get_trailing_lanelets_within_route(
+  const RouteHandler & route_handler, const lanelet::ConstLanelet & ll,
+  const bool is_driving_forward, lanelet::ConstLanelets * out_lanelets)
+{
+  // "Trailing" = already passed relative to the direction of travel: predecessors when driving
+  // forward, successors when reversing.
+  return is_driving_forward ? route_handler.getPreviousLaneletsWithinRoute(ll, out_lanelets)
+                             : route_handler.getNextLaneletsWithinRoute(ll, out_lanelets);
+}
 }  // namespace
 
 void set_trajectory_lanelets(
   const TrajectoryPoints & trajectory_points, const RouteHandler & route_handler,
-  const geometry_msgs::msg::Pose & ego_pose, EgoLanelets & lanelets)
+  const geometry_msgs::msg::Pose & ego_pose, const bool is_driving_forward, EgoLanelets & lanelets)
 {
   lanelet::ConstLanelet closest_lanelet;
   if (!route_handler.getClosestLaneletWithinRoute(ego_pose, &closest_lanelet)) {
     throw std::logic_error("failed to get closest lanelet within route");
   }
 
-  const auto forward_trajectory_length = autoware::motion_utils::calcSignedArcLength(
+  const auto trajectory_length = autoware::motion_utils::calcSignedArcLength(
     trajectory_points, ego_pose.position, trajectory_points.size() - 1);
 
+  // The trajectory extends topologically forward (successor direction) when driving forward,
+  // and topologically backward (predecessor direction) when reversing.
+  const auto backward_distance = is_driving_forward ? 0.0 : trajectory_length;
+  const auto forward_distance = is_driving_forward ? trajectory_length : 0.0;
   lanelets.trajectory_lanelets =
-    route_handler.getLaneletSequence(closest_lanelet, ego_pose, 0.0, forward_trajectory_length);
+    route_handler.getLaneletSequence(closest_lanelet, ego_pose, backward_distance, forward_distance);
+  if (!is_driving_forward) {
+    // getLaneletSequence() always returns lanelets in topological (predecessor -> successor)
+    // order; reverse so the array follows the ego's actual physical direction of travel, same
+    // as in the forward-driving case.
+    std::reverse(lanelets.trajectory_lanelets.begin(), lanelets.trajectory_lanelets.end());
+  }
 
-  lanelet::ConstLanelets prev_lanelets{closest_lanelet};
+  lanelet::ConstLanelets trailing_lanelets{closest_lanelet};
   if (is_turn_lanelet(closest_lanelet)) {
-    while (route_handler.getPreviousLaneletsWithinRoute(prev_lanelets.front(), &prev_lanelets) &&
-           is_turn_lanelet(prev_lanelets.front())) {
+    while (get_trailing_lanelets_within_route(
+             route_handler, trailing_lanelets.front(), is_driving_forward, &trailing_lanelets) &&
+           is_turn_lanelet(trailing_lanelets.front())) {
       lanelets.trajectory_lanelets.insert(
-        lanelets.trajectory_lanelets.begin(), prev_lanelets.front());
+        lanelets.trajectory_lanelets.begin(), trailing_lanelets.front());
     }
   }
 
-  if (route_handler.getPreviousLaneletsWithinRoute(closest_lanelet, &prev_lanelets)) {
-    lanelets.connected_lanelets.push_back(prev_lanelets.front());
-    for (const auto & connected_ll : route_handler.getNextLanelets(prev_lanelets.front())) {
+  if (get_trailing_lanelets_within_route(
+        route_handler, closest_lanelet, is_driving_forward, &trailing_lanelets)) {
+    lanelets.connected_lanelets.push_back(trailing_lanelets.front());
+    for (const auto & connected_ll :
+         get_leading_lanelets(route_handler, trailing_lanelets.front(), is_driving_forward)) {
       lanelets.connected_lanelets.push_back(connected_ll);
     }
   }
@@ -101,7 +134,7 @@ void set_trajectory_lanelets(
   for (const auto & ll : lanelets.trajectory_lanelets) {
     if (!lock_turn_lanelets) set_turn_lanelet(ll);
     // Add connected lanelets to the list
-    for (const auto & connected_ll : route_handler.getNextLanelets(ll)) {
+    for (const auto & connected_ll : get_leading_lanelets(route_handler, ll, is_driving_forward)) {
       lanelets.connected_lanelets.push_back(connected_ll);
     }
   }
@@ -264,7 +297,7 @@ void set_right_turn_target_lanelets(
 void set_left_turn_target_lanelets(
   const EgoTrajectory & ego_traj, const std::shared_ptr<PlanningValidatorContext> & context,
   const intersection_collision_checker_node::Params & params, const EgoLanelets & lanelets,
-  TargetLaneletsMap & target_lanelets, const double time_horizon)
+  TargetLaneletsMap & target_lanelets, const bool is_driving_forward, const double time_horizon)
 {
   if (lanelets.turn_lanelets.empty()) return;
   const std::string turn_direction =
@@ -274,8 +307,23 @@ void set_left_turn_target_lanelets(
   const auto route_handler = *context->data->route_handler;
 
   const auto last_turn_ll = lanelets.turn_lanelets.back();
+  // "next" here means the lanelet ego reaches right after exiting the turn, in its actual
+  // direction of travel: the topological successor when driving forward, the topological
+  // predecessor when reversing.
   lanelet::ConstLanelet next_lanelet;
-  if (!route_handler.getNextLaneletWithinRoute(last_turn_ll, &next_lanelet)) return;
+  bool has_next_lanelet = false;
+  if (is_driving_forward) {
+    has_next_lanelet = route_handler.getNextLaneletWithinRoute(last_turn_ll, &next_lanelet);
+  } else {
+    lanelet::ConstLanelets prev_lanelets;
+    if (
+      route_handler.getPreviousLaneletsWithinRoute(last_turn_ll, &prev_lanelets) &&
+      !prev_lanelets.empty()) {
+      next_lanelet = prev_lanelets.front();
+      has_next_lanelet = true;
+    }
+  }
+  if (!has_next_lanelet) return;
 
   autoware_utils::LineString2d trajectory_ls;
   for (const auto & p : ego_traj.front_traj) {
@@ -315,7 +363,12 @@ void set_left_turn_target_lanelets(
     };
 
   const auto turn_lanelet_id = last_turn_ll.id();
-  for (const auto & ll : route_handler.getPreviousLanelets(next_lanelet)) {
+  // Candidates that also converge on `next_lanelet` from the same side as the turn maneuver:
+  // topological predecessors when driving forward, topological successors when reversing.
+  const auto candidate_lanelets = is_driving_forward
+                                     ? route_handler.getPreviousLanelets(next_lanelet)
+                                     : route_handler.getNextLanelets(next_lanelet);
+  for (const auto & ll : candidate_lanelets) {
     const auto id = ll.id();
     if (id == turn_lanelet_id || ignore_turning(ll)) continue;
     const auto overlap_index = get_overlap_index(ll, ego_traj.front_traj, trajectory_ls);

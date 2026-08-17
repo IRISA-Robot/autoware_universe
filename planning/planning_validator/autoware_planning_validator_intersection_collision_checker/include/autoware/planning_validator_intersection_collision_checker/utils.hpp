@@ -39,7 +39,8 @@ namespace autoware::planning_validator::collision_checker_utils
 
 void set_trajectory_lanelets(
   const TrajectoryPoints & trajectory_points, const RouteHandler & route_handler,
-  const geometry_msgs::msg::Pose & ego_pose, EgoLanelets & lanelets);
+  const geometry_msgs::msg::Pose & ego_pose, const bool is_driving_forward,
+  EgoLanelets & lanelets);
 
 void set_right_turn_target_lanelets(
   const EgoTrajectory & ego_traj, const std::shared_ptr<PlanningValidatorContext> & context,
@@ -50,7 +51,7 @@ void set_right_turn_target_lanelets(
 void set_left_turn_target_lanelets(
   const EgoTrajectory & ego_traj, const std::shared_ptr<PlanningValidatorContext> & context,
   const intersection_collision_checker_node::Params & params, const EgoLanelets & lanelets,
-  TargetLaneletsMap & target_lanelets,
+  TargetLaneletsMap & target_lanelets, const bool is_driving_forward,
   const double time_horizon = std::numeric_limits<double>::max());
 
 MarkerArray get_lanelets_marker_array(const DebugData & debug_data);
