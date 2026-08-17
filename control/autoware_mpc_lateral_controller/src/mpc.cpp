@@ -217,10 +217,60 @@ void MPC::setReferenceTrajectory(
     return;
   }
 
-  const auto is_forward_shift =
-    autoware::motion_utils::isDrivingForward(mpc_traj_resampled.toTrajectoryPoints());
+  const auto resampled_traj_points = mpc_traj_resampled.toTrajectoryPoints();
+  const auto is_forward_shift_by_pose =
+    autoware::motion_utils::isDrivingForward(resampled_traj_points);
+  const auto is_forward_shift_by_twist =
+    autoware::motion_utils::isDrivingForwardWithTwist(resampled_traj_points);
 
-  // if driving direction is unknown, use previous value
+  // [BIDIR-DEBUG] The pose-based check (isDrivingForward) compares point(0)'s orientation
+  // against the azimuth from point(0)->point(1). For centerline-derived paths (see
+  // RouteHandler::getCenterLinePath), pose orientation at every point is itself set to the
+  // azimuth toward the NEXT point in the (already correctly reversed, for inverted lanelets)
+  // point order. That makes the pose-based check trivially true for any well-formed path,
+  // forward or backward, since it is comparing the path's own tangent against itself. Log both
+  // checks + raw data here so a live test can confirm this disagreement with real numbers.
+  {
+    const size_t n = resampled_traj_points.size();
+    const double x0 = n > 0 ? resampled_traj_points.at(0).pose.position.x : 0.0;
+    const double y0 = n > 0 ? resampled_traj_points.at(0).pose.position.y : 0.0;
+    const double yaw0 = n > 0 ? tf2::getYaw(resampled_traj_points.at(0).pose.orientation) : 0.0;
+    const double vx0 = n > 0 ? resampled_traj_points.at(0).longitudinal_velocity_mps : 0.0;
+    const double x1 = n > 1 ? resampled_traj_points.at(1).pose.position.x : 0.0;
+    const double y1 = n > 1 ? resampled_traj_points.at(1).pose.position.y : 0.0;
+    const double yaw1 = n > 1 ? tf2::getYaw(resampled_traj_points.at(1).pose.orientation) : 0.0;
+    const double vx1 = n > 1 ? resampled_traj_points.at(1).longitudinal_velocity_mps : 0.0;
+    RCLCPP_WARN_THROTTLE(
+      m_logger, *m_clock, 1000,
+      "[BIDIR-DEBUG] setReferenceTrajectory: isDrivingForward(pose)=%s "
+      "isDrivingForwardWithTwist=%s | pt0(x=%.3f y=%.3f yaw=%.3f vx=%.3f) "
+      "pt1(x=%.3f y=%.3f yaw=%.3f vx=%.3f)",
+      is_forward_shift_by_pose ? (is_forward_shift_by_pose.value() ? "true" : "false") : "nullopt",
+      is_forward_shift_by_twist ? (is_forward_shift_by_twist.value() ? "true" : "false")
+                                : "nullopt",
+      x0, y0, yaw0, vx0, x1, y1, yaw1, vx1);
+  }
+
+  // Neither isDrivingForward() nor isDrivingForwardWithTwist() can be trusted here: for
+  // trajectories with >= 2 points, isDrivingForwardWithTwist() just forwards to the pose-based
+  // isDrivingForward() (see autoware_motion_utils/trajectory/trajectory.hpp), which is a
+  // tautology for centerline-derived paths as explained above. Determine direction directly
+  // from the resampled trajectory's own velocity sign instead, which is confirmed correct
+  // (negative) upstream for reversed-lanelet routes.
+  std::optional<bool> is_forward_shift = std::nullopt;
+  constexpr double vx_direction_eps = 1e-2;
+  for (const double vx : mpc_traj_resampled.vx) {
+    if (vx > vx_direction_eps) {
+      is_forward_shift = true;
+      break;
+    }
+    if (vx < -vx_direction_eps) {
+      is_forward_shift = false;
+      break;
+    }
+  }
+
+  // if driving direction is unknown (e.g. all-zero velocity), use previous value
   m_is_forward_shift = is_forward_shift ? is_forward_shift.value() : m_is_forward_shift;
 
   // path smoothing
