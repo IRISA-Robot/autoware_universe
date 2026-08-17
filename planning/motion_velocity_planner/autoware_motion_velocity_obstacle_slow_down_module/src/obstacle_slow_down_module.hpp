@@ -100,7 +100,7 @@ private:
   convert_point_cloud_to_slow_down_points(
     const PlannerData::Pointcloud & pointcloud, const std::vector<TrajectoryPoint> & traj_points,
     const std::vector<Polygon2d> & decimated_traj_polys_with_lat_margin,
-    const VehicleInfo & vehicle_info, const size_t ego_idx);
+    const VehicleInfo & vehicle_info, const size_t ego_idx, const bool is_driving_forward);
   std::vector<SlowDownObstacle> filter_slow_down_obstacle_for_predicted_object(
     const Odometry & odometry, const double ego_nearest_dist_threshold,
     const double ego_nearest_yaw_threshold,
@@ -112,7 +112,8 @@ private:
   std::vector<SlowDownObstacle> filter_slow_down_obstacle_for_point_cloud(
     const std::vector<TrajectoryPoint> & traj_points,
     const std::vector<Polygon2d> & decimated_traj_polys_with_lat_margin,
-    const PlannerData::Pointcloud & point_cloud, const VehicleInfo & vehicle_info, size_t ego_idx);
+    const PlannerData::Pointcloud & point_cloud, const VehicleInfo & vehicle_info, size_t ego_idx,
+    const bool is_driving_forward);
   std::optional<SlowDownObstacle> create_slow_down_obstacle_for_predicted_object(
     const std::vector<TrajectoryPoint> & traj_points,
     const std::vector<Polygon2d> & decimated_traj_polys_with_lat_margin,

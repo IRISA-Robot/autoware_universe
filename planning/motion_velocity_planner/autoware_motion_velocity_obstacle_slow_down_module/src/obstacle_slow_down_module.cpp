@@ -224,7 +224,7 @@ std::vector<autoware::motion_velocity_planner::SlowDownPointData>
 ObstacleSlowDownModule::convert_point_cloud_to_slow_down_points(
   const PlannerData::Pointcloud & pointcloud, const std::vector<TrajectoryPoint> & traj_points,
   const std::vector<Polygon2d> & decimated_traj_polys_with_lat_margin,
-  const VehicleInfo & vehicle_info, const size_t ego_idx)
+  const VehicleInfo & vehicle_info, const size_t ego_idx, const bool is_driving_forward)
 {
   if (pointcloud.pointcloud.empty()) {
     return {};
@@ -273,7 +273,7 @@ ObstacleSlowDownModule::convert_point_cloud_to_slow_down_points(
 
       const auto current_ego_to_obstacle_distance =
         autoware::motion_velocity_planner::utils::calc_distance_to_front_object(
-          traj_points, ego_idx, obstacle_point);
+          traj_points, ego_idx, obstacle_point, vehicle_info, is_driving_forward);
       if (!current_ego_to_obstacle_distance) {
         continue;
       }
@@ -338,7 +338,8 @@ VelocityPlanningResult ObstacleSlowDownModule::plan(
   auto slow_down_obstacles_for_point_cloud = filter_slow_down_obstacle_for_point_cloud(
     raw_trajectory_points, decimated_traj_polys_with_lat_margin, planner_data->no_ground_pointcloud,
     planner_data->vehicle_info_,
-    planner_data->find_index(raw_trajectory_points, planner_data->current_odometry.pose.pose));
+    planner_data->find_index(raw_trajectory_points, planner_data->current_odometry.pose.pose),
+    planner_data->is_driving_forward);
 
   const auto slow_down_obstacles = autoware::motion_velocity_planner::utils::concat_vectors(
     std::move(slow_down_obstacles_for_predicted_object),
@@ -432,7 +433,8 @@ ObstacleSlowDownModule::filter_slow_down_obstacle_for_predicted_object(
 std::vector<SlowDownObstacle> ObstacleSlowDownModule::filter_slow_down_obstacle_for_point_cloud(
   const std::vector<TrajectoryPoint> & traj_points,
   const std::vector<Polygon2d> & decimated_traj_polys_with_lat_margin,
-  const PlannerData::Pointcloud & point_cloud, const VehicleInfo & vehicle_info, size_t ego_idx)
+  const PlannerData::Pointcloud & point_cloud, const VehicleInfo & vehicle_info, size_t ego_idx,
+  const bool is_driving_forward)
 {
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
 
@@ -454,7 +456,8 @@ std::vector<SlowDownObstacle> ObstacleSlowDownModule::filter_slow_down_obstacle_
   // Get Objects
   const std::vector<autoware::motion_velocity_planner::SlowDownPointData> slow_down_points_data =
     convert_point_cloud_to_slow_down_points(
-      point_cloud, traj_points, decimated_traj_polys_with_lat_margin, vehicle_info, ego_idx);
+      point_cloud, traj_points, decimated_traj_polys_with_lat_margin, vehicle_info, ego_idx,
+      is_driving_forward);
 
   // slow down
   std::vector<SlowDownObstacle> slow_down_obstacles;
@@ -965,6 +968,13 @@ ObstacleSlowDownModule::calculate_distance_to_slow_down_with_constraints(
   const double abs_ego_offset = planner_data->is_driving_forward
                                   ? std::abs(vehicle_info.max_longitudinal_offset_m)
                                   : std::abs(vehicle_info.min_longitudinal_offset_m);
+  // `calcSignedArcLength` below is anchored to the trajectory's own fixed point ordering
+  // (index 0), NOT to ego's actual direction of travel: a larger raw value only means "at a
+  // higher index than ego", which is "further ahead" when driving forward but "further behind"
+  // when reversing (ego then moves toward decreasing index). `direction_sign` converts these
+  // raw index-order deltas to/from physical "along the current direction of travel" deltas, the
+  // same idiom used by `calc_distance_to_front_object()`.
+  const double direction_sign = planner_data->is_driving_forward ? 1.0 : -1.0;
   const double obstacle_vel = obstacle.velocity;
   // calculate slow down velocity
   const double slow_down_vel = calculate_slow_down_velocity(obstacle, prev_output, obstacle_motion);
@@ -974,10 +984,15 @@ ObstacleSlowDownModule::calculate_distance_to_slow_down_with_constraints(
     autoware::motion_utils::calcSignedArcLength(traj_points, 0, obstacle.front_collision_point);
   const double dist_to_back_collision =
     autoware::motion_utils::calcSignedArcLength(traj_points, 0, obstacle.back_collision_point);
+  // physical (direction-of-travel-aware) distance from ego to the collision points
+  const double physical_gap_to_front_collision =
+    direction_sign * (dist_to_front_collision - dist_to_ego);
+  const double physical_gap_to_back_collision =
+    direction_sign * (dist_to_back_collision - dist_to_ego);
 
   // calculate offset distance to first collision considering relative velocity
   const double offset_dist_to_collision = [&]() {
-    if (dist_to_front_collision < dist_to_ego + abs_ego_offset) {
+    if (physical_gap_to_front_collision < abs_ego_offset) {
       return 0.0;
     }
 
@@ -993,7 +1008,7 @@ ObstacleSlowDownModule::calculate_distance_to_slow_down_with_constraints(
     // lower than the obstacle velocity. Without this, the slow down feature will flicker where
     // the ego velocity is very close to the obstacle velocity.
     constexpr double min_relative_vel = 1.0;
-    const double time_to_collision = (dist_to_front_collision - dist_to_ego - abs_ego_offset) /
+    const double time_to_collision = (physical_gap_to_front_collision - abs_ego_offset) /
                                      std::max(min_relative_vel, relative_vel);
 
     const double cropped_time_to_collision = std::max(0.0, time_to_collision);
@@ -1001,18 +1016,25 @@ ObstacleSlowDownModule::calculate_distance_to_slow_down_with_constraints(
   }();
 
   // calculate distance during deceleration, slow down preparation, and slow down
+  // (all physical, i.e. positive means further along the current direction of travel)
   const double min_slow_down_prepare_dist = 3.0;
   const double slow_down_prepare_dist = std::max(
     min_slow_down_prepare_dist,
     slow_down_vel * slow_down_planning_param_.time_margin_on_target_velocity);
-  const double deceleration_dist = offset_dist_to_collision + dist_to_front_collision -
-                                   abs_ego_offset - dist_to_ego - slow_down_prepare_dist;
-  const double slow_down_dist =
-    dist_to_back_collision - dist_to_front_collision + slow_down_prepare_dist;
+  const double physical_deceleration_dist = offset_dist_to_collision +
+                                            physical_gap_to_front_collision - abs_ego_offset -
+                                            slow_down_prepare_dist;
+  const double physical_slow_down_dist =
+    physical_gap_to_back_collision - physical_gap_to_front_collision + slow_down_prepare_dist;
 
-  // calculate distance to start/end slow down
-  const double dist_to_slow_down_start = dist_to_ego + deceleration_dist;
-  const double dist_to_slow_down_end = dist_to_ego + deceleration_dist + slow_down_dist;
+  // convert back to raw index-order distances (same convention as dist_to_ego) to keep this
+  // compatible with insertTargetPoint()/calcSignedArcLength() callers downstream
+  const double dist_to_slow_down_start = dist_to_ego + direction_sign * physical_deceleration_dist;
+  const double dist_to_slow_down_end =
+    dist_to_ego + direction_sign * (physical_deceleration_dist + physical_slow_down_dist);
+  // NOTE: compare the raw index-order distance (not physical_deceleration_dist) to exactly
+  // preserve the original forward-driving threshold semantics -- dist_to_ego is not always 0,
+  // so these two are not interchangeable.
   if (100.0 < dist_to_slow_down_start) {
     // NOTE: distance to slow down is too far.
     return std::nullopt;
@@ -1036,7 +1058,9 @@ ObstacleSlowDownModule::calculate_distance_to_slow_down_with_constraints(
     apply_lowpass_filter(dist_to_slow_down_start, prev_output->start_point);
   const double filtered_dist_to_slow_down_end =
     apply_lowpass_filter(dist_to_slow_down_end, prev_output->end_point);
-  const double deceleration_dist_lpf = filtered_dist_to_slow_down_start - dist_to_ego;
+  // physical (direction-of-travel-aware) deceleration distance after the low-pass filter
+  const double deceleration_dist_lpf =
+    direction_sign * (filtered_dist_to_slow_down_start - dist_to_ego);
 
   // calculate velocity considering constraints
   const double feasible_slow_down_vel = [&]() {
@@ -1073,9 +1097,12 @@ ObstacleSlowDownModule::calculate_distance_to_slow_down_with_constraints(
       // NOTE: If longitudinal controllability is not good, one_shot_slow_down_vel may be getting
       // larger since we use actual ego's velocity and acceleration for its calculation.
       //       Suppress one_shot_slow_down_vel getting larger here.
+      // physical (direction-of-travel-aware): positive means the start point moved further
+      // ahead of ego along the current direction of travel
       const double start_point_diff =
-        filtered_dist_to_slow_down_start -
-        motion_utils::calcSignedArcLength(traj_points, 0, prev_output->start_point->position);
+        direction_sign * (filtered_dist_to_slow_down_start -
+                           motion_utils::calcSignedArcLength(
+                             traj_points, 0, prev_output->start_point->position));
       const double prev_feasible_slow_down_vel = std::sqrt(
         std::max(
           0.0, std::pow(prev_output->feasible_target_vel, 2) +
