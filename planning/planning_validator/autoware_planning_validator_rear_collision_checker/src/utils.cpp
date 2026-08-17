@@ -235,9 +235,15 @@ auto calc_predicted_stop_line(
 auto check_shift_behavior(
   const lanelet::ConstLanelets & lanelets, const bool is_unsafe_holding,
   const std::shared_ptr<PlanningValidatorContext> & context,
-  const rear_collision_checker_node::Params & parameters, DebugData & debug)
-  -> std::pair<Behavior, double>
+  const rear_collision_checker_node::Params & parameters, DebugData & debug,
+  [[maybe_unused]] const bool is_driving_forward) -> std::pair<Behavior, double>
 {
+  // NOTE: this function only walks `context->data->current_trajectory->points`, which are
+  // always ordered along ego's actual direction of travel (regardless of forward/reverse
+  // driving), and only uses `lanelets` for its combined geometric extent (leftBound/rightBound),
+  // which is direction-agnostic. So no successor/predecessor traversal swap is needed here.
+  // `is_driving_forward` is accepted for API symmetry with `check_turn_behavior` and to be
+  // available to future direction-dependent logic in this function.
   const auto & points = context->data->current_trajectory->points;
   const auto & ego_pose = context->data->current_kinematics->pose.pose;
   const auto & vehicle_width = context->vehicle_info.vehicle_width_m;
@@ -351,8 +357,8 @@ auto check_shift_behavior(
 auto check_turn_behavior(
   const lanelet::ConstLanelets & lanelets, const bool is_unsafe_holding,
   const std::shared_ptr<PlanningValidatorContext> & context,
-  const rear_collision_checker_node::Params & parameters, DebugData & debug)
-  -> std::pair<Behavior, double>
+  const rear_collision_checker_node::Params & parameters, DebugData & debug,
+  const bool is_driving_forward) -> std::pair<Behavior, double>
 {
   const auto & points = context->data->current_trajectory->points;
   const auto & ego_pose = context->data->current_kinematics->pose.pose;
@@ -434,17 +440,32 @@ auto check_turn_behavior(
              stoppable_point.value().second;
     };
 
+  // `lanelets` is always ordered from the predecessor-most lanelet to the successor-most one
+  // (topological order), regardless of which way ego is actually driving. Walking it in that
+  // fixed order and treating "larger accumulated length" as "ahead of ego" is only correct for
+  // forward driving. When driving in reverse, ego's actual direction of travel is towards the
+  // predecessor end, so walk the sequence back-to-front and mirror the arc-length coordinate
+  // accordingly (`ego_arc`/`total_length - ego_arc`) so the rest of the loop body — which is
+  // otherwise direction-agnostic — sees a consistent "distance ahead of ego" value.
+  const auto full_length = lanelet::geometry::length2d(lanelet::LaneletSequence(lanelets));
+  const auto ego_arc =
+    is_driving_forward ? ego_coordinate_on_arc.length : full_length - ego_coordinate_on_arc.length;
+
+  lanelet::ConstLanelets ordered_lanelets = lanelets;
+  if (!is_driving_forward) {
+    std::reverse(ordered_lanelets.begin(), ordered_lanelets.end());
+  }
+
   double total_length = 0.0;
-  for (const auto & lane : lanelets) {
-    const auto distance =
-      total_length - ego_coordinate_on_arc.length - vehicle_info.max_longitudinal_offset_m;
+  for (const auto & lane : ordered_lanelets) {
+    const auto distance = total_length - ego_arc - vehicle_info.max_longitudinal_offset_m;
     const std::string turn_direction = lane.attributeOr("turn_direction", "none");
 
     total_length += lanelet::geometry::length2d(lane);
 
     const auto is_reachable = distance < reachable_point.value().second || is_unsafe_holding;
 
-    if (total_length - vehicle_info.min_longitudinal_offset_m < ego_coordinate_on_arc.length) {
+    if (total_length - vehicle_info.min_longitudinal_offset_m < ego_arc) {
       continue;
     }
 
@@ -574,7 +595,7 @@ void fill_time_to_collision(
 
 auto get_current_lanes(
   const std::shared_ptr<PlanningValidatorContext> & context, const double forward_distance,
-  const double backward_distance) -> lanelet::ConstLanelets
+  const double backward_distance, const bool is_driving_forward) -> lanelet::ConstLanelets
 {
   const auto & ego_pose = context->data->current_kinematics->pose.pose;
   const auto & route_handler = context->data->route_handler;
@@ -584,15 +605,26 @@ auto get_current_lanes(
     return {};
   }
 
-  return route_handler->getLaneletSequence(
-    closest_lanelet, ego_pose, backward_distance, forward_distance);
+  // `getLaneletSequence(lanelet, pose, backward_distance, forward_distance)` extends
+  // `backward_distance` towards the predecessor lanelets and `forward_distance` towards the
+  // successor lanelets, i.e. it is defined purely by lane topology, not by ego's actual travel
+  // direction. `forward_distance`/`backward_distance` here are meant as "distance ahead of
+  // ego"/"distance behind ego" in the real direction of travel, so swap which topological
+  // direction they feed when ego is driving in reverse (successor becomes "behind",
+  // predecessor becomes "ahead").
+  return is_driving_forward
+           ? route_handler->getLaneletSequence(
+               closest_lanelet, ego_pose, backward_distance, forward_distance)
+           : route_handler->getLaneletSequence(
+               closest_lanelet, ego_pose, forward_distance, backward_distance);
 }
 
 auto get_previous_polygons_with_lane_recursively(
   const lanelet::ConstLanelets & current_lanes, const lanelet::ConstLanelets & target_lanes,
   const double s1, const double s2,
   const std::shared_ptr<autoware::route_handler::RouteHandler> & route_handler,
-  const double left_offset, const double right_offset) -> DetectionAreas
+  const double left_offset, const double right_offset, const bool is_driving_forward)
+  -> DetectionAreas
 {
   DetectionAreas ret{};
 
@@ -600,27 +632,44 @@ auto get_previous_polygons_with_lane_recursively(
     return ret;
   }
 
-  if (route_handler->getPreviousLanelets(target_lanes.front()).empty()) {
+  // `target_lanes` is always ordered predecessor-most-first / successor-most-last (its callers
+  // preserve this invariant regardless of driving direction). `s1`/`s2` are distances measured
+  // from the end of `target_lanes` that is furthest from ego *in the real direction of travel*.
+  // For forward driving that's the successor end (`.back()`), extended further by walking
+  // predecessors from the front; for reverse driving it's the predecessor end (`.front()`),
+  // extended further by walking successors from the back. Mirror both the extension direction
+  // and the arc-length window accordingly.
+  const auto & edge_lanelet = is_driving_forward ? target_lanes.front() : target_lanes.back();
+  const auto adjacent_lanelets = is_driving_forward
+                                   ? route_handler->getPreviousLanelets(edge_lanelet)
+                                   : route_handler->getNextLanelets(edge_lanelet);
+
+  const auto arc_length_window = [&is_driving_forward, &s1, &s2](const double total_length) {
+    return is_driving_forward ? std::make_pair(total_length - s2, total_length - s1)
+                               : std::make_pair(s1, s2);
+  };
+
+  if (adjacent_lanelets.empty()) {
     const auto total_length = lanelet::geometry::length2d(lanelet::LaneletSequence(target_lanes));
+    const auto [from, to] = arc_length_window(total_length);
     const auto expand_lanelets =
       lanelet::utils::getExpandedLanelets(target_lanes, left_offset, -1.0 * right_offset);
-    const auto polygon = lanelet::utils::getPolygonFromArcLength(
-      expand_lanelets, total_length - s2, total_length - s1);
+    const auto polygon = lanelet::utils::getPolygonFromArcLength(expand_lanelets, from, to);
     ret.emplace_back(polygon.basicPolygon(), target_lanes);
     return ret;
   }
 
-  for (const auto & prev_lane : route_handler->getPreviousLanelets(target_lanes.front())) {
+  for (const auto & adjacent_lane : adjacent_lanelets) {
     {
       const auto overlap_current_lanes = std::any_of(
         current_lanes.begin(), current_lanes.end(),
-        [&prev_lane](const auto & lane) { return lane.id() == prev_lane.id(); });
+        [&adjacent_lane](const auto & lane) { return lane.id() == adjacent_lane.id(); });
       const auto total_length = lanelet::geometry::length2d(lanelet::LaneletSequence(target_lanes));
       if (overlap_current_lanes) {
+        const auto [from, to] = arc_length_window(total_length);
         const auto expand_lanelets =
           lanelet::utils::getExpandedLanelets(target_lanes, left_offset, -1.0 * right_offset);
-        const auto polygon = lanelet::utils::getPolygonFromArcLength(
-          expand_lanelets, total_length - s2, total_length - s1);
+        const auto polygon = lanelet::utils::getPolygonFromArcLength(expand_lanelets, from, to);
         ret.emplace_back(polygon.basicPolygon(), target_lanes);
 
         continue;
@@ -628,19 +677,24 @@ auto get_previous_polygons_with_lane_recursively(
     }
 
     lanelet::ConstLanelets pushed_lanes = target_lanes;
-    pushed_lanes.insert(pushed_lanes.begin(), prev_lane);
+    if (is_driving_forward) {
+      pushed_lanes.insert(pushed_lanes.begin(), adjacent_lane);
+    } else {
+      pushed_lanes.push_back(adjacent_lane);
+    }
 
     {
       const auto total_length = lanelet::geometry::length2d(lanelet::LaneletSequence(pushed_lanes));
       if (total_length > s2) {
+        const auto [from, to] = arc_length_window(total_length);
         const auto expand_lanelets =
           lanelet::utils::getExpandedLanelets(pushed_lanes, left_offset, -1.0 * right_offset);
-        const auto polygon = lanelet::utils::getPolygonFromArcLength(
-          expand_lanelets, total_length - s2, total_length - s1);
+        const auto polygon = lanelet::utils::getPolygonFromArcLength(expand_lanelets, from, to);
         ret.emplace_back(polygon.basicPolygon(), pushed_lanes);
       } else {
         const auto polygons = get_previous_polygons_with_lane_recursively(
-          current_lanes, pushed_lanes, s1, s2, route_handler, left_offset, right_offset);
+          current_lanes, pushed_lanes, s1, s2, route_handler, left_offset, right_offset,
+          is_driving_forward);
         ret.insert(ret.end(), polygons.begin(), polygons.end());
       }
     }
@@ -672,11 +726,20 @@ auto get_obstacle_points(const lanelet::BasicPolygons3d & polygons, const PointC
 
 auto generate_detection_polygon(
   const lanelet::ConstLanelets & lanelets, const geometry_msgs::msg::Pose & ego_pose,
-  const double forward_distance, const double backward_distance) -> lanelet::BasicPolygon3d
+  const double forward_distance, const double backward_distance, const bool is_driving_forward)
+  -> lanelet::BasicPolygon3d
 {
   const auto ego_coordinate_on_arc = lanelet::utils::getArcCoordinates(lanelets, ego_pose).length;
-  const auto polygon = lanelet::utils::getPolygonFromArcLength(
-    lanelets, ego_coordinate_on_arc - backward_distance, ego_coordinate_on_arc + forward_distance);
+  // Arc length increases towards the successor end of `lanelets` regardless of driving
+  // direction. `forward_distance`/`backward_distance` are meant relative to ego's real travel
+  // direction, so swap which side of the arc-length axis they extend into when reversing.
+  const auto [from, to] =
+    is_driving_forward
+      ? std::make_pair(
+          ego_coordinate_on_arc - backward_distance, ego_coordinate_on_arc + forward_distance)
+      : std::make_pair(
+          ego_coordinate_on_arc - forward_distance, ego_coordinate_on_arc + backward_distance);
+  const auto polygon = lanelet::utils::getPolygonFromArcLength(lanelets, from, to);
   return polygon.basicPolygon();
 }
 

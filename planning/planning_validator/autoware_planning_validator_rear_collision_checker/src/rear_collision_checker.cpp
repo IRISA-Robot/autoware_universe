@@ -17,6 +17,7 @@
 #include "utils.hpp"
 
 #include <autoware/motion_utils/resample/resample.hpp>
+#include <autoware/motion_utils/trajectory/trajectory.hpp>
 #include <autoware/signal_processing/lowpass_filter_1d.hpp>
 #include <autoware_lanelet2_extension/utility/utilities.hpp>
 #include <autoware_lanelet2_extension/visualization/visualization.hpp>
@@ -142,7 +143,8 @@ void RearCollisionChecker::set_diag_status(
   stat.summary(DiagnosticStatus::ERROR, msg);
 }
 
-void RearCollisionChecker::fill_velocity(PointCloudObject & pointcloud_object)
+void RearCollisionChecker::fill_velocity(
+  PointCloudObject & pointcloud_object, const bool is_driving_forward)
 {
   const auto p = param_listener_->get_params();
 
@@ -167,7 +169,14 @@ void RearCollisionChecker::fill_velocity(PointCloudObject & pointcloud_object)
       return;
     }
 
-    const auto raw_velocity = dx / dt + context_->data->current_kinematics->twist.twist.linear.x;
+    // `dx/dt` is the rate of change of the (direction-of-travel-aware) distance behind ego,
+    // which grows at ego's own speed *magnitude* when the object is stationary, regardless of
+    // whether ego is driving forward or in reverse. Use the unsigned speed here so the ego
+    // motion contribution doesn't flip sign under reverse driving (previously this used the
+    // signed twist directly, which double-counted ego's motion as "away" instead of cancelling
+    // it out when reversing).
+    const auto raw_velocity =
+      dx / dt + std::abs(context_->data->current_kinematics->twist.twist.linear.x);
     const auto is_reliable =
       previous_data.tracking_duration > p.common.pointcloud.velocity_estimation.observation_time;
 
@@ -203,8 +212,14 @@ void RearCollisionChecker::fill_velocity(PointCloudObject & pointcloud_object)
   };
 
   if (history_.count(pointcloud_object.furthest_lane.id()) == 0) {
+    // `furthest_lane` is the edge of the detection window closest to where the window will
+    // move to next. As ego travels, that edge shifts one lanelet at a time in ego's direction
+    // of travel: towards the successor lanelet when driving forward, towards the predecessor
+    // lanelet when reversing. Look up history on the opposite (already-visited) side.
     const auto previous_lanes =
-      context_->data->route_handler->getPreviousLanelets(pointcloud_object.furthest_lane);
+      is_driving_forward
+        ? context_->data->route_handler->getPreviousLanelets(pointcloud_object.furthest_lane)
+        : context_->data->route_handler->getNextLanelets(pointcloud_object.furthest_lane);
     for (const auto & previous_lane : previous_lanes) {
       if (history_.count(previous_lane.id()) != 0) {
         fill_velocity(pointcloud_object, history_.at(previous_lane.id()));
@@ -372,7 +387,8 @@ auto RearCollisionChecker::get_clustered_pointcloud(
 
 auto RearCollisionChecker::get_pointcloud_object(
   const rclcpp::Time & now, const PointCloud::Ptr & pointcloud_ptr,
-  const DetectionAreas & detection_areas, DebugData & debug) -> std::optional<PointCloudObject>
+  const DetectionAreas & detection_areas, DebugData & debug, const bool is_driving_forward)
+  -> std::optional<PointCloudObject>
 {
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
 
@@ -385,6 +401,13 @@ auto RearCollisionChecker::get_pointcloud_object(
       lanes, 0.0, std::numeric_limits<double>::max());
     const auto resampled_path = autoware::motion_utils::resamplePath(path, 2.0);
 
+    // `lanes` is always ordered predecessor-most-first / successor-most-last, so `.back()` is
+    // the edge nearest ego when driving forward, and `.front()` is the edge nearest ego when
+    // reversing (see `get_current_lanes`/`get_previous_polygons_with_lane_recursively`).
+    const auto & furthest_lane = is_driving_forward ? lanes.back() : lanes.front();
+    const double path_total_length = autoware::motion_utils::calcSignedArcLength(
+      resampled_path.points, static_cast<size_t>(0), resampled_path.points.size() - 1);
+
     for (const auto & point : pointcloud) {
       const auto p_geom = autoware_utils::create_point(point.x, point.y, point.z);
       const size_t src_seg_idx =
@@ -393,10 +416,18 @@ auto RearCollisionChecker::get_pointcloud_object(
         autoware::motion_utils::calcLongitudinalOffsetToSegment(
           resampled_path.points, src_seg_idx, p_geom);
 
-      const double obj_arc_length =
+      // Raw arc length is always measured as the remaining distance to the successor end of
+      // `resampled_path` (topological, direction-agnostic). Callers of this function measure
+      // ego's own position from the edge of `lanes` closest to ego in the real direction of
+      // travel (`furthest_lane` above), so mirror the object's arc length onto the same
+      // reference edge when reversing, and pick whichever candidate object is closest to that
+      // edge (smallest raw arc length when driving forward, largest when reversing).
+      const double obj_arc_length_raw =
         autoware::motion_utils::calcSignedArcLength(
           resampled_path.points, src_seg_idx, resampled_path.points.size() - 1) -
         signed_length_src_offset;
+      const double obj_arc_length =
+        is_driving_forward ? obj_arc_length_raw : path_total_length - obj_arc_length_raw;
       const auto pose_on_center_line = autoware::motion_utils::calcLongitudinalOffsetPose(
         resampled_path.points, src_seg_idx, signed_length_src_offset);
 
@@ -409,17 +440,20 @@ auto RearCollisionChecker::get_pointcloud_object(
         object.last_update_time = now;
         object.last_stop_time = now;
         object.pose = pose_on_center_line.value();
-        object.furthest_lane = lanes.back();
+        object.furthest_lane = furthest_lane;
         object.tracking_duration = 0.0;
         object.absolute_distance = obj_arc_length;
         object.velocity = 0.0;
         object.moving_time = 0.0;
         opt_object = object;
       } else if (opt_object.value().absolute_distance > obj_arc_length) {
+        // `obj_arc_length` is already expressed as "distance from the near-ego edge of
+        // `lanes`" (see above), so the closest candidate is always the smallest one,
+        // regardless of driving direction.
         opt_object.value().last_update_time = now;
         opt_object.value().last_stop_time = now;
         opt_object.value().pose = pose_on_center_line.value();
-        opt_object.value().furthest_lane = lanes.back();
+        opt_object.value().furthest_lane = furthest_lane;
         opt_object.value().tracking_duration = 0.0;
         opt_object.value().absolute_distance = obj_arc_length;
         opt_object.value().velocity = 0.0;
@@ -448,7 +482,8 @@ auto RearCollisionChecker::get_pointcloud_objects(
 auto RearCollisionChecker::get_pointcloud_objects_on_adjacent_lane(
   const lanelet::ConstLanelets & current_lanes, const Behavior & shift_behavior,
   const double forward_distance, const double backward_distance,
-  const PointCloud::Ptr & obstacle_pointcloud, DebugData & debug) -> PointCloudObjects
+  const PointCloud::Ptr & obstacle_pointcloud, DebugData & debug,
+  const bool is_driving_forward) -> PointCloudObjects
 {
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
 
@@ -463,15 +498,28 @@ auto RearCollisionChecker::get_pointcloud_objects_on_adjacent_lane(
   const auto ego_coordinate_on_arc =
     lanelet::utils::getArcCoordinates(current_lanes, context_->data->current_kinematics->pose.pose);
 
+  // `current_lanes` is always ordered predecessor-most-first / successor-most-last. Walking it
+  // front-to-back and treating "larger accumulated length" as "ahead of ego" is only valid for
+  // forward driving; when reversing, mirror the arc-length coordinate and walk back-to-front so
+  // "ahead" tracks ego's actual direction of travel.
+  const auto full_length = lanelet::geometry::length2d(lanelet::LaneletSequence(current_lanes));
+  const auto ego_arc =
+    is_driving_forward ? ego_coordinate_on_arc.length : full_length - ego_coordinate_on_arc.length;
+
+  lanelet::ConstLanelets ordered_current_lanes = current_lanes;
+  if (!is_driving_forward) {
+    std::reverse(ordered_current_lanes.begin(), ordered_current_lanes.end());
+  }
+
   lanelet::ConstLanelets connected_adjacent_lanes{};
 
   double length = 0.0;
-  for (const auto & lane : current_lanes) {
+  for (const auto & lane : ordered_current_lanes) {
     const auto current_lane_length = lanelet::geometry::length2d(lane);
 
     length += current_lane_length;
 
-    const auto ego_to_furthest_point = length - ego_coordinate_on_arc.length;
+    const auto ego_to_furthest_point = length - ego_arc;
     const auto residual_distance = ego_to_furthest_point - forward_distance;
 
     const auto opt_adjacent_lane = [&lane, &shift_behavior, this]() {
@@ -481,14 +529,22 @@ auto RearCollisionChecker::get_pointcloud_objects_on_adjacent_lane(
     }();
 
     if (opt_adjacent_lane.has_value()) {
-      connected_adjacent_lanes.push_back(opt_adjacent_lane.value());
+      // Keep `connected_adjacent_lanes` ordered predecessor-most-first / successor-most-last
+      // (matching `current_lanes`) regardless of which end we are growing it from while
+      // walking in travel order.
+      if (is_driving_forward) {
+        connected_adjacent_lanes.push_back(opt_adjacent_lane.value());
+      } else {
+        connected_adjacent_lanes.insert(connected_adjacent_lanes.begin(), opt_adjacent_lane.value());
+      }
     }
 
     if (!connected_adjacent_lanes.empty() && residual_distance > 0.0) {
       auto detection_areas = utils::get_previous_polygons_with_lane_recursively(
         current_lanes, connected_adjacent_lanes, residual_distance,
         residual_distance + forward_distance + backward_distance, context_->data->route_handler,
-        p.common.adjacent_lane.offset.left, p.common.adjacent_lane.offset.right);
+        p.common.adjacent_lane.offset.left, p.common.adjacent_lane.offset.right,
+        is_driving_forward);
 
       utils::cut_by_lanelets(current_lanes, detection_areas);
 
@@ -500,7 +556,7 @@ auto RearCollisionChecker::get_pointcloud_objects_on_adjacent_lane(
       time_keeper_->start_track("get_pointcloud_object");
       auto opt_pointcloud_object = get_pointcloud_object(
         context_->data->obstacle_pointcloud->header.stamp, obstacle_pointcloud, detection_areas,
-        debug);
+        debug, is_driving_forward);
       time_keeper_->end_track("get_pointcloud_object");
 
       if (!opt_pointcloud_object.has_value()) {
@@ -517,7 +573,7 @@ auto RearCollisionChecker::get_pointcloud_objects_on_adjacent_lane(
         return objects;
       }
 
-      fill_velocity(opt_pointcloud_object.value());
+      fill_velocity(opt_pointcloud_object.value(), is_driving_forward);
 
       objects.push_back(opt_pointcloud_object.value());
 
@@ -529,7 +585,7 @@ auto RearCollisionChecker::get_pointcloud_objects_on_adjacent_lane(
         current_lanes, connected_adjacent_lanes, 0.0,
         ego_to_furthest_point - current_lane_length + backward_distance,
         context_->data->route_handler, p.common.adjacent_lane.offset.left,
-        p.common.adjacent_lane.offset.right);
+        p.common.adjacent_lane.offset.right, is_driving_forward);
 
       utils::cut_by_lanelets(current_lanes, detection_areas);
 
@@ -543,7 +599,7 @@ auto RearCollisionChecker::get_pointcloud_objects_on_adjacent_lane(
       time_keeper_->start_track("get_pointcloud_object");
       auto opt_pointcloud_object = get_pointcloud_object(
         context_->data->obstacle_pointcloud->header.stamp, obstacle_pointcloud, detection_areas,
-        debug);
+        debug, is_driving_forward);
       time_keeper_->end_track("get_pointcloud_object");
 
       if (!opt_pointcloud_object.has_value()) {
@@ -560,7 +616,7 @@ auto RearCollisionChecker::get_pointcloud_objects_on_adjacent_lane(
         return objects;
       }
 
-      fill_velocity(opt_pointcloud_object.value());
+      fill_velocity(opt_pointcloud_object.value(), is_driving_forward);
 
       objects.push_back(opt_pointcloud_object.value());
     }
@@ -572,7 +628,8 @@ auto RearCollisionChecker::get_pointcloud_objects_on_adjacent_lane(
 auto RearCollisionChecker::get_pointcloud_objects_at_blind_spot(
   const lanelet::ConstLanelets & current_lanes, const Behavior & turn_behavior,
   const double forward_distance, const double backward_distance,
-  const PointCloud::Ptr & obstacle_pointcloud, DebugData & debug) -> PointCloudObjects
+  const PointCloud::Ptr & obstacle_pointcloud, DebugData & debug,
+  const bool is_driving_forward) -> PointCloudObjects
 {
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
 
@@ -584,6 +641,8 @@ auto RearCollisionChecker::get_pointcloud_objects_at_blind_spot(
     return objects;
   }
 
+  // `half_lanes` is built lane-for-lane from `current_lanes`, so it preserves the same
+  // predecessor-most-first / successor-most-last ordering.
   const auto half_lanes = [&current_lanes, &turn_behavior, &p, this]() {
     const auto is_right = turn_behavior == Behavior::TURN_RIGHT;
     lanelet::ConstLanelets ret{};
@@ -597,7 +656,8 @@ auto RearCollisionChecker::get_pointcloud_objects_at_blind_spot(
     return ret;
   }();
   const auto detection_polygon = utils::generate_detection_polygon(
-    half_lanes, context_->data->current_kinematics->pose.pose, forward_distance, backward_distance);
+    half_lanes, context_->data->current_kinematics->pose.pose, forward_distance, backward_distance,
+    is_driving_forward);
 
   DetectionAreas detection_areas{};
   detection_areas.emplace_back(detection_polygon, half_lanes);
@@ -609,7 +669,8 @@ auto RearCollisionChecker::get_pointcloud_objects_at_blind_spot(
 
   time_keeper_->start_track("get_pointcloud_object");
   auto opt_pointcloud_object = get_pointcloud_object(
-    context_->data->obstacle_pointcloud->header.stamp, obstacle_pointcloud, detection_areas, debug);
+    context_->data->obstacle_pointcloud->header.stamp, obstacle_pointcloud, detection_areas, debug,
+    is_driving_forward);
   time_keeper_->end_track("get_pointcloud_object");
 
   if (!opt_pointcloud_object.has_value()) {
@@ -619,9 +680,15 @@ auto RearCollisionChecker::get_pointcloud_objects_at_blind_spot(
   const auto ego_coordinate_on_arc =
     lanelet::utils::getArcCoordinates(current_lanes, context_->data->current_kinematics->pose.pose);
 
+  // Ego's distance to the edge of `half_lanes` nearest ego in the real direction of travel:
+  // the successor end when driving forward, the predecessor end when reversing. This must stay
+  // consistent with `get_pointcloud_object`'s `furthest_lane`/`absolute_distance` selection
+  // above.
   const auto ego_to_furthest_point =
-    lanelet::geometry::length2d(lanelet::LaneletSequence(half_lanes)) -
-    ego_coordinate_on_arc.length;
+    is_driving_forward
+      ? lanelet::geometry::length2d(lanelet::LaneletSequence(half_lanes)) -
+          ego_coordinate_on_arc.length
+      : ego_coordinate_on_arc.length;
 
   opt_pointcloud_object.value().relative_distance =
     opt_pointcloud_object.value().absolute_distance - ego_to_furthest_point -
@@ -633,7 +700,7 @@ auto RearCollisionChecker::get_pointcloud_objects_at_blind_spot(
     return objects;
   }
 
-  fill_velocity(opt_pointcloud_object.value());
+  fill_velocity(opt_pointcloud_object.value(), is_driving_forward);
 
   objects.push_back(opt_pointcloud_object.value());
 
@@ -686,9 +753,21 @@ bool RearCollisionChecker::is_safe(DebugData & debug)
     debug.cluster_points = obstacle_pointcloud;
   }
 
+  // "Forward"/"rear" throughout this module is otherwise defined purely by lanelet topology
+  // (successor vs predecessor), which only matches ego's actual direction of travel when ego is
+  // driving forward. Compute the real direction once here from the planned trajectory (falls
+  // back to `true` if it cannot be determined, e.g. a single-point or zero-velocity trajectory,
+  // matching the default used elsewhere in Autoware, e.g.
+  // `motion_velocity_planner::PlannerData::is_driving_forward`) and thread it through every
+  // function that otherwise assumes forward driving.
+  const auto is_driving_forward =
+    autoware::motion_utils::isDrivingForwardWithTwist(context_->data->current_trajectory->points)
+      .value_or(true);
+
   constexpr double forward = 100.0;
   constexpr double backward = 100.0;
-  const auto current_lanes = utils::get_current_lanes(context_, forward, backward);
+  const auto current_lanes =
+    utils::get_current_lanes(context_, forward, backward, is_driving_forward);
   const auto combine_lanelet = lanelet::utils::combineLaneletsShape(current_lanes);
 
   if (current_lanes.empty()) {
@@ -697,10 +776,10 @@ bool RearCollisionChecker::is_safe(DebugData & debug)
   }
 
   const auto is_unsafe_holding = (now - last_unsafe_time_).seconds() < p.common.off_time_buffer;
-  const auto [turn_behavior, distance_to_turn] =
-    utils::check_turn_behavior(current_lanes, is_unsafe_holding, context_, p, debug);
-  const auto [shift_behavior, distance_to_shift] =
-    utils::check_shift_behavior(current_lanes, is_unsafe_holding, context_, p, debug);
+  const auto [turn_behavior, distance_to_turn] = utils::check_turn_behavior(
+    current_lanes, is_unsafe_holding, context_, p, debug, is_driving_forward);
+  const auto [shift_behavior, distance_to_shift] = utils::check_shift_behavior(
+    current_lanes, is_unsafe_holding, context_, p, debug, is_driving_forward);
 
   {
     debug.current_lanes = current_lanes;
@@ -731,7 +810,7 @@ bool RearCollisionChecker::is_safe(DebugData & debug)
       context_, distance_to_shift, delay_object, max_deceleration_object, max_velocity_object, p);
     const auto func_object_filtering = std::bind(
       &RearCollisionChecker::get_pointcloud_objects_on_adjacent_lane, this, current_lanes,
-      shift_behavior, _1, _2, obstacle_pointcloud, std::ref(debug));
+      shift_behavior, _1, _2, obstacle_pointcloud, std::ref(debug), is_driving_forward);
     const auto func_safety_check = std::bind(
       p.common.adjacent_lane.metric == "ttc" ? utils::fill_time_to_collision
                                              : utils::fill_rss_distance,
@@ -757,7 +836,7 @@ bool RearCollisionChecker::is_safe(DebugData & debug)
       context_, distance_to_turn, delay_object, max_deceleration_object, max_velocity_object, p);
     const auto func_object_filtering = std::bind(
       &RearCollisionChecker::get_pointcloud_objects_at_blind_spot, this, current_lanes,
-      turn_behavior, _1, _2, obstacle_pointcloud, std::ref(debug));
+      turn_behavior, _1, _2, obstacle_pointcloud, std::ref(debug), is_driving_forward);
     const auto func_safety_check = std::bind(
       p.common.blind_spot.metric == "ttc" ? utils::fill_time_to_collision
                                           : utils::fill_rss_distance,

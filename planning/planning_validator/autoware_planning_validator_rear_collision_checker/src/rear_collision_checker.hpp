@@ -39,7 +39,7 @@ public:
   std::string get_module_name() const override { return module_name_; };
 
 private:
-  void fill_velocity(PointCloudObject & pointcloud_object);
+  void fill_velocity(PointCloudObject & pointcloud_object, const bool is_driving_forward);
 
   auto filter_pointcloud(DebugData & debug) const -> PointCloud::Ptr;
 
@@ -48,7 +48,8 @@ private:
 
   auto get_pointcloud_object(
     const rclcpp::Time & now, const PointCloud::Ptr & pointcloud_ptr,
-    const DetectionAreas & detection_areas, DebugData & debug) -> std::optional<PointCloudObject>;
+    const DetectionAreas & detection_areas, DebugData & debug, const bool is_driving_forward)
+    -> std::optional<PointCloudObject>;
 
   auto get_pointcloud_objects(
     const std::function<std::pair<double, double>()> & func_range_calculation,
@@ -58,12 +59,14 @@ private:
   auto get_pointcloud_objects_on_adjacent_lane(
     const lanelet::ConstLanelets & current_lanes, const Behavior & shift_behavior,
     const double forward_distance, const double backward_distance,
-    const PointCloud::Ptr & obstacle_pointcloud, DebugData & debug) -> PointCloudObjects;
+    const PointCloud::Ptr & obstacle_pointcloud, DebugData & debug,
+    const bool is_driving_forward) -> PointCloudObjects;
 
   auto get_pointcloud_objects_at_blind_spot(
     const lanelet::ConstLanelets & current_lanes, const Behavior & turn_behavior,
     const double forward_distance, const double backward_distance,
-    const PointCloud::Ptr & obstacle_pointcloud, DebugData & debug) -> PointCloudObjects;
+    const PointCloud::Ptr & obstacle_pointcloud, DebugData & debug,
+    const bool is_driving_forward) -> PointCloudObjects;
 
   bool is_safe(const PointCloudObjects & objects, DebugData & debug) const;
 

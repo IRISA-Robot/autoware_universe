@@ -30,14 +30,14 @@ namespace autoware::planning_validator::utils
 auto check_shift_behavior(
   const lanelet::ConstLanelets & lanelets, const bool is_unsafe_holding,
   const std::shared_ptr<PlanningValidatorContext> & context,
-  const rear_collision_checker_node::Params & parameters, DebugData & debug)
-  -> std::pair<Behavior, double>;
+  const rear_collision_checker_node::Params & parameters, DebugData & debug,
+  const bool is_driving_forward) -> std::pair<Behavior, double>;
 
 auto check_turn_behavior(
   const lanelet::ConstLanelets & lanelets, const bool is_unsafe_holding,
   const std::shared_ptr<PlanningValidatorContext> & context,
-  const rear_collision_checker_node::Params & parameters, DebugData & debug)
-  -> std::pair<Behavior, double>;
+  const rear_collision_checker_node::Params & parameters, DebugData & debug,
+  const bool is_driving_forward) -> std::pair<Behavior, double>;
 
 void cut_by_lanelets(const lanelet::ConstLanelets & lanelets, DetectionAreas & detection_areas);
 
@@ -60,7 +60,7 @@ auto generate_half_lanelet(
 
 auto get_current_lanes(
   const std::shared_ptr<PlanningValidatorContext> & context, const double forward_distance,
-  const double backward_distance) -> lanelet::ConstLanelets;
+  const double backward_distance, const bool is_driving_forward) -> lanelet::ConstLanelets;
 
 auto get_obstacle_points(const lanelet::BasicPolygons3d & polygons, const PointCloud & points)
   -> PointCloud::Ptr;
@@ -69,11 +69,13 @@ auto get_previous_polygons_with_lane_recursively(
   const lanelet::ConstLanelets & current_lanes, const lanelet::ConstLanelets & target_lanes,
   const double s1, const double s2,
   const std::shared_ptr<autoware::route_handler::RouteHandler> & route_handler,
-  const double left_offset, const double right_offset) -> DetectionAreas;
+  const double left_offset, const double right_offset, const bool is_driving_forward)
+  -> DetectionAreas;
 
 auto generate_detection_polygon(
   const lanelet::ConstLanelets & lanelets, const geometry_msgs::msg::Pose & ego_pose,
-  const double forward_distance, const double backward_distance) -> lanelet::BasicPolygon3d;
+  const double forward_distance, const double backward_distance, const bool is_driving_forward)
+  -> lanelet::BasicPolygon3d;
 
 auto get_range_for_rss(
   const std::shared_ptr<PlanningValidatorContext> & context,
