@@ -71,10 +71,21 @@ autoware_utils::Polygon2d project_to_pose(
 
 void make_ego_footprint_rtree(EgoData & ego_data, const PlannerParam & params)
 {
+  // Each trajectory point's footprint only extends towards ego's LEADING edge (the direction it
+  // is about to sweep into), relying on consecutive trajectory points' footprints to overlap and
+  // cover the rest of the vehicle body along the path. When driving forward that leading edge is
+  // the front bumper (extend from base_link towards +x, i.e. base_to_front); when reversing it is
+  // the rear bumper (extend towards -x, i.e. base_to_rear), since ego then sweeps backwards
+  // relative to the pose's heading. Using the front-only extension unconditionally while
+  // reversing would build a footprint pointing away from ego's actual direction of travel and
+  // miss collisions behind ego.
+  const auto base_to_front = ego_data.is_driving_forward ? params.ego_longitudinal_offset : 0.0;
+  const auto base_to_rear =
+    ego_data.is_driving_forward ? 0.0 : params.ego_rear_longitudinal_offset;
   for (const auto & p : ego_data.trajectory)
     ego_data.trajectory_footprints.push_back(
       autoware_utils::to_footprint(
-        p.pose, params.ego_longitudinal_offset, 0.0, params.ego_lateral_offset * 2.0));
+        p.pose, base_to_front, base_to_rear, params.ego_lateral_offset * 2.0));
   std::vector<BoxIndexPair> rtree_nodes;
   rtree_nodes.reserve(ego_data.trajectory_footprints.size());
   for (auto i = 0UL; i < ego_data.trajectory_footprints.size(); ++i) {

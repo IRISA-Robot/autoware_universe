@@ -78,6 +78,11 @@ void DynamicObstacleStopModule::init(rclcpp::Node & node, const std::string & mo
   p.ego_lateral_offset =
     std::max(std::abs(vehicle_info.min_lateral_offset_m), vehicle_info.max_lateral_offset_m);
   p.ego_longitudinal_offset = vehicle_info.max_longitudinal_offset_m;
+  // min_longitudinal_offset_m is the (negative) rear overhang; negate it to get the positive
+  // "distance from base_link to leading edge" magnitude used when reversing (rear bumper becomes
+  // the leading edge). Same idiom as `calc_x_offset_to_bumper` /
+  // `calc_distance_to_front_object` used elsewhere in this migration.
+  p.ego_rear_longitudinal_offset = -vehicle_info.min_longitudinal_offset_m;
 }
 
 void DynamicObstacleStopModule::update_parameters(const std::vector<rclcpp::Parameter> & parameters)
@@ -123,6 +128,7 @@ VelocityPlanningResult DynamicObstacleStopModule::plan(
   stopwatch.tic("preprocessing");
   dynamic_obstacle_stop::EgoData ego_data;
   ego_data.pose = planner_data->current_odometry.pose.pose;
+  ego_data.is_driving_forward = planner_data->is_driving_forward;
   ego_data.trajectory = smoothed_trajectory_points;
   ego_data.trajectory = autoware::motion_utils::removeOverlapPoints(ego_data.trajectory);
   ego_data.first_trajectory_idx =
@@ -159,28 +165,48 @@ VelocityPlanningResult DynamicObstacleStopModule::plan(
   stopwatch.tic("collisions");
   auto collisions = dynamic_obstacle_stop::find_collisions(
     ego_data, dynamic_obstacles, obstacle_forward_footprints);
-  update_object_map(object_map_, collisions, clock_->now(), ego_data.trajectory, params_);
+  update_object_map(
+    object_map_, collisions, clock_->now(), ego_data.trajectory, params_,
+    ego_data.is_driving_forward);
   std::optional<geometry_msgs::msg::Point> earliest_collision =
     dynamic_obstacle_stop::find_earliest_collision(object_map_, ego_data);
   const auto collisions_duration_us = stopwatch.toc("collisions");
+  // Offset from base_link to ego's leading edge along its current direction of travel: forward ->
+  // front bumper, reversing -> rear bumper (the physically leading edge while backing up).
+  const auto ego_leading_edge_offset = ego_data.is_driving_forward
+                                          ? params_.ego_longitudinal_offset
+                                          : params_.ego_rear_longitudinal_offset;
   if (earliest_collision) {
-    const auto arc_length_diff = autoware::motion_utils::calcSignedArcLength(
+    // Raw arc length (src=collision, dst=ego) is positive only when ego is ahead of the collision
+    // in trajectory index order, which happens when reversing (ego moves towards decreasing
+    // index) if the collision is in ego's direction of travel. Flip the sign when reversing so
+    // `arc_length_diff` always keeps the same "negative when the collision is in front of ego
+    // along its direction of travel" convention this forward-driving formula was written for.
+    const auto raw_arc_length_diff = autoware::motion_utils::calcSignedArcLength(
       ego_data.trajectory, *earliest_collision, ego_data.pose.position);
-    const auto can_stop_before_limit = arc_length_diff < min_stop_distance -
-                                                           params_.ego_longitudinal_offset -
-                                                           params_.stop_distance_buffer;
-    const auto stop_pose = can_stop_before_limit
-                             ? autoware::motion_utils::calcLongitudinalOffsetPose(
-                                 ego_data.trajectory, *earliest_collision,
-                                 -params_.stop_distance_buffer - params_.ego_longitudinal_offset)
-                             : ego_data.earliest_stop_pose;
+    const auto arc_length_diff =
+      ego_data.is_driving_forward ? raw_arc_length_diff : -raw_arc_length_diff;
+    const auto can_stop_before_limit =
+      arc_length_diff <
+      min_stop_distance - ego_leading_edge_offset - params_.stop_distance_buffer;
+    // calcLongitudinalOffsetPose() offsets along the trajectory's fixed index order (positive ->
+    // increasing index). Placing the stop pose "behind" the collision (from ego's leading edge)
+    // in ego's direction of travel means decreasing index when driving forward (negative offset,
+    // the original convention) but increasing index when reversing (positive offset).
+    const auto stop_pose_offset_sign = ego_data.is_driving_forward ? -1.0 : 1.0;
+    const auto stop_pose =
+      can_stop_before_limit
+        ? autoware::motion_utils::calcLongitudinalOffsetPose(
+            ego_data.trajectory, *earliest_collision,
+            stop_pose_offset_sign * (params_.stop_distance_buffer + ego_leading_edge_offset))
+        : ego_data.earliest_stop_pose;
     debug_data_.stop_pose = stop_pose;
     if (stop_pose) {
       result.stop_points.push_back(stop_pose->position);
       planning_factor_interface_->add(
         smoothed_trajectory_points, ego_data.pose, *stop_pose, PlanningFactor::STOP,
         SafetyFactorArray{});
-      create_virtual_walls();
+      create_virtual_walls(ego_leading_edge_offset, ego_data.is_driving_forward);
     }
   }
 
@@ -228,14 +254,16 @@ visualization_msgs::msg::MarkerArray DynamicObstacleStopModule::create_debug_mar
   return array;
 }
 
-void DynamicObstacleStopModule::create_virtual_walls()
+void DynamicObstacleStopModule::create_virtual_walls(
+  const double ego_leading_edge_offset, const bool is_driving_forward)
 {
   if (debug_data_.stop_pose) {
     autoware::motion_utils::VirtualWall virtual_wall;
     virtual_wall.text = "dynamic_obstacle_stop";
-    virtual_wall.longitudinal_offset = params_.ego_longitudinal_offset;
+    virtual_wall.longitudinal_offset = ego_leading_edge_offset;
     virtual_wall.style = autoware::motion_utils::VirtualWallType::stop;
     virtual_wall.pose = *debug_data_.stop_pose;
+    virtual_wall.is_driving_forward = is_driving_forward;
     virtual_wall_marker_creator.add_virtual_wall(virtual_wall);
   }
 }

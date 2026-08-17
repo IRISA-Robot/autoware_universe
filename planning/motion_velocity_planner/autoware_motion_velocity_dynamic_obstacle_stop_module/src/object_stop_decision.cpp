@@ -23,15 +23,23 @@ namespace autoware::motion_velocity_planner::dynamic_obstacle_stop
 {
 void update_object_map(
   ObjectStopDecisionMap & object_map, const std::vector<Collision> & collisions,
-  const rclcpp::Time & now, const TrajectoryPoints & trajectory, const PlannerParam & params)
+  const rclcpp::Time & now, const TrajectoryPoints & trajectory, const PlannerParam & params,
+  const bool is_driving_forward)
 {
   for (auto & [object, decision] : object_map) decision.collision_detected = false;
   for (const auto & collision : collisions) {
     if (auto search = object_map.find(collision.object_uuid); search != object_map.end()) {
       search->second.collision_detected = true;
-      const auto is_closer_collision_point =
-        autoware::motion_utils::calcSignedArcLength(
-          trajectory, search->second.collision_point, collision.point) < 0.0;
+      // Raw arc length only reflects trajectory index order (dst - src, positive when
+      // `collision.point` is at a higher index than the stored point), which is "closer to ego"
+      // when driving forward but the opposite when reversing (ego then travels towards
+      // decreasing index, so the point at the *higher* index is the one closer to ego along its
+      // actual path). Flip the sign when reversing before comparing.
+      const auto raw_arc_length_diff = autoware::motion_utils::calcSignedArcLength(
+        trajectory, search->second.collision_point, collision.point);
+      const auto directional_arc_length_diff =
+        is_driving_forward ? raw_arc_length_diff : -raw_arc_length_diff;
+      const auto is_closer_collision_point = directional_arc_length_diff < 0.0;
       if (is_closer_collision_point) search->second.collision_point = collision.point;
     } else {
       object_map[collision.object_uuid].collision_point = collision.point;
@@ -54,10 +62,17 @@ std::optional<geometry_msgs::msg::Point> find_earliest_collision(
   double earliest_collision_arc_length = std::numeric_limits<double>::max();
   for (auto & [object_uuid, decision] : object_map) {
     if (decision.should_be_avoided()) {
-      const auto arc_length = autoware::motion_utils::calcSignedArcLength(
+      // Raw arc length (dst - src) is positive when `collision_point` is at a higher trajectory
+      // index than ego, which means "ahead of ego" when driving forward but "behind ego" when
+      // reversing (ego then moves towards decreasing index). Flip the sign when reversing so the
+      // smallest `directional_arc_length` is always the earliest collision ego will reach along
+      // its actual direction of travel, matching this loop's original forward-driving intent.
+      const auto raw_arc_length = autoware::motion_utils::calcSignedArcLength(
         ego_data.trajectory, ego_data.pose.position, decision.collision_point);
-      if (arc_length < earliest_collision_arc_length) {
-        earliest_collision_arc_length = arc_length;
+      const auto directional_arc_length =
+        ego_data.is_driving_forward ? raw_arc_length : -raw_arc_length;
+      if (directional_arc_length < earliest_collision_arc_length) {
+        earliest_collision_arc_length = directional_arc_length;
         earliest_collision = decision.collision_point;
       }
     }

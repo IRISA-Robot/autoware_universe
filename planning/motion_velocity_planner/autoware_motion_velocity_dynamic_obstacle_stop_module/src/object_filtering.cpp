@@ -108,10 +108,19 @@ std::vector<autoware_perception_msgs::msg::PredictedObject> filter_predicted_obj
     const auto is_not_too_slow =
       predicted_object.kinematics.initial_twist_with_covariance.twist.linear.x >=
       params.minimum_object_velocity;
+    // Use the offset from base_link to ego's LEADING edge along its current direction of travel:
+    // forward -> front bumper (ego_longitudinal_offset, i.e., +max_longitudinal_offset_m);
+    // reversing -> the physically leading edge is the REAR bumper (ego_rear_longitudinal_offset,
+    // i.e., -min_longitudinal_offset_m). Using the front-bumper offset unconditionally would
+    // under/over-estimate how much of the vehicle body to exclude around ego while reversing,
+    // since front and rear overhangs generally differ.
+    const auto ego_leading_edge_offset = ego_data.is_driving_forward
+                                            ? params.ego_longitudinal_offset
+                                            : params.ego_rear_longitudinal_offset;
     if (
       is_vehicle(predicted_object) && is_not_too_slow &&
       is_in_range(predicted_object, ego_data.trajectory, params, hysteresis) &&
-      is_not_too_close(predicted_object, ego_data, params.ego_longitudinal_offset) &&
+      is_not_too_close(predicted_object, ego_data, ego_leading_edge_offset) &&
       (!params.ignore_unavoidable_collisions ||
        !is_unavoidable(predicted_object, ego_data.pose, ego_data.earliest_stop_pose, params)))
       filtered_objects.push_back(predicted_object);

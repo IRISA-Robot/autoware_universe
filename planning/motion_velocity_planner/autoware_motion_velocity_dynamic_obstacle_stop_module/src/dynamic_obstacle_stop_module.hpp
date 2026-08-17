@@ -50,7 +50,7 @@ public:
 
 private:
   visualization_msgs::msg::MarkerArray create_debug_marker_array();
-  void create_virtual_walls();
+  void create_virtual_walls(const double ego_leading_edge_offset, const bool is_driving_forward);
 
   inline static const std::string ns_ = "dynamic_obstacle_stop";
   std::string module_name_;

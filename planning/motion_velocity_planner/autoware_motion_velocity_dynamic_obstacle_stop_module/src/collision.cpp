@@ -49,10 +49,18 @@ std::optional<geometry_msgs::msg::Point> find_closest_collision_point(
         object_footprint.outer(), ego_footprint.outer(), collision_points);
       for (const auto & coll_p : collision_points) {
         auto p = geometry_msgs::msg::Point().set__x(coll_p.x()).set__y(coll_p.y());
+        // `calcSignedArcLength` is anchored to the trajectory's own fixed point ordering, NOT to
+        // ego's current direction of travel: a positive result only means "p is at a higher index
+        // than ego", which is "ahead of ego" when driving forward but "behind ego" when reversing
+        // (ego then moves towards decreasing index). Flip the sign when reversing so the smallest
+        // `directional_dist_to_ego` is always the point closest to ego along its actual direction
+        // of travel, matching this loop's original forward-driving intent.
         const auto dist_to_ego = autoware::motion_utils::calcSignedArcLength(
           ego_data.trajectory, ego_data.pose.position, p);
-        if (dist_to_ego < closest_dist) {
-          closest_dist = dist_to_ego;
+        const auto directional_dist_to_ego =
+          ego_data.is_driving_forward ? dist_to_ego : -dist_to_ego;
+        if (directional_dist_to_ego < closest_dist) {
+          closest_dist = directional_dist_to_ego;
           closest_collision_point = p;
         }
       }

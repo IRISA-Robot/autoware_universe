@@ -58,9 +58,12 @@ using ObjectStopDecisionMap = std::unordered_map<std::string, ObjectStopDecision
 /// @param [in] now current time (used to update the objects' timers)
 /// @param [in] trajectory ego trajectory points (used to determine the closest collision points)
 /// @param [in] params planner parameters
+/// @param [in] is_driving_forward whether ego is currently driving forward along `trajectory`
+/// (true) or reversing (false, ego moves towards decreasing trajectory index)
 void update_object_map(
   ObjectStopDecisionMap & object_map, const std::vector<Collision> & collisions,
-  const rclcpp::Time & now, const TrajectoryPoints & trajectory, const PlannerParam & params);
+  const rclcpp::Time & now, const TrajectoryPoints & trajectory, const PlannerParam & params,
+  const bool is_driving_forward);
 
 /// @brief find the earliest collision requiring a stop along the ego trajectory
 /// @param object_map map with the objects to avoid and their corresponding collision points

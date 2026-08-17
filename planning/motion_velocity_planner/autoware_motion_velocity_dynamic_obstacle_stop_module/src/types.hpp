@@ -45,7 +45,12 @@ struct PlannerParam
   double hysteresis{};
   double add_duration_buffer{};
   double remove_duration_buffer{};
+  // Offset from base_link to ego's leading edge when driving forward (front bumper, i.e.,
+  // +max_longitudinal_offset_m).
   double ego_longitudinal_offset{};
+  // Offset from base_link to ego's leading edge when reversing (rear bumper, i.e.,
+  // -min_longitudinal_offset_m, positive magnitude since min_longitudinal_offset_m is negative).
+  double ego_rear_longitudinal_offset{};
   double ego_lateral_offset{};
   double minimum_object_distance_from_ego_trajectory{};
   bool ignore_unavoidable_collisions{};
@@ -60,6 +65,12 @@ struct EgoData
   autoware_utils::MultiPolygon2d trajectory_footprints{};
   Rtree rtree{};
   std::optional<geometry_msgs::msg::Pose> earliest_stop_pose{};
+  // Direction ego is currently driving along `trajectory`. `trajectory` point indices only
+  // increase in ego's direction of travel when this is true; when false (reversing), ego moves
+  // towards *decreasing* indices, so any raw calcSignedArcLength()/index-order-based "ahead of
+  // ego" computation using this trajectory must flip sign accordingly. Defaults to true so
+  // call sites that don't explicitly set it keep the historical forward-only behavior.
+  bool is_driving_forward{true};
 };
 
 /// @brief debug data
