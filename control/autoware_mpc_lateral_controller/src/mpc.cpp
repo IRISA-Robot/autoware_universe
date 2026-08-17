@@ -146,6 +146,29 @@ ResultWithReason MPC::calculateMPC(
       mpc_matrix, initial_state, Uex, mpc_resampled_ref_trajectory, prediction_dt, "frenet");
     predicted_trajectory_frenet.header.stamp = m_clock->now();
     predicted_trajectory_frenet.header.frame_id = "map";
+    // [BIDIR-DEBUG] The RViz "Predicted Trajectory" display (autoware.rviz) is bound to exactly
+    // this topic (~/debug/predicted_trajectory_in_frenet_coordinate). User reports it never
+    // appears while reversing despite driving/steering otherwise working. Log point count +
+    // first/last point so the next live test can prove whether this is a publish-side gap
+    // (points.size()==0, or points containing NaN that AutowarePathBaseDisplay::validateFloats
+    // would reject) vs a pure render-side issue (message arrives fine, RViz just doesn't draw it).
+    if (!m_is_forward_shift) {
+      const auto n = predicted_trajectory_frenet.points.size();
+      RCLCPP_WARN_THROTTLE(
+        m_logger, *m_clock, 1000,
+        "[BIDIR-DEBUG] frenet predicted_trajectory publish: %zu points%s", n,
+        n == 0 ? " (EMPTY -- this is why RViz shows nothing)" : "");
+      if (n > 0) {
+        const auto & p0 = predicted_trajectory_frenet.points.front().pose.position;
+        const auto & pN = predicted_trajectory_frenet.points.back().pose.position;
+        RCLCPP_WARN_THROTTLE(
+          m_logger, *m_clock, 1000,
+          "[BIDIR-DEBUG] frenet predicted_trajectory: first=(%.3f,%.3f,%.3f) last=(%.3f,%.3f,%.3f) "
+          "frame_id=%s stamp=%.3f",
+          p0.x, p0.y, p0.z, pN.x, pN.y, pN.z, predicted_trajectory_frenet.header.frame_id.c_str(),
+          rclcpp::Time(predicted_trajectory_frenet.header.stamp).seconds());
+      }
+    }
     m_debug_frenet_predicted_trajectory_pub->publish(predicted_trajectory_frenet);
   }
 
