@@ -269,6 +269,11 @@ bool TrajectoryChecker::check_valid_relative_angle()
       context_->debug_pose_publisher->pushPoseMarker(p.at(i + 1), "trajectory_relative_angle", 1);
       context_->debug_pose_publisher->pushPoseMarker(p.at(i + 2), "trajectory_relative_angle", 2);
     }
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000,
+      "[BIDIR-DEBUG] check_valid_relative_angle FAILED: max_relative_angle=%.4f threshold=%.4f "
+      "idx=%zu/%zu",
+      max_relative_angle, params_.relative_angle.threshold, i, p.size());
     context_->set_handling(params_.relative_angle.handling_type);
     override_all_error_diag_ |= params_.relative_angle.override_error_diag;
     return false;
@@ -295,6 +300,12 @@ bool TrajectoryChecker::check_valid_curvature()
       context_->debug_pose_publisher->pushPoseMarker(p.at(i), "trajectory_curvature");
       context_->debug_pose_publisher->pushPoseMarker(p.at(i + 1), "trajectory_curvature");
     }
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000,
+      "[BIDIR-DEBUG] check_valid_curvature FAILED: max_curvature=%.4f threshold=%.4f idx=%zu/%zu "
+      "v_at_idx=%.2f",
+      max_curvature, params_.curvature.threshold, i, p.size(),
+      i < p.size() ? p.at(i).longitudinal_velocity_mps : 0.0F);
     context_->set_handling(params_.curvature.handling_type);
     override_all_error_diag_ |= params_.curvature.override_error_diag;
     return false;
@@ -435,6 +446,14 @@ bool TrajectoryChecker::check_valid_steering_rate()
   if (max_steering_rate > params_.steering_rate.threshold) {
     context_->debug_pose_publisher->pushPoseMarker(
       trajectory.points.at(i).pose, "max_steering_rate");
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000,
+      "[BIDIR-DEBUG] check_valid_steering_rate FAILED: max_steering_rate=%.4f threshold=%.4f "
+      "idx=%zu/%zu v_at_idx=%.2f v_at_idx+1=%.2f",
+      max_steering_rate, params_.steering_rate.threshold, i, trajectory.points.size(),
+      trajectory.points.at(i).longitudinal_velocity_mps,
+      (i + 1 < trajectory.points.size() ? trajectory.points.at(i + 1).longitudinal_velocity_mps
+                                        : 0.0F));
     context_->set_handling(params_.steering_rate.handling_type);
     override_all_error_diag_ |= params_.steering_rate.override_error_diag;
     return false;
@@ -461,6 +480,20 @@ bool TrajectoryChecker::check_valid_velocity_deviation()
     std::abs(trajectory.points.at(idx).longitudinal_velocity_mps - ego_speed);
 
   if (status->velocity_deviation > params_.velocity_deviation.threshold) {
+    // [BIDIR-DEBUG] this check compares the *signed* trajectory velocity directly against
+    // *signed* ego twist.linear.x (no abs() on either side). That is only correct if the ego
+    // twist source reports a genuinely signed forward/reverse speed consistent with this
+    // migration's reversed-trajectory sign convention (negative longitudinal_velocity_mps).
+    // If twist.linear.x turns out to be unsigned (speed magnitude only, or lags/glitches sign
+    // during accel/decel through zero) this will intermittently see a large spurious deviation
+    // while ego is genuinely following a correctly-signed reversed trajectory. Logging both raw
+    // values to settle it from the next live test.
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000,
+      "[BIDIR-DEBUG] check_valid_velocity_deviation FAILED: deviation=%.3f threshold=%.3f "
+      "trajectory_v=%.2f ego_twist.linear.x=%.2f idx=%zu",
+      status->velocity_deviation, params_.velocity_deviation.threshold,
+      trajectory.points.at(idx).longitudinal_velocity_mps, ego_speed, idx);
     context_->set_handling(params_.velocity_deviation.handling_type);
     override_all_error_diag_ |= params_.velocity_deviation.override_error_diag;
     return false;
@@ -630,6 +663,12 @@ bool TrajectoryChecker::check_valid_forward_trajectory_length()
   status->forward_trajectory_length_measured = forward_length;
 
   if (forward_length < forward_length_required) {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000,
+      "[BIDIR-DEBUG] check_valid_forward_trajectory_length FAILED: forward_length=%.3f "
+      "required=%.3f ego_speed=%.2f (signed twist.linear.x=%.2f)",
+      forward_length, forward_length_required, ego_speed,
+      data->current_kinematics->twist.twist.linear.x);
     context_->set_handling(params_.forward_trajectory_length.handling_type);
     override_all_error_diag_ |= params_.forward_trajectory_length.override_error_diag;
     return false;
@@ -673,6 +712,12 @@ bool TrajectoryChecker::check_trajectory_shift()
   if (
     ego_lat_dist > params_.trajectory_shift.lat_shift_th &&
     lat_shift > params_.trajectory_shift.lat_shift_th) {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000,
+      "[BIDIR-DEBUG] check_trajectory_shift FAILED (lateral): ego_lat_dist=%.3f lat_shift=%.3f "
+      "th=%.3f nearest_seg_idx=%zu prev_nearest_seg_idx=%zu",
+      ego_lat_dist, lat_shift, params_.trajectory_shift.lat_shift_th, *nearest_seg_idx,
+      *prev_nearest_seg_idx);
     context_->set_handling(params_.trajectory_shift.handling_type);
     override_all_error_diag_ |= params_.trajectory_shift.override_error_diag;
     context_->debug_pose_publisher->pushPoseMarker(nearest_pose, "trajectory_shift");
@@ -703,6 +748,10 @@ bool TrajectoryChecker::check_trajectory_shift()
   // if the nearest segment is the first segment, check forward shift
   if (*nearest_seg_idx == 0) {
     if (lon_shift > params_.trajectory_shift.forward_shift_th) {
+      RCLCPP_WARN_THROTTLE(
+        logger_, *clock_, 1000,
+        "[BIDIR-DEBUG] check_trajectory_shift FAILED (forward_shift): lon_shift=%.3f th=%.3f",
+        lon_shift, params_.trajectory_shift.forward_shift_th);
       context_->set_handling(params_.trajectory_shift.handling_type);
       override_all_error_diag_ |= params_.trajectory_shift.override_error_diag;
       context_->debug_pose_publisher->pushPoseMarker(nearest_pose, "trajectory_shift");
@@ -713,6 +762,10 @@ bool TrajectoryChecker::check_trajectory_shift()
 
   // if the nearest segment is the last segment, check backward shift
   if (lon_shift < 0.0 && std::abs(lon_shift) > params_.trajectory_shift.backward_shift_th) {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000,
+      "[BIDIR-DEBUG] check_trajectory_shift FAILED (backward_shift): lon_shift=%.3f th=%.3f",
+      lon_shift, params_.trajectory_shift.backward_shift_th);
     context_->set_handling(params_.trajectory_shift.handling_type);
     override_all_error_diag_ |= params_.trajectory_shift.override_error_diag;
     context_->debug_pose_publisher->pushPoseMarker(nearest_pose, "trajectory_shift");

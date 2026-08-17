@@ -347,7 +347,19 @@ std::pair<double, size_t> calcMaxSteeringRates(
     const auto & p_prev = trajectory.points.at(i);
     const auto & p_next = trajectory.points.at(i + 1);
     const auto delta_s = calc_distance2d(p_prev, p_next);
-    const auto v = 0.5 * (p_next.longitudinal_velocity_mps + p_prev.longitudinal_velocity_mps);
+    // [BIDIR-DEBUG] speed magnitude, not signed velocity: for a reversed (negative-velocity)
+    // trajectory, `std::max(v, 1.0e-5)` on the *signed* average collapses to the 1e-5 floor for
+    // every point (since v is negative), which does not itself misclassify a bad rate, but right
+    // at a forward<->reversed direction change the signed average legitimately crosses through
+    // (near-)zero -- previously that only ever happened at a goal stop (end of trajectory, not
+    // checked here), but the bidirectional-driving migration makes this a genuine *mid-trajectory*
+    // occurrence at every forward/reversed lane transition. There, the same 1e-5 floor produces a
+    // near-zero dt for a real, nonzero delta_s, spiking the computed steer_rate arbitrarily high
+    // and intermittently failing check_valid_steering_rate exactly at the transition point. Using
+    // the speed *magnitude* (abs of each point's own velocity, not the signed average of the two)
+    // keeps dt physically meaningful (and direction-agnostic) through a sign change.
+    const auto v =
+      0.5 * (std::abs(p_next.longitudinal_velocity_mps) + std::abs(p_prev.longitudinal_velocity_mps));
     const auto dt = delta_s / std::max(v, 1.0e-5);
 
     const auto steer_prev = steering_vector.at(i);

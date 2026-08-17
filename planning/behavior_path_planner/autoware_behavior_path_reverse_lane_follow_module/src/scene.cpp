@@ -110,11 +110,21 @@ void ReverseLaneFollowModule::updateData()
 
 void ReverseLaneFollowModule::updateRouteReversedFollow()
 {
+  const bool was_active = status_.is_route_reversed_active;
+
   status_.is_route_reversed_active = false;
   status_.route_reversed_path = PathWithLaneId{};
   status_.route_reversed_lanelets.clear();
 
   if (!planner_data_ || !planner_data_->route_handler) {
+    // [BIDIR-DEBUG] edge-triggered (unthrottled) flip log -- see note below. A flip caused by a
+    // missing route_handler is distinguished here from one caused by buildRouteReversedFollowPath
+    // itself returning nullopt.
+    if (was_active) {
+      RCLCPP_WARN(
+        getLogger(),
+        "[BIDIR-DEBUG] is_route_reversed_active FLIP true->false: no planner_data_/route_handler");
+    }
     return;
   }
 
@@ -122,12 +132,34 @@ void ReverseLaneFollowModule::updateRouteReversedFollow()
     planner_data_->route_handler, getEgoPose(), parameters_->route_reversed_backward_distance_m,
     parameters_->route_reversed_forward_distance_m);
   if (!follow) {
+    // [BIDIR-DEBUG] edge-triggered, UNTHROTTLED (unlike buildRouteReversedFollowPath's own
+    // 2000ms-throttled logging) so a rapid on/off flicker -- e.g. ego pose oscillating right at
+    // the boundary between a forward and a reversed route segment, or between two lanelets where
+    // getClosestLaneletWithinRoute's nearest-polygon query has no hysteresis -- is not masked by
+    // the throttle window. If this fires repeatedly within a second or two of "true->false" then
+    // "false->true" while ego is obviously still mid-maneuver, that confirms activation flicker
+    // (not a one-shot end-of-segment transition) as the cause of the trajectory intermittently
+    // disappearing: plan() falls back to getPreviousModuleOutput() every time this is inactive.
+    if (was_active) {
+      RCLCPP_WARN(
+        getLogger(),
+        "[BIDIR-DEBUG] is_route_reversed_active FLIP true->false: ego=(%.2f, %.2f) "
+        "buildRouteReversedFollowPath returned nullopt this cycle",
+        getEgoPose().position.x, getEgoPose().position.y);
+    }
     return;
   }
 
   status_.is_route_reversed_active = true;
   status_.route_reversed_path = follow->path;
   status_.route_reversed_lanelets = follow->lanelets;
+
+  if (!was_active) {
+    RCLCPP_WARN(
+      getLogger(),
+      "[BIDIR-DEBUG] is_route_reversed_active FLIP false->true: ego=(%.2f, %.2f) %zu path points",
+      getEgoPose().position.x, getEgoPose().position.y, follow->path.points.size());
+  }
 }
 
 bool ReverseLaneFollowModule::isExecutionRequested() const
