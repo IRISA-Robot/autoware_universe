@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>autoware_behavior_path_reverse_lane_follow_module</name>
+  <version>0.48.0</version>
+  <description>
+    Bidirectional-driving Phase 1 scaffold: retraces the already-traveled lanelet path backward,
+    emitting a negative-longitudinal-velocity PathWithLaneId. See
+    bidirectional_plan/03-phase1-scaffold.md.
+  </description>
+
+  <maintainer email="softwareteam@irisa-robot.com">Autoware Planning Team</maintainer>
+
+  <license>Apache License 2.0</license>
+
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
+  <buildtool_depend>autoware_cmake</buildtool_depend>
+  <buildtool_depend>eigen3_cmake_module</buildtool_depend>
+
+  <depend>autoware_behavior_path_planner</depend>
+  <depend>autoware_behavior_path_planner_common</depend>
+  <depend>autoware_internal_planning_msgs</depend>
+  <depend>autoware_motion_utils</depend>
+  <depend>autoware_planning_msgs</depend>
+  <depend>autoware_route_handler</depend>
+  <depend>autoware_utils</depend>
+  <depend>geometry_msgs</depend>
+  <depend>pluginlib</depend>
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>tier4_planning_msgs</depend>
+
+  <test_depend>ament_cmake_ros</test_depend>
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>autoware_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
