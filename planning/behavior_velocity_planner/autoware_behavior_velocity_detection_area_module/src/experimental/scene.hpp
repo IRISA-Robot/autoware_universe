@@ -128,11 +128,12 @@ private:
    * @param detection_source Source of detection
    * @param policy_name Name of policy being applied (for logging)
    * @param prev_state Previous state before this operation
+   * @param is_driving_forward Whether the ego vehicle is currently driving forward (vs reversing)
    */
   void finalizeStopPoint(
     Trajectory & path, const double stop_point_s, const double modified_stop_point_s,
     const geometry_msgs::msg::Pose & self_pose, const std::string & detection_source,
-    const std::string & policy_name, const State & prev_state);
+    const std::string & policy_name, const State & prev_state, const bool is_driving_forward);
 
   /**
    * @brief Handle "go" policy for unstoppable situation
@@ -147,11 +148,13 @@ private:
    * @param modified_stop_point_s Modified stop point position (s-coordinate)
    * @param self_pose Current vehicle pose
    * @param detection_source Source of detection
+   * @param is_driving_forward Whether the ego vehicle is currently driving forward (vs reversing)
    * @return true if stop point was set
    */
   bool handleUnstoppableForceStopPolicy(
     Trajectory & path, const double stop_point_s, const double modified_stop_point_s,
-    const geometry_msgs::msg::Pose & self_pose, const std::string & detection_source);
+    const geometry_msgs::msg::Pose & self_pose, const std::string & detection_source,
+    const bool is_driving_forward);
 
   /**
    * @brief Handle "stop_after_stopline" policy for unstoppable situation
@@ -162,12 +165,14 @@ private:
    * @param current_velocity Current vehicle velocity
    * @param dist_from_self_to_stop Distance from vehicle to stop line
    * @param detection_source Source of detection
+   * @param is_driving_forward Whether the ego vehicle is currently driving forward (vs reversing)
    * @return true if stop point was set
    */
   bool handleUnstoppableStopAfterLinePolicy(
     Trajectory & path, const double stop_point_s, double & modified_stop_point_s,
     const geometry_msgs::msg::Pose & self_pose, const double current_velocity,
-    const double dist_from_self_to_stop, const std::string & detection_source);
+    const double dist_from_self_to_stop, const std::string & detection_source,
+    const bool is_driving_forward);
 };
 }  // namespace autoware::behavior_velocity_planner::experimental
 

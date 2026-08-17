@@ -176,7 +176,7 @@ void DetectionAreaModule::print_detected_obstacle(
 void DetectionAreaModule::finalizeStopPoint(
   Trajectory & path, const double stop_point_s, const double modified_stop_point_s,
   const geometry_msgs::msg::Pose & self_pose, const std::string & detection_source,
-  const std::string & policy_name, const State & prev_state)
+  const std::string & policy_name, const State & prev_state, const bool is_driving_forward)
 {
   state_ = State::STOP;
   if (prev_state != State::STOP) {
@@ -198,7 +198,7 @@ void DetectionAreaModule::finalizeStopPoint(
     planning_factor_interface_->add(
       path.restore(), self_pose, stop_pose,
       autoware_internal_planning_msgs::msg::PlanningFactor::STOP,
-      autoware_internal_planning_msgs::msg::SafetyFactorArray{}, true /*is_driving_forward*/, 0.0,
+      autoware_internal_planning_msgs::msg::SafetyFactorArray{}, is_driving_forward, 0.0,
       0.0 /*shift distance*/, detection_source);
   }
 }
@@ -212,13 +212,15 @@ bool DetectionAreaModule::handleUnstoppableGoPolicy()
 
 bool DetectionAreaModule::handleUnstoppableForceStopPolicy(
   Trajectory & path, const double stop_point_s, const double modified_stop_point_s,
-  const geometry_msgs::msg::Pose & self_pose, const std::string & detection_source)
+  const geometry_msgs::msg::Pose & self_pose, const std::string & detection_source,
+  const bool is_driving_forward)
 {
   logWarnThrottle(
     1000, "[detection_area] insufficient braking distance, policy: force_stop (emergency)");
 
   finalizeStopPoint(
-    path, stop_point_s, modified_stop_point_s, self_pose, detection_source, "force_stop", state_);
+    path, stop_point_s, modified_stop_point_s, self_pose, detection_source, "force_stop", state_,
+    is_driving_forward);
 
   return true;
 }
@@ -226,7 +228,8 @@ bool DetectionAreaModule::handleUnstoppableForceStopPolicy(
 bool DetectionAreaModule::handleUnstoppableStopAfterLinePolicy(
   Trajectory & path, const double stop_point_s, double & modified_stop_point_s,
   const geometry_msgs::msg::Pose & self_pose, const double current_velocity,
-  const double dist_from_self_to_stop, const std::string & detection_source)
+  const double dist_from_self_to_stop, const std::string & detection_source,
+  const bool is_driving_forward)
 {
   logWarnThrottle(
     1000, "[detection_area] insufficient braking distance, policy: stop_after_stopline");
@@ -241,7 +244,7 @@ bool DetectionAreaModule::handleUnstoppableStopAfterLinePolicy(
 
   finalizeStopPoint(
     path, stop_point_s, modified_stop_point_s, self_pose, detection_source, "stop_after_stopline",
-    state_);
+    state_, is_driving_forward);
 
   return true;
 }
@@ -255,7 +258,15 @@ bool DetectionAreaModule::modifyPathVelocity(
 
   // Reset data
   debug_data_ = DebugData();
-  debug_data_.base_link2front = planner_data.vehicle_info_.max_longitudinal_offset_m;
+  // Offset from base_link to the vehicle's LEADING edge along the current direction of travel.
+  // When driving forward the leading edge is the front bumper (max_longitudinal_offset_m,
+  // positive). When reversing, the physically leading edge is the REAR bumper —
+  // min_longitudinal_offset_m is defined as -rear_overhang_m, so negate it to get a positive
+  // "distance from base_link to leading edge" consistent with the forward case.
+  const double leading_edge_offset = planner_data.is_driving_forward
+    ? planner_data.vehicle_info_.max_longitudinal_offset_m
+    : -planner_data.vehicle_info_.min_longitudinal_offset_m;
+  debug_data_.base_link2front = leading_edge_offset;
 
   // Find obstacles in detection area
   auto has_obstacle = false;
@@ -314,8 +325,7 @@ bool DetectionAreaModule::modifyPathVelocity(
   // Get stop point
   const auto stop_point_s = detection_area::get_stop_point(
     original_path, stop_line, planner_param_.stop_margin,
-    planner_data.vehicle_info_.max_longitudinal_offset_m - forward_offset_to_stop_line_,
-    connected_lane_ids);
+    leading_edge_offset - forward_offset_to_stop_line_, connected_lane_ids);
   if (!stop_point_s) {
     return true;
   }
@@ -353,8 +363,8 @@ bool DetectionAreaModule::modifyPathVelocity(
   if (planner_param_.use_dead_line) {
     // Use '-' for margin because it's the backward distance from stop line
     const auto dead_line_point_s = detection_area::get_stop_point(
-      original_path, stop_line, -planner_param_.dead_line_margin,
-      planner_data.vehicle_info_.max_longitudinal_offset_m, connected_lane_ids);
+      original_path, stop_line, -planner_param_.dead_line_margin, leading_edge_offset,
+      connected_lane_ids);
 
     if (dead_line_point_s) {
       debug_data_.dead_line_poses.push_back(path.compute(*dead_line_point_s).point.pose);
@@ -392,19 +402,21 @@ bool DetectionAreaModule::modifyPathVelocity(
 
     if (planner_param_.unstoppable_policy == "force_stop") {
       return handleUnstoppableForceStopPolicy(
-        path, *stop_point_s, modified_stop_point_s, self_pose, detection_source);
+        path, *stop_point_s, modified_stop_point_s, self_pose, detection_source,
+        planner_data.is_driving_forward);
     }
 
     if (planner_param_.unstoppable_policy == "stop_after_stopline") {
       return handleUnstoppableStopAfterLinePolicy(
         path, *stop_point_s, modified_stop_point_s, self_pose, current_velocity,
-        dist_from_self_to_stop, detection_source);
+        dist_from_self_to_stop, detection_source, planner_data.is_driving_forward);
     }
   }
 
   // Normal case: sufficient braking distance OR already in STOP state
   finalizeStopPoint(
-    path, *stop_point_s, modified_stop_point_s, self_pose, detection_source, "normal", prev_state);
+    path, *stop_point_s, modified_stop_point_s, self_pose, detection_source, "normal", prev_state,
+    planner_data.is_driving_forward);
 
   return true;
 }
