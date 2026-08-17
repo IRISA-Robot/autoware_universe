@@ -59,7 +59,7 @@ private:
   static void limit_trajectory_size(
     out_of_lane::EgoData & ego_data,
     const std::vector<autoware_planning_msgs::msg::TrajectoryPoint> & smoothed_trajectory_points,
-    const double max_arc_length);
+    const double max_arc_length, const bool is_driving_forward);
   /// @brief calculate the first slowdown pose (if any)
   std::optional<geometry_msgs::msg::Pose> calculate_slowdown_pose(
     const out_of_lane::EgoData & ego_data, const out_of_lane::OutOfLaneData & out_of_lane_data);

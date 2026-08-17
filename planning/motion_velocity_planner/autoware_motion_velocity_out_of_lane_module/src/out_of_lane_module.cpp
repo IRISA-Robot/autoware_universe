@@ -175,22 +175,64 @@ void OutOfLaneModule::update_parameters(const std::vector<rclcpp::Parameter> & p
 void OutOfLaneModule::limit_trajectory_size(
   out_of_lane::EgoData & ego_data,
   const std::vector<autoware_planning_msgs::msg::TrajectoryPoint> & smoothed_trajectory_points,
-  const double max_arc_length)
+  const double max_arc_length, const bool is_driving_forward)
 {
+  // `findNearestSegmentIndex` is purely geometric: it finds the segment
+  // [first_trajectory_idx, first_trajectory_idx + 1] of the *original* (fixed point order)
+  // trajectory closest to ego, independent of ego's current direction of travel.
+  // Every downstream user of `ego_data.trajectory_points` (this file, calculate_slowdown_points.cpp,
+  // filter_predicted_objects.cpp) treats local index 0 as "at ego" and increasing local index /
+  // increasing arc length as "ahead of ego" (e.g. filter_predicted_objects.cpp's
+  // `is_coming_from_behind`, calculate_slowdown_points.cpp's `min_stop_arc_length` comparisons).
+  // That assumption only holds when ego is actually moving toward increasing original-trajectory
+  // index. When reversing (`!is_driving_forward`), ego moves toward *decreasing* index, so we must
+  // build this local sub-trajectory walking backward instead -- otherwise "ahead of ego" here would
+  // silently mean "behind ego" for the entire module (out-of-lane points, slowdown poses, and the
+  // "ignore objects behind ego" filter would all be looking in the wrong direction).
   ego_data.first_trajectory_idx =
     motion_utils::findNearestSegmentIndex(smoothed_trajectory_points, ego_data.pose.position);
-  ego_data.longitudinal_offset_to_first_trajectory_index =
-    motion_utils::calcLongitudinalOffsetToSegment(
-      smoothed_trajectory_points, ego_data.first_trajectory_idx, ego_data.pose.position);
-  auto l = -ego_data.longitudinal_offset_to_first_trajectory_index;
-  ego_data.trajectory_points.push_back(smoothed_trajectory_points[ego_data.first_trajectory_idx]);
-  for (auto i = ego_data.first_trajectory_idx + 1; i < smoothed_trajectory_points.size(); ++i) {
-    l += autoware_utils::calc_distance2d(
-      smoothed_trajectory_points[i - 1], smoothed_trajectory_points[i]);
-    if (l >= max_arc_length) {
-      break;
+  const auto offset_from_segment_start = motion_utils::calcLongitudinalOffsetToSegment(
+    smoothed_trajectory_points, ego_data.first_trajectory_idx, ego_data.pose.position);
+
+  if (is_driving_forward) {
+    // local index 0 = segment start (behind ego in the direction of travel), walk toward
+    // increasing index.
+    ego_data.longitudinal_offset_to_first_trajectory_index = offset_from_segment_start;
+    auto l = -offset_from_segment_start;
+    ego_data.trajectory_points.push_back(smoothed_trajectory_points[ego_data.first_trajectory_idx]);
+    for (auto i = ego_data.first_trajectory_idx + 1; i < smoothed_trajectory_points.size(); ++i) {
+      l += autoware_utils::calc_distance2d(
+        smoothed_trajectory_points[i - 1], smoothed_trajectory_points[i]);
+      if (l >= max_arc_length) {
+        break;
+      }
+      ego_data.trajectory_points.push_back(smoothed_trajectory_points[i]);
     }
-    ego_data.trajectory_points.push_back(smoothed_trajectory_points[i]);
+  } else {
+    // Reversing: ego moves toward decreasing index, so the segment end point (originally "ahead"
+    // in the trajectory's fixed order) is now the one *behind* ego. Local index 0 = segment end,
+    // walk toward decreasing index.
+    const auto segment_end_idx = ego_data.first_trajectory_idx + 1;
+    const auto segment_length = autoware_utils::calc_distance2d(
+      smoothed_trajectory_points[ego_data.first_trajectory_idx],
+      smoothed_trajectory_points[segment_end_idx]);
+    const auto offset_from_segment_end = segment_length - offset_from_segment_start;
+    ego_data.longitudinal_offset_to_first_trajectory_index = offset_from_segment_end;
+    auto l = -offset_from_segment_end;
+    ego_data.trajectory_points.push_back(smoothed_trajectory_points[segment_end_idx]);
+    // NOTE: loop starts at first_trajectory_idx + 1 (= segment_end_idx), not
+    // first_trajectory_idx, so the first increment is the length of ego's own current segment
+    // (points[segment_end_idx] -> points[first_trajectory_idx]) and points[first_trajectory_idx]
+    // itself is pushed next -- an off-by-one here would silently skip
+    // points[first_trajectory_idx] and mis-accumulate the first segment length.
+    for (auto i = segment_end_idx; i > 0; --i) {
+      l += autoware_utils::calc_distance2d(
+        smoothed_trajectory_points[i], smoothed_trajectory_points[i - 1]);
+      if (l >= max_arc_length) {
+        break;
+      }
+      ego_data.trajectory_points.push_back(smoothed_trajectory_points[i - 1]);
+    }
   }
 }
 
@@ -433,7 +475,8 @@ VelocityPlanningResult OutOfLaneModule::plan(
   stopwatch.tic("preprocessing");
   out_of_lane::EgoData ego_data;
   ego_data.pose = planner_data->current_odometry.pose.pose;
-  limit_trajectory_size(ego_data, smoothed_trajectory_points, params_.max_arc_length);
+  limit_trajectory_size(
+    ego_data, smoothed_trajectory_points, params_.max_arc_length, planner_data->is_driving_forward);
   out_of_lane::calculate_min_stop_and_slowdown_distances(
     ego_data, *planner_data, previous_slowdown_pose_);
   prepare_stop_lines_rtree(ego_data, *planner_data, params_.max_arc_length);
