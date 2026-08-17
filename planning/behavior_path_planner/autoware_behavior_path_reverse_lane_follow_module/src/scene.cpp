@@ -27,6 +27,7 @@
 
 namespace autoware::behavior_path_planner
 {
+using reverse_lane_follow_utils::buildRouteReversedFollowPath;
 using reverse_lane_follow_utils::extractTraveledTailPath;
 using reverse_lane_follow_utils::reversePathForRetrace;
 
@@ -83,52 +84,93 @@ void ReverseLaneFollowModule::updateData()
   if (!requested_distance_m_) {
     status_.retrace_path = PathWithLaneId{};
     status_.retrace_lanelets.clear();
-    return;
+  } else if (!planner_data_ || !planner_data_->route_handler) {
+    // fall through to updateRouteReversedFollow() below regardless
+  } else {
+    const auto tail =
+      extractTraveledTailPath(planner_data_->route_handler, getEgoPose(), *requested_distance_m_);
+    if (!tail) {
+      // Cannot build a valid retrace path (e.g. not enough traveled history yet) -- treat as no
+      // request rather than emitting a bogus path.
+      requested_distance_m_.reset();
+      status_.retrace_path = PathWithLaneId{};
+      status_.retrace_lanelets.clear();
+    } else {
+      status_.retrace_path = reversePathForRetrace(tail->path, parameters_->retrace_velocity_mps);
+      status_.retrace_lanelets = tail->lanelets;
+    }
   }
+
+  // Alternative/additional activation trigger (Task E / §4d): active whenever ego's current
+  // route segment is itself flagged reversed, not just during an explicit retrace request. Kept
+  // independent of the retrace-request branch above so Phase 1's standalone retrace use case
+  // keeps working unchanged.
+  updateRouteReversedFollow();
+}
+
+void ReverseLaneFollowModule::updateRouteReversedFollow()
+{
+  status_.is_route_reversed_active = false;
+  status_.route_reversed_path = PathWithLaneId{};
+  status_.route_reversed_lanelets.clear();
 
   if (!planner_data_ || !planner_data_->route_handler) {
     return;
   }
 
-  const auto tail =
-    extractTraveledTailPath(planner_data_->route_handler, getEgoPose(), *requested_distance_m_);
-  if (!tail) {
-    // Cannot build a valid retrace path (e.g. not enough traveled history yet) -- treat as no
-    // request rather than emitting a bogus path.
-    requested_distance_m_.reset();
-    status_.retrace_path = PathWithLaneId{};
-    status_.retrace_lanelets.clear();
+  const auto follow = buildRouteReversedFollowPath(
+    planner_data_->route_handler, getEgoPose(), parameters_->route_reversed_backward_distance_m,
+    parameters_->route_reversed_forward_distance_m);
+  if (!follow) {
     return;
   }
 
-  status_.retrace_path = reversePathForRetrace(tail->path, parameters_->retrace_velocity_mps);
-  status_.retrace_lanelets = tail->lanelets;
+  status_.is_route_reversed_active = true;
+  status_.route_reversed_path = follow->path;
+  status_.route_reversed_lanelets = follow->lanelets;
 }
 
 bool ReverseLaneFollowModule::isExecutionRequested() const
 {
-  return requested_distance_m_.has_value() && !status_.retrace_path.points.empty();
+  const bool retrace_active =
+    requested_distance_m_.has_value() && !status_.retrace_path.points.empty();
+  const bool route_reversed_active =
+    status_.is_route_reversed_active && !status_.route_reversed_path.points.empty();
+  return retrace_active || route_reversed_active;
 }
 
 bool ReverseLaneFollowModule::isExecutionReady() const
 {
-  return !status_.retrace_path.points.empty();
+  return !status_.retrace_path.points.empty() || !status_.route_reversed_path.points.empty();
 }
 
 BehaviorModuleOutput ReverseLaneFollowModule::plan()
 {
   BehaviorModuleOutput output{};
 
-  if (status_.retrace_path.points.empty()) {
-    // Nothing to retrace (yet/anymore) -- do not clobber the previous module's output.
+  // Explicit retrace request takes priority if both happen to be active simultaneously (should
+  // not normally occur -- retrace is an operator-triggered scaffold use case, route-reversed
+  // following is route-driven -- but retrace being an explicit ask wins ties).
+  const PathWithLaneId * active_path = nullptr;
+  const lanelet::ConstLanelets * active_lanelets = nullptr;
+  if (!status_.retrace_path.points.empty()) {
+    active_path = &status_.retrace_path;
+    active_lanelets = &status_.retrace_lanelets;
+  } else if (!status_.route_reversed_path.points.empty()) {
+    active_path = &status_.route_reversed_path;
+    active_lanelets = &status_.route_reversed_lanelets;
+  }
+
+  if (!active_path) {
+    // Nothing to follow (yet/anymore) -- do not clobber the previous module's output.
     return getPreviousModuleOutput();
   }
 
-  output.path = status_.retrace_path;
-  output.reference_path = status_.retrace_path;
+  output.path = *active_path;
+  output.reference_path = *active_path;
 
-  if (!status_.retrace_lanelets.empty()) {
-    output.drivable_area_info.drivable_lanes = utils::generateDrivableLanes(status_.retrace_lanelets);
+  if (!active_lanelets->empty()) {
+    output.drivable_area_info.drivable_lanes = utils::generateDrivableLanes(*active_lanelets);
   }
 
   return output;
@@ -136,12 +178,15 @@ BehaviorModuleOutput ReverseLaneFollowModule::plan()
 
 CandidateOutput ReverseLaneFollowModule::planCandidate() const
 {
-  return CandidateOutput(status_.retrace_path);
+  if (!status_.retrace_path.points.empty()) {
+    return CandidateOutput(status_.retrace_path);
+  }
+  return CandidateOutput(status_.route_reversed_path);
 }
 
 void ReverseLaneFollowModule::processOnEntry()
 {
-  status_.is_retracing = true;
+  status_.is_retracing = requested_distance_m_.has_value();
   status_.requested_distance_m =
     requested_distance_m_.value_or(parameters_->default_retrace_distance_m);
 }
@@ -151,6 +196,9 @@ void ReverseLaneFollowModule::processOnExit()
   status_.is_retracing = false;
   status_.retrace_path = PathWithLaneId{};
   status_.retrace_lanelets.clear();
+  status_.is_route_reversed_active = false;
+  status_.route_reversed_path = PathWithLaneId{};
+  status_.route_reversed_lanelets.clear();
   // Edge-triggered: completing (or aborting) a retrace always clears the request. A new
   // std_msgs::msg::Float64 publish is required to trigger the next one.
   requested_distance_m_.reset();
@@ -158,14 +206,20 @@ void ReverseLaneFollowModule::processOnExit()
 
 bool ReverseLaneFollowModule::canTransitSuccessState()
 {
-  if (status_.retrace_path.points.empty()) {
-    return true;
+  if (!status_.retrace_path.points.empty()) {
+    const auto & end_pose = status_.retrace_path.points.back().point.pose;
+    const auto remaining_distance = autoware_utils::calc_distance2d(getEgoPose(), end_pose);
+    return remaining_distance < parameters_->goal_reach_tolerance_m;
   }
 
-  const auto & end_pose = status_.retrace_path.points.back().point.pose;
-  const auto remaining_distance = autoware_utils::calc_distance2d(getEgoPose(), end_pose);
+  if (!status_.route_reversed_path.points.empty()) {
+    // Route-reversed following stays active as long as ego remains on a reversed route segment;
+    // updateRouteReversedFollow() clears route_reversed_path once that stops being true, which
+    // this then reports as "success" (nothing left to do) rather than "failure".
+    return false;
+  }
 
-  return remaining_distance < parameters_->goal_reach_tolerance_m;
+  return true;
 }
 
 }  // namespace autoware::behavior_path_planner

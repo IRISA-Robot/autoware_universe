@@ -71,6 +71,11 @@ public:
   // this to decide whether to stay out of the way.
   bool isRetracing() const { return status_.is_retracing; }
 
+  // True when this module is active because ego is on a route segment RouteHandler's direction
+  // side-table flags as reversed (is_reversed), as opposed to an explicit retrace request. See
+  // updateData()/bidirectional_plan/04-routing-foundation.md §4d.
+  bool isFollowingReversedRouteSegment() const { return status_.is_route_reversed_active; }
+
 private:
   bool canTransitSuccessState() override;
   bool canTransitFailureState() override { return false; }
@@ -78,6 +83,12 @@ private:
   // Polls the manager-owned retrace-request subscriber and refreshes requested_distance_m_.
   // Never creates/destroys the subscription itself (see manager.hpp).
   void updateRetraceRequest();
+
+  // Checks RouteHandler::isLaneletInvertedInRoute() for ego's current lanelet and, if flagged,
+  // builds a follow path directly from the route's own inverted centerline. This is the
+  // alternative/additional activation trigger alongside the retrace-request trigger -- see
+  // buildRouteReversedFollowPath().
+  void updateRouteReversedFollow();
 
   std::shared_ptr<ReverseLaneFollowParameters> parameters_;
   std::shared_ptr<autoware_utils::InterProcessPollingSubscriber<std_msgs::msg::Float64>>

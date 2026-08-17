@@ -86,4 +86,46 @@ PathWithLaneId reversePathForRetrace(
   return reversed;
 }
 
+std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
+  const std::shared_ptr<RouteHandler> & route_handler, const Pose & ego_pose,
+  const double backward_distance_m, const double forward_distance_m)
+{
+  if (!route_handler) {
+    return std::nullopt;
+  }
+
+  lanelet::ConstLanelet current_lanelet;
+  if (!route_handler->getClosestLaneletWithinRoute(ego_pose, &current_lanelet)) {
+    return std::nullopt;
+  }
+
+  if (!route_handler->isLaneletInvertedInRoute(current_lanelet)) {
+    // Not on a reversed route segment -- this activation trigger does not apply; the caller
+    // should fall back to the (still-supported standalone) retrace-request trigger.
+    return std::nullopt;
+  }
+
+  // following()/previous() on routing_graph_ptr_ already resolve correctly for an inverted
+  // ConstLanelet (verified by the Phase-0 spike), so "forward"/"backward" here already mean
+  // ahead-of/behind-ego in the actual direction of travel, not map/centerline-index order.
+  const auto lanelet_sequence = route_handler->getLaneletSequence(
+    current_lanelet, ego_pose, backward_distance_m, forward_distance_m);
+  if (lanelet_sequence.empty()) {
+    return std::nullopt;
+  }
+
+  auto path =
+    route_handler->getCenterLinePath(lanelet_sequence, 0.0, std::numeric_limits<double>::max());
+  if (path.points.empty()) {
+    return std::nullopt;
+  }
+
+  for (auto & path_point : path.points) {
+    path_point.point.longitudinal_velocity_mps =
+      -std::abs(path_point.point.longitudinal_velocity_mps);
+  }
+
+  return RouteReversedFollow{path, lanelet_sequence};
+}
+
 }  // namespace autoware::behavior_path_planner::reverse_lane_follow_utils

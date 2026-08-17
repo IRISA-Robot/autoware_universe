@@ -41,6 +41,13 @@ struct ReverseLaneFollowParameters
 
   // Ego-to-path-end distance below which the retrace is considered complete.
   double goal_reach_tolerance_m{0.5};
+
+  // Bidirectional-driving support (Task E / §4d): forward/backward lookahead (meters) used when
+  // this module activates because ego is on a route segment RouteHandler flags as reversed,
+  // independent of any explicit retrace request. "forward" here means ahead of ego in the actual
+  // direction of travel (i.e. along the inverted lanelet sequence), not map/centerline order.
+  double route_reversed_forward_distance_m{30.0};
+  double route_reversed_backward_distance_m{5.0};
 };
 
 // This module's own "am I currently retracing" status flag -- the reverse-lane-follow analogue of
@@ -54,6 +61,14 @@ struct ReverseLaneFollowStatus
   // Lanelet sequence the retrace_path was built from -- kept around so plan() can regenerate a
   // drivable area without re-querying RouteHandler every cycle.
   lanelet::ConstLanelets retrace_lanelets{};
+
+  // Bidirectional-driving support (Task E / §4d): true when this module is active because ego is
+  // on a route segment RouteHandler flags as reversed, rather than because of an explicit
+  // retrace request. route_reversed_path/route_reversed_lanelets mirror retrace_path/
+  // retrace_lanelets for that trigger.
+  bool is_route_reversed_active{false};
+  PathWithLaneId route_reversed_path{};
+  lanelet::ConstLanelets route_reversed_lanelets{};
 };
 
 }  // namespace autoware::behavior_path_planner

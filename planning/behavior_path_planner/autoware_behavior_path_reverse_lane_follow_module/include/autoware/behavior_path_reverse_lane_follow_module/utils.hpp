@@ -73,6 +73,39 @@ std::optional<TraveledTail> extractTraveledTailPath(
 PathWithLaneId reversePathForRetrace(
   const PathWithLaneId & forward_tail_path, const double retrace_velocity_mps);
 
+// Result of buildRouteReversedFollowPath(): a negative-velocity path already in correct
+// travel-point-order (see that function's doc comment for why no point-order reversal is
+// needed here, unlike reversePathForRetrace), plus the (inverted) lanelet sequence it was built
+// from -- needed downstream to (re)generate a drivable area.
+struct RouteReversedFollow
+{
+  PathWithLaneId path;
+  lanelet::ConstLanelets lanelets;
+};
+
+/**
+ * @brief Build a reverse-direction follow path when ego's current route segment is itself
+ * flagged reversed (RouteHandler::isLaneletInvertedInRoute()), independent of any explicit
+ * retrace request. This is the Phase-2 activation trigger added alongside Phase-1's
+ * retrace-request trigger (extractTraveledTailPath()/reversePathForRetrace()) -- see
+ * bidirectional_plan/04-routing-foundation.md §4d.
+ *
+ * Unlike extractTraveledTailPath() (which reverses an already-forward-driven tail path point
+ * order), this follows the route's own (auto-flipping) inverted centerline directly via
+ * RouteHandler::getCenterLinePath(): lanelet::ConstLanelet::centerline() already returns points
+ * in correct travel-direction order for an inverted lanelet (see the Phase-0 spike,
+ * InvertedCenterlineIsReversed), so no manual point-order reversal is applied here -- only the
+ * velocity sign is flipped negative, reusing the same convention as reversePathForRetrace()/
+ * autoware_freespace_planning_algorithms.
+ *
+ * @return std::nullopt if ego is not within the route, or ego's current lanelet is not flagged
+ *         reversed in the route's direction side-table (i.e. this trigger does not apply -- the
+ *         caller should fall back to / keep using the retrace-request trigger).
+ */
+std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
+  const std::shared_ptr<RouteHandler> & route_handler, const Pose & ego_pose,
+  const double backward_distance_m, const double forward_distance_m);
+
 }  // namespace autoware::behavior_path_planner::reverse_lane_follow_utils
 
 #endif  // AUTOWARE__BEHAVIOR_PATH_REVERSE_LANE_FOLLOW_MODULE__UTILS_HPP_

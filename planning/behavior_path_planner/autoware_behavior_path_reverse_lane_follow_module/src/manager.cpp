@@ -44,6 +44,10 @@ void ReverseLaneFollowModuleManager::init(rclcpp::Node * node)
     node->declare_parameter<double>(ns + "retrace_velocity_mps", p.retrace_velocity_mps);
   p.goal_reach_tolerance_m =
     node->declare_parameter<double>(ns + "goal_reach_tolerance_m", p.goal_reach_tolerance_m);
+  p.route_reversed_forward_distance_m = node->declare_parameter<double>(
+    ns + "route_reversed_forward_distance_m", p.route_reversed_forward_distance_m);
+  p.route_reversed_backward_distance_m = node->declare_parameter<double>(
+    ns + "route_reversed_backward_distance_m", p.route_reversed_backward_distance_m);
 
   parameters_ = std::make_shared<ReverseLaneFollowParameters>(p);
 
@@ -66,6 +70,10 @@ void ReverseLaneFollowModuleManager::updateModuleParams(
   update_param<double>(parameters, ns + "min_retrace_distance_m", p->min_retrace_distance_m);
   update_param<double>(parameters, ns + "retrace_velocity_mps", p->retrace_velocity_mps);
   update_param<double>(parameters, ns + "goal_reach_tolerance_m", p->goal_reach_tolerance_m);
+  update_param<double>(
+    parameters, ns + "route_reversed_forward_distance_m", p->route_reversed_forward_distance_m);
+  update_param<double>(
+    parameters, ns + "route_reversed_backward_distance_m", p->route_reversed_backward_distance_m);
 
   std::for_each(observers_.begin(), observers_.end(), [&p](const auto & observer) {
     if (!observer.expired()) observer.lock()->updateModuleParams(p);

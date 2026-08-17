@@ -40,6 +40,7 @@
 #include <lanelet2_core/geometry/BoundingBox.h>
 #include <lanelet2_core/geometry/Lanelet.h>
 
+#include <algorithm>
 #include <limits>
 #include <vector>
 
@@ -89,6 +90,11 @@ void DefaultPlanner::initialize_common(rclcpp::Node * node)
   param_.consider_no_drivable_lanes = node_->declare_parameter<bool>("consider_no_drivable_lanes");
   param_.check_footprint_inside_lanes =
     node_->declare_parameter<bool>("check_footprint_inside_lanes");
+  // Bidirectional-driving support: default false preserves today's behavior for existing
+  // deployments/param files that don't set this yet.
+  param_.allow_reverse_route =
+    node_->declare_parameter<bool>("allow_reverse_route", false);
+  route_handler_.setAllowReverseRoute(param_.allow_reverse_route);
 }
 
 void DefaultPlanner::initialize(rclcpp::Node * node)
@@ -387,6 +393,11 @@ PlannerPlugin::LaneletRoute DefaultPlanner::plan(const RoutePoints & points)
   route_msg.start_pose = points.front();
   route_msg.goal_pose = refined_goal;
   route_msg.segments = route_sections;
+  // Fast-path hint for consumers (RViz plugins, RouteState publishers) that don't want to scan
+  // every segment for is_reversed -- see LaneletRoute.msg.
+  route_msg.has_reversed_segments = std::any_of(
+    route_msg.segments.begin(), route_msg.segments.end(),
+    [](const auto & segment) { return segment.is_reversed; });
   return route_msg;
 }
 
