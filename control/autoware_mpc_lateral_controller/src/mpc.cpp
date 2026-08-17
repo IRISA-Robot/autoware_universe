@@ -60,6 +60,27 @@ ResultWithReason MPC::calculateMPC(
     return ResultWithReason{false, fmt::format("getting MPC Data ({}).", get_data_result.reason)};
   }
 
+  // [BIDIR-DEBUG] Distinguish "noisy reference curvature" vs "MPC-internal tracking error" as the
+  // dominant source of reverse steering-quality degradation. Logs the reference curvature around
+  // the nearest point (raw k / smoothed smooth_k) plus current lateral/yaw error whenever driving
+  // in reverse. If k jumps around a lot sample-to-sample while lateral/yaw error stay small, the
+  // reference path itself (behavior_path_planner / centerline) is the dominant noise source
+  // (planning-layer issue). If k is smooth but lateral/yaw error oscillate, the issue is in the
+  // MPC's own tracking (control-layer issue).
+  if (!m_is_forward_shift) {
+    const size_t idx = mpc_data.nearest_idx;
+    const size_t idx_prev = idx > 0 ? idx - 1 : idx;
+    const size_t idx_next = idx + 1 < reference_trajectory.k.size() ? idx + 1 : idx;
+    RCLCPP_WARN_THROTTLE(
+      m_logger, *m_clock, 500,
+      "[BIDIR-DEBUG] reverse tracking: lateral_err=%.4f yaw_err=%.4f | k[prev,curr,next]=(%.4f, "
+      "%.4f, %.4f) smooth_k[prev,curr,next]=(%.4f, %.4f, %.4f)",
+      mpc_data.lateral_err, mpc_data.yaw_err, reference_trajectory.k.at(idx_prev),
+      reference_trajectory.k.at(idx), reference_trajectory.k.at(idx_next),
+      reference_trajectory.smooth_k.at(idx_prev), reference_trajectory.smooth_k.at(idx),
+      reference_trajectory.smooth_k.at(idx_next));
+  }
+
   // calculate initial state of the error dynamics
   const auto x0 = getInitialState(mpc_data);
 
@@ -845,10 +866,23 @@ VectorXd MPC::calcSteerRateLimitOnTrajectory(
   }
 
   // calculate steering rate limit
+  // NOTE: Both lookup tables (curvature_list_for_steer_rate_lim, velocity_list_for_steer_rate_lim)
+  // are defined with non-negative, ascending reference values, and the interpolation above uses
+  // zero-order hold below the first entry. Feeding a raw *signed* curvature/velocity in here means
+  // any negative value (e.g. one turn direction's curvature sign, or -- critically -- reverse
+  // driving's negative vx) always falls below the smallest table entry and is zero-order-held at
+  // the loosest (front) limit, regardless of magnitude. For reverse driving in particular this
+  // silently disables the intended speed-based steering-rate tapering (the vehicle always gets the
+  // "near-zero-speed" rate limit, e.g. 172 deg/s here, no matter how fast it is actually reversing),
+  // which allows faster steering swings than the equivalent forward speed would and is a plausible
+  // contributor to reverse steering feeling less smooth than forward. Use magnitude so both tables
+  // are looked up direction-agnostically, matching how they are tuned/intended.
   VectorXd steer_rate_limits = VectorXd::Zero(m_param.prediction_horizon);
   for (int i = 0; i < m_param.prediction_horizon; ++i) {
-    const auto limit_by_curvature = interp(m_steer_rate_lim_map_by_curvature, trajectory.k.at(i));
-    const auto limit_by_velocity = interp(m_steer_rate_lim_map_by_velocity, trajectory.vx.at(i));
+    const auto limit_by_curvature =
+      interp(m_steer_rate_lim_map_by_curvature, std::abs(trajectory.k.at(i)));
+    const auto limit_by_velocity =
+      interp(m_steer_rate_lim_map_by_velocity, std::abs(trajectory.vx.at(i)));
     steer_rate_limits(i) = std::min(limit_by_curvature, limit_by_velocity);
   }
 
