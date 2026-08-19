@@ -143,6 +143,21 @@ std::optional<std::pair<double, double>> ShiftLineGenerator::computeFeasibleShif
   const auto bypass_longitudinal_gates =
     parameters_->always_avoid_if_geometrically_possible || object.is_avoidance_committed;
 
+  {
+    static auto logger = rclcpp::get_logger("static_obstacle_avoidance_shift_line_generator");
+    static rclcpp::Clock steady_clock{RCL_ROS_TIME};
+    RCLCPP_WARN_THROTTLE(
+      logger, steady_clock, 1000,
+      "[AVOID-DEBUG] computeFeasibleShiftProfile: always_avoid_if_geometrically_possible=%s "
+      "is_avoidance_committed=%s bypass_longitudinal_gates=%s prepare_distance=%.2f "
+      "constant_distance=%.2f nominal_avoid_distance=%.2f has_enough_distance=%s "
+      "avoidance_distance=%.2f",
+      (parameters_->always_avoid_if_geometrically_possible ? "true" : "false"),
+      (object.is_avoidance_committed ? "true" : "false"),
+      (bypass_longitudinal_gates ? "true" : "false"), prepare_distance, constant_distance,
+      nominal_avoid_distance, (has_enough_distance ? "true" : "false"), avoidance_distance);
+  }
+
   // nominal case. avoidable.
   if (has_enough_distance) {
     return std::make_pair(desire_shift_length, avoidance_distance);

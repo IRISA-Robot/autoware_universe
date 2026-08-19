@@ -129,8 +129,38 @@ AvoidanceState StaticObstacleAvoidanceModule::getCurrentModuleState(
     data.target_objects.begin(), data.target_objects.end(),
     [this](const auto & o) { return !helper_->isAbsolutelyNotAvoidable(o); });
 
+  const bool has_shift_point = !path_shifter_.getShiftLines().empty();
+  const bool has_base_offset =
+    std::abs(path_shifter_.getBaseOffset()) > parameters_->lateral_execution_threshold;
+  const bool is_shifted = helper_->isShifted();
+
+  // [AVOID-DEBUG] AvoidanceState values: 0=RUNNING, 1=CANCEL, 2=SUCCEEDED
+  const auto to_state_string = [](const AvoidanceState state) -> const char * {
+    switch (state) {
+      case AvoidanceState::RUNNING:
+        return "RUNNING";
+      case AvoidanceState::CANCEL:
+        return "CANCEL";
+      case AvoidanceState::SUCCEEDED:
+        return "SUCCEEDED";
+      default:
+        return "UNKNOWN";
+    }
+  };
+
+  const auto log_state_and_return = [&](const AvoidanceState state) {
+    RCLCPP_WARN_THROTTLE(
+      getLogger(), *clock_, 1000,
+      "[AVOID-DEBUG] getCurrentModuleState: has_avoidance_target=%s has_shift_point=%s "
+      "has_base_offset=%s is_shifted=%s -> state=%s",
+      (has_avoidance_target ? "true" : "false"), (has_shift_point ? "true" : "false"),
+      (has_base_offset ? "true" : "false"), (is_shifted ? "true" : "false"),
+      to_state_string(state));
+    return state;
+  };
+
   if (has_avoidance_target) {
-    return AvoidanceState::RUNNING;
+    return log_state_and_return(AvoidanceState::RUNNING);
   }
 
   // If the ego is on the shift line, keep RUNNING.
@@ -141,30 +171,26 @@ AvoidanceState StaticObstacleAvoidanceModule::getCurrentModuleState(
     };
     for (const auto & shift_line : path_shifter_.getShiftLines()) {
       if (within(shift_line, idx)) {
-        return AvoidanceState::RUNNING;
+        return log_state_and_return(AvoidanceState::RUNNING);
       }
     }
   }
 
-  const bool has_shift_point = !path_shifter_.getShiftLines().empty();
-  const bool has_base_offset =
-    std::abs(path_shifter_.getBaseOffset()) > parameters_->lateral_execution_threshold;
-
   if (has_base_offset) {
-    return AvoidanceState::RUNNING;
+    return log_state_and_return(AvoidanceState::RUNNING);
   }
 
   // Nothing to do. -> EXIT.
   if (!has_shift_point) {
-    return AvoidanceState::SUCCEEDED;
+    return log_state_and_return(AvoidanceState::SUCCEEDED);
   }
 
   // Be able to canceling avoidance path. -> EXIT.
-  if (!helper_->isShifted() && parameters_->enable_cancel_maneuver) {
-    return AvoidanceState::CANCEL;
+  if (!is_shifted && parameters_->enable_cancel_maneuver) {
+    return log_state_and_return(AvoidanceState::CANCEL);
   }
 
-  return AvoidanceState::RUNNING;
+  return log_state_and_return(AvoidanceState::RUNNING);
 }
 
 bool StaticObstacleAvoidanceModule::canTransitSuccessState()
@@ -196,7 +222,13 @@ bool StaticObstacleAvoidanceModule::canTransitSuccessState()
     }
   }
 
-  return data.state == AvoidanceState::CANCEL || data.state == AvoidanceState::SUCCEEDED;
+  const bool is_cancel = data.state == AvoidanceState::CANCEL;
+  const bool is_succeeded = data.state == AvoidanceState::SUCCEEDED;
+  RCLCPP_WARN_THROTTLE(
+    getLogger(), *clock_, 1000,
+    "[AVOID-DEBUG] canTransitSuccessState: exit_cause_cancel=%s exit_cause_succeeded=%s",
+    (is_cancel ? "true" : "false"), (is_succeeded ? "true" : "false"));
+  return is_cancel || is_succeeded;
 }
 
 void StaticObstacleAvoidanceModule::fillFundamentalData(
@@ -610,6 +642,20 @@ void StaticObstacleAvoidanceModule::fillEgoStatus(
   AvoidancePlanningData & data, [[maybe_unused]] DebugData & debug) const
 {
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
+
+  // [AVOID-DEBUG] per-object avoidability snapshot, right before getCurrentModuleState() reads
+  // data.target_objects. `info` is the ObjectInfo enum (see data_structs.hpp) logged as an int
+  // since no string-conversion helper exists for it yet.
+  for (const auto & o : data.target_objects) {
+    RCLCPP_WARN_THROTTLE(
+      getLogger(), *clock_, 1000,
+      "[AVOID-DEBUG] target_object avoidability: object_id=%s is_avoidance_committed=%s "
+      "has_avoid_margin=%s avoid_margin=%.2f info=%d is_absolutely_not_avoidable=%s",
+      to_hex_string(o.object.object_id).c_str(), (o.is_avoidance_committed ? "true" : "false"),
+      (o.avoid_margin.has_value() ? "true" : "false"), o.avoid_margin.value_or(-1.0),
+      static_cast<int>(o.info), (helper_->isAbsolutelyNotAvoidable(o) ? "true" : "false"));
+  }
+
   data.state = getCurrentModuleState(data);
 
   /**
