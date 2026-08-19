@@ -1178,9 +1178,22 @@ bool isNoNeedAvoidanceBehavior(
     return false;
   }
 
+  // NOTE: object.avoid_margin is derived from getAvoidMargin()/getRoadShoulderDistance(), which
+  // are computed relative to the TRUE lane geometry (bias-independent -- see the
+  // getRoadShoulderDistance frame-mismatch fix). isOnRight(object)/object.direction, by contrast,
+  // are computed relative to the CURRENT reference path (scene.cpp's calc_lateral_deviation
+  // against data.reference_path), which can be laterally biased (e.g. prefer_lateral_ratio).
+  // object.overhang_points.front().first (overhang_dist) legitimately stays path-relative here:
+  // it is the real, current lateral distance from the path actually being shifted to the
+  // object's near edge, and shift_length is by definition relative to that same path. What must
+  // NOT be path-relative is the add-vs-subtract decision (which side of the object requires the
+  // margin), since that decision has to agree with the true-lane side getAvoidMargin() assumed
+  // when it picked the "far" road bound. So use object.is_on_right_of_true_lane here instead of
+  // isOnRight(object) to keep both terms of the shift_length formula in the same frame.
   const auto shift_length = calcShiftLength(
-    isOnRight(object), object.overhang_points.front().first, object.avoid_margin.value());
-  if (!isShiftNecessary(isOnRight(object), shift_length)) {
+    object.is_on_right_of_true_lane, object.overhang_points.front().first,
+    object.avoid_margin.value());
+  if (!isShiftNecessary(object.is_on_right_of_true_lane, shift_length)) {
     object.info = ObjectInfo::ENOUGH_LATERAL_DISTANCE;
     return true;
   }
@@ -2233,6 +2246,7 @@ void updateRoadShoulderDistance(
 
   for (auto & o : data.target_objects) {
     o.to_road_shoulder_distance = filtering_utils::getRoadShoulderDistance(o, data, planner_data);
+    o.is_on_right_of_true_lane = filtering_utils::getDistanceToCenterline(o, data) <= 0.0;
     o.avoid_margin = filtering_utils::getAvoidMargin(o, planner_data, parameters);
   }
 }
@@ -2257,7 +2271,9 @@ bool isAvoidanceOpportunityRunningOut(
     return false;
   }
 
-  const auto is_object_on_right = utils::static_obstacle_avoidance::isOnRight(object);
+  // avoid_margin here is getAvoidMargin()'s output (true-lane-relative), so pair it with
+  // object.is_on_right_of_true_lane rather than isOnRight(object) -- see data_structs.hpp.
+  const auto is_object_on_right = object.is_on_right_of_true_lane;
   const auto desire_shift_length =
     helper->getShiftLength(object, is_object_on_right, avoid_margin.value());
   const auto required_distance = helper->getNominalPrepareDistance() +
@@ -2306,6 +2322,11 @@ void filterTargetObjects(
         planner_data->parameters.vehicle_info.front_overhang_m,
       planner_data->parameters.vehicle_info.rear_overhang_m);
     o.to_road_shoulder_distance = filtering_utils::getRoadShoulderDistance(o, data, planner_data);
+    // Bias-independent side classification -- see is_on_right_of_true_lane doc comment in
+    // data_structs.hpp. Must be computed here (rather than reusing isOnRight(o)) so that every
+    // downstream consumer that combines this side with avoid_margin (itself true-lane-relative)
+    // stays in the same reference frame, even when data.reference_path is laterally biased.
+    o.is_on_right_of_true_lane = filtering_utils::getDistanceToCenterline(o, data) <= 0.0;
 
     if (filtering_utils::isUnknownTypeObject(o)) {
       const auto avoid_margin = filtering_utils::getAvoidMargin(o, planner_data, parameters);

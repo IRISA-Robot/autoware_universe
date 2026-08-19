@@ -513,6 +513,19 @@ struct ObjectData  // avoidance target
   // object direction.
   Direction direction{Direction::NONE};
 
+  // Whether the object sits on the right side of the TRUE lane centerline, i.e. bias-independent
+  // -- computed via filtering_utils::getDistanceToCenterline() (arc-coordinate distance against
+  // object.overhang_lanelet), NOT relative to the possibly prefer_lateral_ratio-biased
+  // data.reference_path the way `direction`/isOnRight() above are. avoid_margin (see below) is
+  // derived from getAvoidMargin()/getRoadShoulderDistance(), which are themselves computed in
+  // this same true-lane-relative frame (fixed in the getRoadShoulderDistance frame-mismatch
+  // patch). Combining avoid_margin with the path-relative `direction`/isOnRight() in the same
+  // shift_length arithmetic mixes two different reference frames and produces a wrong-signed
+  // shift_length whenever the reference path is laterally biased -- so anywhere avoid_margin is
+  // combined with a left/right decision, use this field instead of isOnRight(*this). Populated
+  // alongside to_road_shoulder_distance in identifyTargetObjects()/updateRoadShoulderDistance().
+  bool is_on_right_of_true_lane{false};
+
   // overhang points (sort by distance)
   std::vector<std::pair<double, Point>> overhang_points{};
 

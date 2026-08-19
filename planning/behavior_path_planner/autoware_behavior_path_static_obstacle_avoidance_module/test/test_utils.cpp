@@ -479,6 +479,10 @@ TEST(TestUtils, isAvoidanceOpportunityRunningOut)
         .label(ObjectClassification::UNKNOWN)
         .probability(1.0));
     object_data.direction = Direction::RIGHT;
+    // Unbiased scenario: true-lane-relative side agrees with the path-relative `direction` above.
+    // isAvoidanceOpportunityRunningOut() now uses is_on_right_of_true_lane (see the
+    // calcShiftLength frame-mismatch fix) instead of isOnRight(object)/direction.
+    object_data.is_on_right_of_true_lane = true;
     object_data.overhang_points.emplace_back(0.5, Point{});
     object_data.longitudinal = longitudinal;
     return object_data;
@@ -489,7 +493,7 @@ TEST(TestUtils, isAvoidanceOpportunityRunningOut)
   // determine the distance required to still attempt a shift with the above setup, so the test
   // doesn't hardcode brittle numbers derived from the jerk-based distance formula.
   const auto probe_object = make_unknown_object(0.0);
-  const auto is_object_on_right = utils::static_obstacle_avoidance::isOnRight(probe_object);
+  const auto is_object_on_right = probe_object.is_on_right_of_true_lane;
   const auto desire_shift_length =
     helper->getShiftLength(probe_object, is_object_on_right, avoid_margin.value());
   const auto required_distance = helper->getNominalPrepareDistance() +
@@ -2215,6 +2219,10 @@ TEST(TestUtils, AlwaysAvoidFlagBypassesWaitAndSeeGate)
       .label(ObjectClassification::TRUCK)
       .probability(1.0));
   object_data.direction = Direction::RIGHT;
+  // Unbiased scenario: true-lane-relative side agrees with the path-relative one above. isReady()
+  // now uses is_on_right_of_true_lane (see the calcShiftLength frame-mismatch fix) instead of
+  // isOnRight(object)/direction, so it must be set explicitly here to match.
+  object_data.is_on_right_of_true_lane = true;
   object_data.overhang_points.emplace_back(0.0, Point{});
   object_data.is_ambiguous = true;
   object_data.behavior = ObjectData::Behavior::MERGING;
@@ -2236,6 +2244,79 @@ TEST(TestUtils, AlwaysAvoidFlagBypassesWaitAndSeeGate)
     const auto [ready, ambiguous] = helper->isReady(ObjectDataArray{object_data});
     EXPECT_TRUE(ready);
     EXPECT_FALSE(ambiguous);
+  }
+}
+
+// isNoNeedAvoidanceBehavior()'s calcShiftLength() frame-mismatch fix: object.avoid_margin is
+// computed relative to the TRUE lane (getAvoidMargin()/getRoadShoulderDistance(), bias-independent
+// -- see the getRoadShoulderDistance fix), but object.overhang_points/direction (isOnRight()) are
+// computed relative to the CURRENT reference path, which can be laterally biased away from true
+// center (e.g. by a prefer_lateral_ratio lanelet tag). Before this fix, calcShiftLength() combined
+// avoid_margin with the path-relative side to decide whether to add or subtract the margin; when
+// the path bias makes the path-relative side disagree with the true-lane side, this produces a
+// wrong-signed (here: numerically-cancelled, near-zero) shift_length even for an object genuinely
+// blocking the TRUE driving line. Fixed by introducing object.is_on_right_of_true_lane (populated
+// once, bias-independent, alongside to_road_shoulder_distance/avoid_margin) and using it instead
+// of isOnRight(object)/direction wherever it is combined with avoid_margin.
+TEST(TestUtils, isNoNeedAvoidanceBehaviorTrueLaneRelativeShiftLength)
+{
+  const auto parameters = get_parameters();  // lateral_execution_threshold = 0.5
+
+  // Live-bug repro: a pedestrian genuinely blocking the TRUE path produces a healthy, correctly
+  // true-lane-relative avoid_margin (1.81 m, matching the recorded-bag value), but the current
+  // (biased) reference path happens to sit almost exactly `avoid_margin` away from the object on
+  // its near-edge/path-relative measurement -- so old code (mixing true-lane avoid_margin with
+  // path-relative side) computed shift_length = overhang_dist - avoid_margin = 1.81 - 1.81 = 0.0,
+  // misclassified LESS_THAN_EXECUTION_THRESHOLD ("no need to shift") despite the object truly
+  // blocking the path.
+  {
+    ObjectData object_data;
+    object_data.avoid_margin = 1.81;
+    // Path-relative: the biased reference path is far enough right that the object reads as being
+    // on its LEFT (isOnRight(object) == false via direction == LEFT).
+    object_data.direction = Direction::LEFT;
+    // True-lane-relative: the object is actually on the RIGHT of the true lane centerline --
+    // this is what getAvoidMargin() assumed when picking the road bound to measure margin
+    // against, and disagrees with the path-relative classification above.
+    object_data.is_on_right_of_true_lane = true;
+    // Path-relative near-edge overhang distance: numerically equal to avoid_margin, which is
+    // exactly what causes the old (buggy) subtract-branch math to cancel to ~0.
+    object_data.overhang_points.emplace_back(1.81, Point{});
+
+    EXPECT_FALSE(filtering_utils::isNoNeedAvoidanceBehavior(object_data, parameters))
+      << "genuinely-blocking object must not be dropped as ENOUGH_LATERAL_DISTANCE / "
+         "LESS_THAN_EXECUTION_THRESHOLD just because the biased path's path-relative side "
+         "disagrees with the object's true-lane side";
+    EXPECT_NE(object_data.info, ObjectInfo::ENOUGH_LATERAL_DISTANCE);
+    EXPECT_NE(object_data.info, ObjectInfo::LESS_THAN_EXECUTION_THRESHOLD);
+  }
+
+  // Regression (unbiased path): path-relative and true-lane-relative side agree, so behavior must
+  // be identical to before this fix. Mirrors the same avoid_margin/overhang_dist magnitudes as the
+  // bug repro above, but with both sides consistently RIGHT -- add-branch math correctly yields a
+  // healthy positive shift_length, so avoidance is (still) required.
+  {
+    ObjectData object_data;
+    object_data.avoid_margin = 1.81;
+    object_data.direction = Direction::RIGHT;
+    object_data.is_on_right_of_true_lane = true;
+    object_data.overhang_points.emplace_back(0.0, Point{});
+
+    EXPECT_FALSE(filtering_utils::isNoNeedAvoidanceBehavior(object_data, parameters));
+  }
+
+  // Regression (unbiased path, genuinely sufficient clearance): both sides agree the object is on
+  // the right and already comfortably clear of the required margin -- must still resolve to
+  // ENOUGH_LATERAL_DISTANCE exactly as before this fix.
+  {
+    ObjectData object_data;
+    object_data.avoid_margin = 1.81;
+    object_data.direction = Direction::RIGHT;
+    object_data.is_on_right_of_true_lane = true;
+    object_data.overhang_points.emplace_back(-3.0, Point{});
+
+    EXPECT_TRUE(filtering_utils::isNoNeedAvoidanceBehavior(object_data, parameters));
+    EXPECT_EQ(object_data.info, ObjectInfo::ENOUGH_LATERAL_DISTANCE);
   }
 }
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance

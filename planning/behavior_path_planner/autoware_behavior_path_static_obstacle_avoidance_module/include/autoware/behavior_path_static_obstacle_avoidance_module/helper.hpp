@@ -429,7 +429,11 @@ public:
       return std::make_pair(true, false);
     }
 
-    const auto is_object_on_right = utils::static_obstacle_avoidance::isOnRight(object);
+    // Use the true-lane-relative side here (not isOnRight(object)/object.direction, which is
+    // relative to the possibly-biased current reference path) since it is combined with
+    // object.avoid_margin -- itself computed in the true-lane frame by getAvoidMargin() /
+    // getRoadShoulderDistance(). See is_on_right_of_true_lane doc comment in data_structs.hpp.
+    const auto is_object_on_right = object.is_on_right_of_true_lane;
     const auto desire_shift_length =
       getShiftLength(object, is_object_on_right, object.avoid_margin.value());
 

@@ -320,9 +320,15 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
       }
     }
 
+    // Use the true-lane-relative side (o.is_on_right_of_true_lane) rather than isOnRight(o) here:
+    // o.avoid_margin is computed in the true-lane frame (getAvoidMargin()/
+    // getRoadShoulderDistance()), so the add-vs-subtract / same-direction sanity check must use
+    // the same frame to keep the resulting shift_length sign correct even when data.reference_path
+    // is laterally biased (e.g. prefer_lateral_ratio). See data_structs.hpp for details.
     const auto desire_shift_length =
-      helper_->getShiftLength(o, isOnRight(o), o.avoid_margin.value());
-    if (utils::static_obstacle_avoidance::isSameDirectionShift(isOnRight(o), desire_shift_length)) {
+      helper_->getShiftLength(o, o.is_on_right_of_true_lane, o.avoid_margin.value());
+    if (utils::static_obstacle_avoidance::isSameDirectionShift(
+          o.is_on_right_of_true_lane, desire_shift_length)) {
       o.info = ObjectInfo::SAME_DIRECTION_SHIFT;
       if (o.avoid_required && is_forward_object(o) && is_on_path(o)) {
         break;
