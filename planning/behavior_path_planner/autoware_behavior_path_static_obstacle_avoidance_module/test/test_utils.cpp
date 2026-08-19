@@ -1904,4 +1904,39 @@ TEST(TestUtils, isSatisfiedWithNonVehicleConditionAllowsMidLanePedestrianWithAdj
   // is_on_ego_lane is still computed/populated (used elsewhere); confirm it reads correctly too.
   EXPECT_TRUE(object_data.is_on_ego_lane);
 }
+
+TEST(TestUtils, getNominalReturnPrepareDistanceIsDecoupledFromPrepareDistance)
+{
+  // The post-object "hold distance" (used by addReturnShiftLine()) must be independently
+  // configurable from the before-object "prepare distance" (used by every other call site of
+  // getNominalPrepareDistance()). Confirm the two accessors read distinct parameters and can
+  // diverge when only one side is tuned.
+  auto parameters = get_parameters();
+  const auto planner_data = get_planner_data();
+
+  auto helper = std::make_shared<helper::static_obstacle_avoidance::AvoidanceHelper>(parameters);
+  helper->setData(planner_data);
+
+  // Sanity check: with return params left at their (unset) defaults, the two accessors differ
+  // from the pre-object prepare distance, proving they are not silently aliased to the same
+  // parameter fields.
+  parameters->min_return_prepare_distance = 0.0;
+  parameters->max_return_prepare_time = 0.0;
+  EXPECT_NE(helper->getNominalReturnPrepareDistance(), helper->getNominalPrepareDistance());
+
+  // When mirrored to the same values as min_prepare_distance/max_prepare_time, behavior must be
+  // identical (this is the default-identical-behavior guarantee).
+  parameters->min_return_prepare_distance = parameters->min_prepare_distance;
+  parameters->max_return_prepare_time = parameters->max_prepare_time;
+  EXPECT_DOUBLE_EQ(
+    helper->getNominalReturnPrepareDistance(), helper->getNominalPrepareDistance());
+
+  // Raising only the return-specific params must change getNominalReturnPrepareDistance() while
+  // leaving getNominalPrepareDistance() (the before-object distance) completely untouched.
+  const auto prepare_distance_before = helper->getNominalPrepareDistance();
+  parameters->min_return_prepare_distance = parameters->min_prepare_distance + 5.0;
+  parameters->max_return_prepare_time = parameters->max_prepare_time + 5.0;
+  EXPECT_DOUBLE_EQ(helper->getNominalPrepareDistance(), prepare_distance_before);
+  EXPECT_GT(helper->getNominalReturnPrepareDistance(), prepare_distance_before);
+}
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance

@@ -120,6 +120,13 @@ public:
     return std::max(getAvoidanceEgoSpeed() * p->max_prepare_time, p->min_prepare_distance);
   }
 
+  double getNominalReturnPrepareDistance() const
+  {
+    const auto & p = parameters_;
+    return std::max(
+      getAvoidanceEgoSpeed() * p->max_return_prepare_time, p->min_return_prepare_distance);
+  }
+
   double getNominalAvoidanceDistance(const double shift_length) const
   {
     const auto & p = parameters_;

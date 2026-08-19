@@ -181,6 +181,10 @@ void StaticObstacleAvoidanceModuleManager::updateModuleParams(
     update_param<double>(parameters, ns + "min_prepare_time", p->min_prepare_time);
     update_param<double>(parameters, ns + "max_prepare_time", p->max_prepare_time);
     update_param<double>(parameters, ns + "min_prepare_distance", p->min_prepare_distance);
+    update_param<double>(
+      parameters, ns + "max_return_prepare_time", p->max_return_prepare_time);
+    update_param<double>(
+      parameters, ns + "min_return_prepare_distance", p->min_return_prepare_distance);
     update_param<double>(parameters, ns + "min_slow_down_speed", p->min_slow_down_speed);
     update_param<double>(parameters, ns + "buf_slow_down_speed", p->buf_slow_down_speed);
     update_param<bool>(parameters, ns + "consider_front_overhang", p->consider_front_overhang);

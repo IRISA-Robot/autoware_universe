@@ -299,6 +299,10 @@ AvoidanceParameters getParameter(rclcpp::Node * node)
     p.min_prepare_time = get_or_declare_parameter<double>(*node, ns + "min_prepare_time");
     p.max_prepare_time = get_or_declare_parameter<double>(*node, ns + "max_prepare_time");
     p.min_prepare_distance = get_or_declare_parameter<double>(*node, ns + "min_prepare_distance");
+    p.max_return_prepare_time =
+      get_or_declare_parameter<double>(*node, ns + "max_return_prepare_time");
+    p.min_return_prepare_distance =
+      get_or_declare_parameter<double>(*node, ns + "min_return_prepare_distance");
     p.min_slow_down_speed = get_or_declare_parameter<double>(*node, ns + "min_slow_down_speed");
     p.buf_slow_down_speed = get_or_declare_parameter<double>(*node, ns + "buf_slow_down_speed");
     p.nominal_avoidance_speed =

@@ -254,6 +254,12 @@ struct AvoidanceParameters
   // Even if the vehicle speed is zero, avoidance will start after a distance of this much.
   double min_prepare_distance{0.0};
 
+  // like min_prepare_distance/max_prepare_time, but for how long to hold the shift PAST an
+  // object before starting to return to center. Deliberately decoupled from
+  // min_prepare_distance/max_prepare_time so one can be tuned without affecting the other.
+  double max_return_prepare_time{0.0};
+  double min_return_prepare_distance{0.0};
+
   // minimum slow down speed
   double min_slow_down_speed{0.0};
 

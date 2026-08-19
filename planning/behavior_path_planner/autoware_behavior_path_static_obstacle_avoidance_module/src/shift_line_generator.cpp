@@ -1189,7 +1189,7 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
 
   const auto & arclength_from_ego = data.arclength_from_ego;
 
-  const auto nominal_prepare_distance = helper_->getNominalPrepareDistance();
+  const auto nominal_prepare_distance = helper_->getNominalReturnPrepareDistance();
   const auto nominal_avoid_distance = helper_->getMaxReturnDistance(last_sl.end_shift_length);
 
   if (arclength_from_ego.empty()) {
@@ -1231,13 +1231,15 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
     std::max(nominal_prepare_distance - last_sl_distance, 0.0);
 
   double prepare_distance_scaled = std::max(
-    helper_->getNominalPrepareDistance(), std::max(nominal_prepare_distance, last_sl_distance));
+    helper_->getNominalReturnPrepareDistance(),
+    std::max(nominal_prepare_distance, last_sl_distance));
   double avoid_distance_scaled = nominal_avoid_distance;
   if (remaining_distance < prepare_distance_scaled + avoid_distance_scaled) {
     const auto scale = (remaining_distance - last_sl_distance) /
                        std::max(nominal_avoid_distance + variable_prepare_distance, 0.1);
     prepare_distance_scaled = std::max(
-      helper_->getNominalPrepareDistance(), last_sl_distance + scale * nominal_prepare_distance);
+      helper_->getNominalReturnPrepareDistance(),
+      last_sl_distance + scale * nominal_prepare_distance);
     avoid_distance_scaled *= scale;
   }
 

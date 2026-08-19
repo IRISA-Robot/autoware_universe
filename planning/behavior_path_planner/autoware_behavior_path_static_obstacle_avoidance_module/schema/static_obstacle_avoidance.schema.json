@@ -1232,6 +1232,16 @@
                   "description": "Minimum prepare distance.",
                   "default": 1.0
                 },
+                "max_return_prepare_time": {
+                  "type": "number",
+                  "description": "Like max_prepare_time, but for how long to hold the shift past an object before starting to return to lane center. Decoupled from max_prepare_time so it can be tuned independently.",
+                  "default": 2.0
+                },
+                "min_return_prepare_distance": {
+                  "type": "number",
+                  "description": "Like min_prepare_distance, but for how long to hold the shift past an object before starting to return to lane center. Decoupled from min_prepare_distance so it can be tuned independently.",
+                  "default": 1.0
+                },
                 "min_slow_down_speed": {
                   "type": "number",
                   "description": "Minimum slow speed for avoidance prepare section.",
@@ -1262,6 +1272,8 @@
                 "min_prepare_time",
                 "max_prepare_time",
                 "min_prepare_distance",
+                "max_return_prepare_time",
+                "min_return_prepare_distance",
                 "min_slow_down_speed",
                 "buf_slow_down_speed",
                 "nominal_avoidance_speed",
