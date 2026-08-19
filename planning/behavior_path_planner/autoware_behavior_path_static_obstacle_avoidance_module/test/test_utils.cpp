@@ -459,6 +459,72 @@ TEST(TestUtils, getAvoidMargin)
   }
 }
 
+TEST(TestUtils, isAvoidanceOpportunityRunningOut)
+{
+  // Keep front-constant-distance computation independent of PlannerData vehicle geometry, which
+  // `get_planner_data()` does not populate (only vehicle_width is set there).
+  auto parameters = get_parameters();
+  parameters->consider_front_overhang = false;
+
+  const auto planner_data = get_planner_data();
+
+  auto helper = std::make_shared<helper::static_obstacle_avoidance::AvoidanceHelper>(parameters);
+  helper->setData(planner_data);
+
+  const auto make_unknown_object = [](const double longitudinal) {
+    ObjectData object_data;
+    object_data.object.classification.emplace_back(
+      autoware_perception_msgs::build<ObjectClassification>()
+        .label(ObjectClassification::UNKNOWN)
+        .probability(1.0));
+    object_data.direction = Direction::RIGHT;
+    object_data.overhang_points.emplace_back(0.5, Point{});
+    object_data.longitudinal = longitudinal;
+    return object_data;
+  };
+
+  const std::optional<double> avoid_margin = 0.5;
+
+  // determine the distance required to still attempt a shift with the above setup, so the test
+  // doesn't hardcode brittle numbers derived from the jerk-based distance formula.
+  const auto probe_object = make_unknown_object(0.0);
+  const auto is_object_on_right = utils::static_obstacle_avoidance::isOnRight(probe_object);
+  const auto desire_shift_length =
+    helper->getShiftLength(probe_object, is_object_on_right, avoid_margin.value());
+  const auto required_distance = helper->getNominalPrepareDistance() +
+                                  helper->getFrontConstantDistance(probe_object) +
+                                  helper->getMinAvoidanceDistance(desire_shift_length);
+  ASSERT_GT(required_distance, 0.0);
+
+  // Case 1: fresh UNKNOWN object, but already close enough that waiting out the rest of the
+  // instability window would consume the remaining avoidance opportunity -- must NOT be
+  // excluded (classification-stability safeguard is short-circuited).
+  {
+    auto object_data = make_unknown_object(required_distance - 0.5);
+    EXPECT_TRUE(
+      utils::static_obstacle_avoidance::isAvoidanceOpportunityRunningOut(
+        object_data, avoid_margin, helper));
+  }
+
+  // Case 2 (regression): fresh UNKNOWN object with ample remaining distance -- the "wait and
+  // see" safety behavior during the instability window must be preserved.
+  {
+    auto object_data = make_unknown_object(required_distance + 5.0);
+    EXPECT_FALSE(
+      utils::static_obstacle_avoidance::isAvoidanceOpportunityRunningOut(
+        object_data, avoid_margin, helper));
+  }
+
+  // Case 3: even at zero remaining distance, if the object isn't geometrically avoidable at all
+  // (no avoid margin), don't short-circuit the safeguard -- there's nothing to gain.
+  {
+    auto object_data = make_unknown_object(0.0);
+    EXPECT_FALSE(
+      utils::static_obstacle_avoidance::isAvoidanceOpportunityRunningOut(
+        object_data, std::nullopt, helper));
+  }
+}
+
 TEST(TestUtils, isSafetyCheckTargetObjectType)
 {
   const auto parameters = get_parameters();

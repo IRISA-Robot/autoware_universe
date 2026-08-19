@@ -25,6 +25,11 @@
 #include <utility>
 #include <vector>
 
+namespace autoware::behavior_path_planner::helper::static_obstacle_avoidance
+{
+class AvoidanceHelper;
+}  // namespace autoware::behavior_path_planner::helper::static_obstacle_avoidance
+
 namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
 {
 
@@ -237,10 +242,27 @@ void compensateLostTargetObjects(
   AvoidancePlanningData & data, const ObjectDataArray & stored_objects,
   const std::shared_ptr<const PlannerData> & planner_data);
 
+/**
+ * @brief check whether the remaining geometric room to attempt an avoidance shift has already
+ * shrunk to (or below) the minimum distance required to act, for an UNKNOWN-classified object
+ * whose classification is still within the "unstable" observation window.
+ * @param object object data. `object.longitudinal` must already be filled in.
+ * @param avoid_margin lateral avoidance margin for the object, if avoidable at all.
+ * @param helper avoidance helper, used for the prepare/front-constant/min-avoidance distance
+ * calculation.
+ * @return true if there is no longer a safety benefit in waiting out the rest of the
+ * classification-instability window (i.e. the classification-stability safeguard can be
+ * short-circuited without giving up genuine avoidance opportunity).
+ */
+bool isAvoidanceOpportunityRunningOut(
+  const ObjectData & object, const std::optional<double> & avoid_margin,
+  const std::shared_ptr<helper::static_obstacle_avoidance::AvoidanceHelper> & helper);
+
 void filterTargetObjects(
   ObjectDataArray & objects, AvoidancePlanningData & data, const double forward_detection_range,
   const std::shared_ptr<const PlannerData> & planner_data,
-  const std::shared_ptr<AvoidanceParameters> & parameters);
+  const std::shared_ptr<AvoidanceParameters> & parameters,
+  const std::shared_ptr<helper::static_obstacle_avoidance::AvoidanceHelper> & helper);
 
 void updateRoadShoulderDistance(
   AvoidancePlanningData & data, const std::shared_ptr<const PlannerData> & planner_data,

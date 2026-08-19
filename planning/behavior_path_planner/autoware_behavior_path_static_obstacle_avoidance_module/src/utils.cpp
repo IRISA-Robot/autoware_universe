@@ -19,6 +19,7 @@
 #include "autoware/behavior_path_planner_common/utils/path_utils.hpp"
 #include "autoware/behavior_path_planner_common/utils/traffic_light_utils.hpp"
 #include "autoware/behavior_path_static_obstacle_avoidance_module/data_structs.hpp"
+#include "autoware/behavior_path_static_obstacle_avoidance_module/helper.hpp"
 #include "autoware/behavior_path_static_obstacle_avoidance_module/utils.hpp"
 
 #include <Eigen/Dense>
@@ -2209,10 +2210,40 @@ void updateRoadShoulderDistance(
   }
 }
 
+bool isAvoidanceOpportunityRunningOut(
+  const ObjectData & object, const std::optional<double> & avoid_margin,
+  const std::shared_ptr<helper::static_obstacle_avoidance::AvoidanceHelper> & helper)
+{
+  // Even while an UNKNOWN object's classification is still considered "unstable" (i.e. we
+  // haven't yet watched it for `unstable_classification_time`), don't blindly exclude it from
+  // avoidance targeting if ego is already close enough that waiting out the rest of the
+  // instability window would consume the geometric room needed to attempt a shift. Continuing
+  // to distrust the classification in that situation buys no extra safety -- it only guarantees
+  // a stop-only outcome instead of a still-available avoidance maneuver.
+  //
+  // This mirrors the "is there still time to act" distance computation used by
+  // AvoidanceHelper::isReady() for the wait-and-see policy: prepare + front-constant +
+  // min-avoidance distance, compared against the object's longitudinal distance.
+  if (!avoid_margin.has_value()) {
+    // no avoid margin means it isn't geometrically avoidable regardless of urgency; don't
+    // short-circuit the safeguard in that case.
+    return false;
+  }
+
+  const auto is_object_on_right = utils::static_obstacle_avoidance::isOnRight(object);
+  const auto desire_shift_length =
+    helper->getShiftLength(object, is_object_on_right, avoid_margin.value());
+  const auto required_distance = helper->getNominalPrepareDistance() +
+                                  helper->getFrontConstantDistance(object) +
+                                  helper->getMinAvoidanceDistance(desire_shift_length);
+  return object.longitudinal <= required_distance;
+}
+
 void filterTargetObjects(
   ObjectDataArray & objects, AvoidancePlanningData & data, const double forward_detection_range,
   const std::shared_ptr<const PlannerData> & planner_data,
-  const std::shared_ptr<AvoidanceParameters> & parameters)
+  const std::shared_ptr<AvoidanceParameters> & parameters,
+  const std::shared_ptr<helper::static_obstacle_avoidance::AvoidanceHelper> & helper)
 {
   if (data.current_lanelets.empty()) {
     return;
@@ -2250,12 +2281,16 @@ void filterTargetObjects(
     o.to_road_shoulder_distance = filtering_utils::getRoadShoulderDistance(o, data, planner_data);
 
     if (filtering_utils::isUnknownTypeObject(o)) {
-      if (o.is_classification_unstable) {
+      const auto avoid_margin = filtering_utils::getAvoidMargin(o, planner_data, parameters);
+
+      if (
+        o.is_classification_unstable &&
+        !isAvoidanceOpportunityRunningOut(o, avoid_margin, helper)) {
         o.info = ObjectInfo::UNSTABLE_OBJECT;
         data.other_objects.push_back(o);
         continue;
       }
-      o.avoid_margin = filtering_utils::getAvoidMargin(o, planner_data, parameters);
+      o.avoid_margin = avoid_margin;
     } else if (filtering_utils::isVehicleTypeObject(o)) {
       // TARGET: CAR, TRUCK, BUS, TRAILER, MOTORCYCLE
       o.behavior = filtering_utils::getObjectBehavior(o, parameters);

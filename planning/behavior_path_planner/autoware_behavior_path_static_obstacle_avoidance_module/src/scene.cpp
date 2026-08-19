@@ -409,7 +409,7 @@ void StaticObstacleAvoidanceModule::fillAvoidanceTargetObjects(
   }
 
   // Filter out the objects to determine the ones to be avoided.
-  filterTargetObjects(objects, data, forward_detection_range, planner_data_, parameters_);
+  filterTargetObjects(objects, data, forward_detection_range, planner_data_, parameters_, helper_);
   updateRoadShoulderDistance(data, planner_data_, parameters_);
 
   // debug
