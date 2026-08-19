@@ -113,6 +113,18 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
   // Deteksi valid (RED/GREEN/BLANK) mereset counter — robot menunggu GREEN selamanya selama lampu RED.
   param_.light_detect_timeout_sec = declare_parameter<double>("light_detect_timeout_sec", 10.0);
 
+  // --- Safety-timeout watchdogs (defensive, additive) ---
+  // CROSSING safety timeout: forces DONE if egoPastCrossingExit() never fires
+  // (e.g. is_driving_forward_ flips near/inside the crossing lanelet).
+  param_.crossing_timeout_sec = declare_parameter<double>("crossing_timeout_sec", 60.0);
+  // Engage-wait absolute timeout: abandon reroute attempt if autonomous_available
+  // never becomes true within this many seconds of entering the engage-retry substep.
+  param_.engage_timeout_sec = declare_parameter<double>("engage_timeout_sec", 30.0);
+  // Blanket episode-duration watchdog: force resetEpisode()+IDLE if stuck non-IDLE
+  // for longer than this, regardless of state.
+  param_.max_episode_duration_sec =
+    declare_parameter<double>("max_episode_duration_sec", 120.0);
+
   // ------------------------------------------------------------------
   // Subscribers
   // ------------------------------------------------------------------
@@ -338,6 +350,31 @@ void RoadCrossingFsmNode::onTimer()
   const rclcpp::Time now = this->now();
 
   // ---------------------------------------------------------------------------
+  // Blanket episode-duration watchdog (defensive watchdog #3, catch-all).
+  //
+  // Runs BEFORE the state switch below, on every tick, regardless of which state
+  // the FSM is in. This is intentionally coarse and state-agnostic: it exists to
+  // catch any stuck-state bug not covered by the more targeted CROSSING-timeout
+  // (watchdog #1) or engage-wait-timeout (watchdog #2) fixes below. Placed here
+  // (after the map/route/pose guard above, before the switch) so it can force a
+  // reset+IDLE and short-circuit the rest of this tick without letting the switch
+  // run stale/inconsistent state afterward.
+  // ---------------------------------------------------------------------------
+  if (state_ != FsmState::IDLE && episode_start_time_) {
+    const double episode_elapsed = (now - *episode_start_time_).seconds();
+    if (episode_elapsed > param_.max_episode_duration_sec) {
+      RCLCPP_WARN(
+        get_logger(),
+        "onTimer WATCHDOG: episode stuck in state=%d for %.1f s (max=%.1f s) — "
+        "forcing resetEpisode()+IDLE (blanket safety watchdog, catch-all)",
+        static_cast<int>(state_), episode_elapsed, param_.max_episode_duration_sec);
+      resetEpisode();
+      transitionTo(FsmState::IDLE);
+      return;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Rotary aimer control block — dua fase:
   //
   // APPROACH (baru):
@@ -507,6 +544,10 @@ void RoadCrossingFsmNode::onTimer()
     case FsmState::IDLE: {
       if (checkArmCondition()) {
         transitionTo(FsmState::ARMED_CROSSWALK);
+        // Arm the blanket episode-duration watchdog (defensive watchdog #3) for this
+        // new episode — checkArmCondition() just (re)assigned active_pre_id_/
+        // active_crossing_id_, so this is the natural "episode start" point.
+        episode_start_time_ = now;
         // NOTE: crosswalk_detector is now enabled lazily by DISTANCE (crosswalk_enable_dist_m)
         // in the distance-gate block above, not here at arming time.
         // By the time checkArmCondition() succeeds (episode active), the distance-gate
@@ -837,6 +878,27 @@ void RoadCrossingFsmNode::onTimer()
               adapi_op_mode_);
             break;
           }
+
+          // Engage-wait absolute timeout (defensive watchdog #2). Set ONCE on the first
+          // tick this substep is actually processed (route acked) — tracks TOTAL elapsed
+          // time waiting for AUTONOMOUS here, not time-since-last-retry (that's
+          // last_engage_attempt_ / engage_retry_sec, a retry CADENCE, unaffected by this).
+          if (!engage_wait_start_) {
+            engage_wait_start_ = now;
+          }
+          if ((now - *engage_wait_start_).seconds() > param_.engage_timeout_sec) {
+            RCLCPP_WARN(
+              get_logger(),
+              "REROUTING_TO_ALT step2 WATCHDOG: autonomous_available never became true "
+              "after %.1f s (timeout=%.1f s, mode=%u, autonomous_available=%d) — "
+              "abandoning reroute attempt, resetting IDLE",
+              (now - *engage_wait_start_).seconds(), param_.engage_timeout_sec,
+              adapi_op_mode_, adapi_autonomous_available_);
+            resetEpisode();
+            transitionTo(FsmState::IDLE);
+            break;
+          }
+
           // Route ack confirmed — now inspect mode on the NEW route.
           // OperationModeState constants: UNKNOWN=0, STOP=1, AUTONOMOUS=2, LOCAL=3, REMOTE=4.
           constexpr uint8_t kAutonomousMode = 2u;
@@ -1002,6 +1064,27 @@ void RoadCrossingFsmNode::onTimer()
               adapi_op_mode_);
             break;
           }
+
+          // Engage-wait absolute timeout (defensive watchdog #2). Set ONCE on the first
+          // tick this substep is actually processed (route acked) — tracks TOTAL elapsed
+          // time waiting for AUTONOMOUS here, not time-since-last-retry (that's
+          // last_engage_attempt_ / engage_retry_sec, a retry CADENCE, unaffected by this).
+          if (!engage_wait_start_) {
+            engage_wait_start_ = now;
+          }
+          if ((now - *engage_wait_start_).seconds() > param_.engage_timeout_sec) {
+            RCLCPP_WARN(
+              get_logger(),
+              "REROUTING_TO_GOAL step2 WATCHDOG: autonomous_available never became true "
+              "after %.1f s (timeout=%.1f s, mode=%u, autonomous_available=%d) — "
+              "abandoning reroute attempt, resetting IDLE",
+              (now - *engage_wait_start_).seconds(), param_.engage_timeout_sec,
+              adapi_op_mode_, adapi_autonomous_available_);
+            resetEpisode();
+            transitionTo(FsmState::IDLE);
+            break;
+          }
+
           // Original route ack confirmed — now inspect mode on the restored route.
           // OperationModeState constants: UNKNOWN=0, STOP=1, AUTONOMOUS=2, LOCAL=3, REMOTE=4.
           constexpr uint8_t kAutonomousMode = 2u;
@@ -1132,6 +1215,7 @@ void RoadCrossingFsmNode::onTimer()
         light_timeout_start_.reset();
         no_detect_since_.reset();
         road_cross_is_green_ = false;   // bypass: trust-light shortcut must NOT fire
+        crossing_timeout_start_ = now;  // arm CROSSING safety-timeout watchdog
         transitionTo(FsmState::CROSSING);
         // Robot mulai menyeberang — re-zero aimer (direction-aware; see
         // reZeroAimerDirectionAware()).
@@ -1180,6 +1264,7 @@ void RoadCrossingFsmNode::onTimer()
             "WAIT_GREEN: lampu HIJAU (state=%u) — GO_GREEN", light_state);
           light_timeout_start_.reset();
           road_cross_is_green_ = true;   // persist GO_GREEN through CROSSING state
+          crossing_timeout_start_ = now;  // arm CROSSING safety-timeout watchdog
           transitionTo(FsmState::CROSSING);
           // Robot mulai menyeberang (lampu HIJAU) — re-zero aimer (direction-aware).
           reZeroAimerDirectionAware();
@@ -1218,6 +1303,7 @@ void RoadCrossingFsmNode::onTimer()
           light_timeout_start_.reset();
           no_detect_since_.reset();
           road_cross_is_green_ = false;   // timeout fallback: trust-light shortcut must NOT fire
+          crossing_timeout_start_ = now;  // arm CROSSING safety-timeout watchdog
           transitionTo(FsmState::CROSSING);
           // Robot mulai menyeberang — re-zero aimer (direction-aware).
           reZeroAimerDirectionAware();
@@ -1247,7 +1333,30 @@ void RoadCrossingFsmNode::onTimer()
       publishGate(road_gate_cmd);
 
       // Detect ego has exited the crossing.
-      if (egoPastCrossingExit()) {
+      //
+      // Safety-timeout watchdog #1: egoPastCrossingExit() is a centerline-projection
+      // check that can permanently fail to register "past exit" if is_driving_forward_
+      // flips near/inside the crossing lanelet (bidirectional-driving reverse scenario).
+      // checkArmCondition() — the only place active_pre_id_/active_crossing_id_ get
+      // (re)assigned — only runs from IDLE, so a wedged CROSSING never self-corrects.
+      // If crossing_timeout_start_ (set at the WAIT_GREEN -> CROSSING transition) has
+      // been running longer than crossing_timeout_sec, force the SAME cleanup as the
+      // normal exit path below, but flag it loudly as a safety-timeout-forced exit.
+      const bool timed_out =
+        crossing_timeout_start_ &&
+        (now - *crossing_timeout_start_).seconds() > param_.crossing_timeout_sec;
+
+      if (egoPastCrossingExit() || timed_out) {
+        if (timed_out) {
+          RCLCPP_WARN(
+            get_logger(),
+            "CROSSING WATCHDOG: safety-timeout-forced exit (NOT a normal geometric exit) — "
+            "egoPastCrossingExit() never fired after %.1f s (timeout=%.1f s), "
+            "pre=%ld crossing=%ld — forcing DONE",
+            (now - *crossing_timeout_start_).seconds(), param_.crossing_timeout_sec,
+            active_pre_id_ ? static_cast<int64_t>(*active_pre_id_) : -1L,
+            active_crossing_id_ ? static_cast<int64_t>(*active_crossing_id_) : -1L);
+        }
         transitionTo(FsmState::DONE);
         publishGatePre(autoware_road_crossing_msgs::msg::RoadCrossingGate::GO);
         publishGate(road_gate_cmd);
@@ -1979,6 +2088,10 @@ void RoadCrossingFsmNode::resetRerouteSubstep()
   reroute_engage_called_ = false;
   reroute_alt_move_start_.reset();
   last_engage_attempt_.reset();  // allow immediate first attempt in next phase
+  // Engage-wait absolute-timeout timer (defensive watchdog #2) — reset per phase so
+  // each new REROUTING_TO_ALT/REROUTING_TO_GOAL phase gets a fresh engage_timeout_sec
+  // budget, tracked from that phase's own first step-2 tick.
+  engage_wait_start_.reset();
   // Must be reset to false so step-2 waits for the NEW route's ack before
   // checking adapi_op_mode_.  A phase-A ack must NOT carry into phase B.
   reroute_route_acked_ = false;
@@ -2054,6 +2167,8 @@ void RoadCrossingFsmNode::resetEpisode()
   active_crossing_id_.reset();
   pre_wait_timer_start_.reset();
   light_timeout_start_.reset();
+  crossing_timeout_start_.reset();  // reset CROSSING safety-timeout watchdog (#1)
+  episode_start_time_.reset();      // reset blanket episode-duration watchdog (#3)
   no_detect_since_.reset();  // reset no-detect counter saat episode baru/abort
   last_crosswalk_det_.reset();
   last_ped_light_.reset();

@@ -126,3 +126,25 @@
     crossing_arrive_dist_m:  1.5        # [m] ego dianggap "sudah di crossing" jika
                                         #     distanceToCrossingEntry() berada di [0, crossing_arrive_dist_m].
                                         #     Gate WAIT_GREEN: tahan sampai at_crossing = true.
+
+    # -------------------------------------------------------------------
+    # Safety-timeout watchdogs (defensive, additive — do not gate normal-path exits)
+    # -------------------------------------------------------------------
+    crossing_timeout_sec:        60.0   # [s] CROSSING (state 6) safety timeout. Its only normal
+                                        #     exit is egoPastCrossingExit() (centerline-projection
+                                        #     check), which can permanently fail to fire if
+                                        #     is_driving_forward_ flips near/inside the crossing
+                                        #     lanelet (bidirectional-driving reverse scenario).
+                                        #     If exceeded, forces the same cleanup as the normal
+                                        #     exit (DONE + GO gates + disable detectors), logged
+                                        #     as a distinct safety-timeout-forced exit.
+    engage_timeout_sec:          30.0   # [s] REROUTING_TO_ALT/REROUTING_TO_GOAL step2 absolute
+                                        #     timeout waiting for autonomous_available while
+                                        #     retrying change_to_autonomous at engage_retry_sec
+                                        #     cadence. If exceeded, abandons the reroute attempt
+                                        #     (resetEpisode + IDLE) instead of retrying forever.
+    max_episode_duration_sec:   120.0   # [s] Blanket episode-duration watchdog (catch-all). If
+                                        #     the FSM is not IDLE for longer than this, forces
+                                        #     resetEpisode()+IDLE regardless of which state it is
+                                        #     stuck in. Defense-in-depth for any stuck-state bug
+                                        #     not covered by the two more targeted timeouts above.

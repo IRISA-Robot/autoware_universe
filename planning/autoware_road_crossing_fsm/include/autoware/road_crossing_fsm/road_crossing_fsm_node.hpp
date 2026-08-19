@@ -157,6 +157,24 @@ private:
     // FSM menyerah dan GO (fallback).  Deteksi RED/GREEN/BLANK mereset counter ini
     // sehingga selama lampu merah robot menunggu GREEN selamanya (benar).
     double light_detect_timeout_sec{10.0};
+
+    // --- Safety-timeout watchdogs (defensive, additive — do not gate normal-path exits) ---
+    // CROSSING (state 6) safety timeout: its only normal exit is egoPastCrossingExit()
+    // (a centerline-projection check), which can permanently fail to register "past exit"
+    // if is_driving_forward_ flips near/inside the crossing lanelet (bidirectional-driving
+    // reverse scenario). If ego is stuck in CROSSING longer than this, force the SAME
+    // cleanup as the normal exit path (DONE + GO gates + disable detectors), logged loudly
+    // as a safety-timeout-forced exit, not a normal geometric exit.
+    double crossing_timeout_sec{60.0};
+    // Engage-wait absolute timeout for REROUTING_TO_ALT/REROUTING_TO_GOAL step2: total time
+    // allowed waiting for autonomous_available while retrying change_to_autonomous at
+    // engage_retry_sec cadence. If exceeded without ever becoming autonomous, abandon the
+    // reroute attempt (resetEpisode + IDLE) instead of retrying forever.
+    double engage_timeout_sec{30.0};
+    // Blanket episode-duration watchdog (catch-all): if the FSM is not IDLE for longer
+    // than this, force resetEpisode()+IDLE regardless of which state it is stuck in.
+    // Defense-in-depth for any stuck-state bug not covered by the two timeouts above.
+    double max_episode_duration_sec{120.0};
   } param_;
 
   // ------------------------------------------------------------------
@@ -261,6 +279,16 @@ private:
   std::optional<lanelet::Id> active_pre_id_;
   std::optional<lanelet::Id> active_crossing_id_;
 
+  // Blanket episode-duration watchdog (defensive watchdog #3, catch-all).
+  // Set once at the IDLE -> ARMED_CROSSWALK transition (i.e. right when
+  // checkArmCondition() first succeeds and active_pre_id_/active_crossing_id_ get
+  // assigned). Checked at the very top of onTimer(), before the state switch: if
+  // state_ != IDLE and the elapsed time exceeds max_episode_duration_sec, force
+  // resetEpisode()+IDLE regardless of which state the FSM is stuck in. Defense-in-depth
+  // for any stuck-state bug the two more targeted timeouts above don't cover.
+  // Reset in resetEpisode().
+  std::optional<rclcpp::Time> episode_start_time_;
+
   // Suppression: the road_crossing lanelet ID of the episode that just completed (DONE).
   // checkArmCondition() will not re-arm for this ID until ego leaves the vicinity
   // (i.e. no crossing at all is found within arm_hops_max, or a DIFFERENT crossing
@@ -276,6 +304,13 @@ private:
 
   // WAIT_GREEN timeout timer
   std::optional<rclcpp::Time> light_timeout_start_;
+
+  // CROSSING safety-timeout timer (defensive watchdog #1).
+  // Set once at each WAIT_GREEN -> CROSSING transition (green / bypass / timeout-fallback).
+  // If ego is still in CROSSING after crossing_timeout_sec, the CROSSING handler forces
+  // the same cleanup as a normal exit, logging a distinct safety-timeout WARN.
+  // Reset in resetEpisode().
+  std::optional<rclcpp::Time> crossing_timeout_start_;
 
   // True when the CROSSING episode was initiated by a GREEN pedestrian light.
   // Set at the WAIT_GREEN → CROSSING (green) transition.
@@ -347,6 +382,14 @@ private:
 
   // Throttle timestamp for step-2 engage retries (reset each time a new reroute phase starts).
   std::optional<rclcpp::Time> last_engage_attempt_;
+
+  // Engage-wait absolute-timeout timer (defensive watchdog #2).
+  // Set ONCE when first entering the step-2 engage-retry substep of REROUTING_TO_ALT/
+  // REROUTING_TO_GOAL (not reset on every retry attempt — tracks TOTAL elapsed time in
+  // this substep, not time-since-last-retry). If autonomous_available never becomes true
+  // within engage_timeout_sec, the reroute attempt is abandoned (resetEpisode + IDLE).
+  // Reset in resetRerouteSubstep() (start of each new phase) and resetEpisode().
+  std::optional<rclcpp::Time> engage_wait_start_;
 
   // Gate flag: true once onRoute() confirms the route published by the CURRENT reroute
   // phase has been acked by the mission planner.  Prevents step-2 from reading a stale
