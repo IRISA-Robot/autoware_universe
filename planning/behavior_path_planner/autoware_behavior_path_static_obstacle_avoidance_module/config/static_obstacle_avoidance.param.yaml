@@ -268,6 +268,17 @@
             enable: true                                # [-]
             buffer: 3.0                                 # [m]
 
+        # If true, bypass every purely longitudinal-distance/timing-based rejection or
+        # cancellation gate (wait-and-see start delay, "not enough prepare/avoidance distance"
+        # rejection, cancel maneuver triggered solely by shrinking longitudinal room, etc.) and
+        # always attempt to avoid any object for which there is still a valid (non-nullopt)
+        # lateral avoid_margin -- i.e. if there is physically enough LATERAL room, always try to
+        # shift, no matter how little longitudinal distance/time would nominally be required for a
+        # comfortable, gradual maneuver. This can produce sharper/more abrupt shifts when triggered
+        # very close to an object. The lateral room-availability check is NEVER bypassed by this
+        # flag, regardless of its value.
+        always_avoid_if_geometrically_possible: false   # [-]
+
       # For cancel maneuver
       cancel:
         enable: true                                    # [-]

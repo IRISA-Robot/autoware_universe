@@ -21,6 +21,8 @@
 #include "autoware/behavior_path_static_obstacle_avoidance_module/type_alias.hpp"
 
 #include <memory>
+#include <optional>
+#include <utility>
 
 namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
 {
@@ -66,6 +68,29 @@ public:
   AvoidLineArray generate(const AvoidancePlanningData & data, DebugData & debug) const;
 
   AvoidLineArray getRawRegisteredShiftLine() const { return raw_registered_; }
+
+  /**
+   * @brief Calculate the feasible shift length/avoidance-distance pair for a single object,
+   * applying the behavior policy (lateral margin relaxation, deceleration policy, jerk-limited
+   * shift relaxation, etc).
+   *
+   * If `object.is_avoidance_committed` is true (this object was already found avoidable in a
+   * previous cycle and still has a valid lateral avoid_margin), or
+   * `parameters.always_avoid_if_geometrically_possible` is true, every purely
+   * longitudinal-distance/timing-based rejection gate is bypassed: the function will always try
+   * to return a jerk-feasible (possibly sharp) shift profile instead of std::nullopt, as long as
+   * the object's lateral avoid_margin is available and the hard lateral-margin geometric
+   * feasibility check (the actual physical safety boundary -- is there room at all) still passes.
+   * That geometric feasibility check, and the object's avoid_margin having a value in the first
+   * place, are NEVER bypassed by either flag.
+   *
+   * @param object object data. `object.info` may be mutated with the rejection reason.
+   * @param desire_shift_length desired (full lateral-margin) shift length for this object.
+   * @param current_ego_shift ego's current lateral shift (see AvoidanceHelper::getEgoShift()).
+   * @return {shift_length, avoidance_distance} if feasible, std::nullopt otherwise.
+   */
+  std::optional<std::pair<double, double>> computeFeasibleShiftProfile(
+    ObjectData & object, const double desire_shift_length, const double current_ego_shift) const;
 
 private:
   /**

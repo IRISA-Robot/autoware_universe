@@ -2024,6 +2024,33 @@ void fillObjectAvoidableByDesiredShiftLength(
     same_id_obj->is_avoidable_by_desired_shift_length;
 }
 
+void fillObjectAvoidanceCommitted(
+  ObjectData & object_data, const ObjectDataArray & previous_target_objects)
+{
+  // The lateral room-availability check is the one physical safety boundary that must never be
+  // bypassed. If there is no valid avoid_margin this cycle, the object cannot be "committed" no
+  // matter what happened in previous cycles.
+  if (!object_data.avoid_margin.has_value()) {
+    object_data.is_avoidance_committed = false;
+    return;
+  }
+
+  const auto id = object_data.object.object_id;
+  const auto same_id_obj = std::find_if(
+    previous_target_objects.begin(), previous_target_objects.end(),
+    [&id](const auto & o) { return o.object.object_id == id; });
+
+  if (same_id_obj == previous_target_objects.end()) {
+    object_data.is_avoidance_committed = false;
+    return;
+  }
+
+  // sticky: once committed (or previously found avoidable), stay committed as long as lateral
+  // room is still available.
+  object_data.is_avoidance_committed =
+    same_id_obj->is_avoidance_committed || same_id_obj->is_avoidable;
+}
+
 void compensateLostTargetObjects(
   AvoidancePlanningData & data, const ObjectDataArray & stored_objects,
   const std::shared_ptr<const PlannerData> & planner_data)

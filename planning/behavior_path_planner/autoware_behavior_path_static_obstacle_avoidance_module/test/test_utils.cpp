@@ -15,6 +15,7 @@
 #include "../src/utils.cpp"  // NOLINT
 #include "autoware/behavior_path_static_obstacle_avoidance_module/data_structs.hpp"
 #include "autoware/behavior_path_static_obstacle_avoidance_module/helper.hpp"
+#include "autoware/behavior_path_static_obstacle_avoidance_module/shift_line_generator.hpp"
 #include "autoware/behavior_path_static_obstacle_avoidance_module/type_alias.hpp"
 #include "autoware/behavior_path_static_obstacle_avoidance_module/utils.hpp"
 #include "autoware_test_utils/autoware_test_utils.hpp"
@@ -1938,5 +1939,303 @@ TEST(TestUtils, getNominalReturnPrepareDistanceIsDecoupledFromPrepareDistance)
   parameters->max_return_prepare_time = parameters->max_prepare_time + 5.0;
   EXPECT_DOUBLE_EQ(helper->getNominalPrepareDistance(), prepare_distance_before);
   EXPECT_GT(helper->getNominalReturnPrepareDistance(), prepare_distance_before);
+}
+
+namespace
+{
+// Helper shared by the "always avoid" / "mid-approach reversion" tests below: builds a minimal,
+// self-consistent AvoidanceHelper + ShiftLineGenerator pair, and a TRUCK-classified ObjectData
+// positioned directly ahead of ego, on the right, with no pre-existing approved shift.
+struct AlwaysAvoidTestFixture
+{
+  std::shared_ptr<AvoidanceParameters> parameters;
+  std::shared_ptr<PlannerData> planner_data;
+  std::shared_ptr<helper::static_obstacle_avoidance::AvoidanceHelper> helper;
+  ShiftLineGenerator generator;
+
+  explicit AlwaysAvoidTestFixture(const double vehicle_width)
+  : parameters(get_parameters()),
+    planner_data(get_planner_data()),
+    helper(std::make_shared<helper::static_obstacle_avoidance::AvoidanceHelper>(parameters)),
+    generator(parameters)
+  {
+    // Keep distance computations independent of vehicle geometry not populated by
+    // get_planner_data().
+    parameters->consider_front_overhang = false;
+    parameters->consider_rear_overhang = false;
+    // Force the "reliable" deceleration policy so the *unbypassed* path takes the hard-refusal
+    // branch instead of silently relaxing (best_effort would relax regardless of the new flag,
+    // which would not isolate the behavior under test).
+    parameters->policy_deceleration = "reliable";
+    planner_data->parameters.vehicle_width = vehicle_width;
+
+    helper->setData(planner_data);
+    generator.setHelper(helper);
+    generator.setData(planner_data);
+
+    // Minimal single-point "previous cycle" path so AvoidanceHelper::getShift()/getEgoShift()
+    // (validated against matching point counts) do not throw, and report a fixed zero shift (no
+    // pre-existing approved maneuver) regardless of query position.
+    PathWithLaneId prev_path;
+    PathPointWithLaneId p;
+    p.point.pose = autoware::test_utils::createPose(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    prev_path.points.push_back(p);
+    ShiftedPath zero_shift;
+    zero_shift.path = prev_path;
+    zero_shift.shift_length = {0.0};
+    helper->setPreviousReferencePath(prev_path);
+    helper->setPreviousSplineShiftPath(zero_shift);
+    helper->setPreviousLinearShiftPath(zero_shift);
+  }
+
+  ObjectData make_object(const double longitudinal) const
+  {
+    ObjectData object_data;
+    object_data.object.classification.emplace_back(
+      autoware_perception_msgs::build<ObjectClassification>()
+        .label(ObjectClassification::TRUCK)
+        .probability(1.0));
+    object_data.direction = Direction::RIGHT;
+    object_data.overhang_points.emplace_back(0.0, Point{});
+    object_data.longitudinal = longitudinal;
+    object_data.is_parked = false;
+    object_data.is_stoppable = false;
+    return object_data;
+  }
+};
+}  // namespace
+
+// Part 1 root-cause regression: an object whose remaining longitudinal distance has shrunk below
+// what shift_line_generator's "reliable" deceleration policy would normally accept (a hard
+// nullopt/INSUFFICIENT_LONGITUDINAL_DISTANCE refusal -- the exact mechanism that, combined with
+// getCurrentModuleState()'s cancel-on-shrinking-distance transition, produced the "avoids far,
+// reverts to centerline close" symptom) must NOT be silently reverted once it is already
+// "committed" (was found avoidable in a previous cycle and still has a valid lateral avoid_margin)
+// -- confirming the sticky bypass in ShiftLineGenerator::computeFeasibleShiftProfile().
+TEST(TestUtils, ComputeFeasibleShiftProfileMidApproachReversionIsPrevented)
+{
+  AlwaysAvoidTestFixture fixture(/*vehicle_width=*/0.5);
+
+  constexpr double desire_shift_length = 1.5;
+  const auto avoiding_shift = desire_shift_length;  // current_ego_shift == 0
+
+  // Pick a longitudinal distance whose remaining avoidance room is comfortably inside the
+  // "reliable policy hard refusal" zone (< getMinAvoidanceDistance(avoiding_shift)), but not so
+  // small that the achievable jerk-limited shift collapses below the execution threshold --
+  // derived from the helper's own distance formula rather than a hardcoded magic number.
+  const auto min_avoidance_distance = fixture.helper->getMinAvoidanceDistance(avoiding_shift);
+  ASSERT_GT(min_avoidance_distance, 0.0);
+  const auto remaining_distance = 0.9 * min_avoidance_distance;
+
+  const auto prepare_distance = fixture.helper->getNominalPrepareDistance();
+  auto object = fixture.make_object(prepare_distance + remaining_distance);
+
+  // Not yet committed, and the global override is off: the "reliable" policy refuses outright.
+  object.is_avoidance_committed = false;
+  const auto not_committed_result =
+    fixture.generator.computeFeasibleShiftProfile(object, desire_shift_length, 0.0);
+  EXPECT_FALSE(not_committed_result.has_value());
+
+  // Same object, same shrunk distance, but now marked "committed" (as it would be after a
+  // previous cycle found it avoidable) -- must still produce a feasible shift instead of
+  // reverting to "no avoidance".
+  object.is_avoidance_committed = true;
+  object.info = ObjectInfo::NONE;
+  const auto committed_result =
+    fixture.generator.computeFeasibleShiftProfile(object, desire_shift_length, 0.0);
+  ASSERT_TRUE(committed_result.has_value());
+  EXPECT_GT(std::abs(committed_result.value().first), 0.0);
+}
+
+// Same scenario, but driven by the global `always_avoid_if_geometrically_possible` override
+// instead of the per-object sticky commitment -- confirms the flag bypasses the longitudinal gate
+// when true, and that default (false) behavior is unchanged (gated).
+TEST(TestUtils, AlwaysAvoidFlagBypassesLongitudinalGate)
+{
+  AlwaysAvoidTestFixture fixture(/*vehicle_width=*/0.5);
+
+  constexpr double desire_shift_length = 1.5;
+  const auto avoiding_shift = desire_shift_length;
+
+  const auto min_avoidance_distance = fixture.helper->getMinAvoidanceDistance(avoiding_shift);
+  const auto remaining_distance = 0.9 * min_avoidance_distance;
+  const auto prepare_distance = fixture.helper->getNominalPrepareDistance();
+
+  // default: flag off -> gated (nullopt).
+  {
+    fixture.parameters->always_avoid_if_geometrically_possible = false;
+    auto object = fixture.make_object(prepare_distance + remaining_distance);
+    const auto result = fixture.generator.computeFeasibleShiftProfile(object, desire_shift_length, 0.0);
+    EXPECT_FALSE(result.has_value());
+  }
+
+  // flag on -> bypassed (feasible shift produced).
+  {
+    fixture.parameters->always_avoid_if_geometrically_possible = true;
+    auto object = fixture.make_object(prepare_distance + remaining_distance);
+    const auto result = fixture.generator.computeFeasibleShiftProfile(object, desire_shift_length, 0.0);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_GT(std::abs(result.value().first), 0.0);
+  }
+}
+
+// The lateral room-availability check is the one physical safety boundary that must never be
+// bypassed by the new flag: (a) getAvoidMargin() returning nullopt for a genuinely too-narrow road
+// is untouched by the flag (it doesn't even read it), and (b) computeFeasibleShiftProfile's final
+// hard lateral-margin geometric feasibility check still refuses when the vehicle is simply too
+// wide to fit, regardless of the flag.
+TEST(TestUtils, AlwaysAvoidFlagNeverBypassesLateralRoomCheck)
+{
+  // (a) getAvoidMargin(): narrow-road "not enough room" case from the existing getAvoidMargin
+  // test, replayed with the new flag turned on.
+  {
+    auto parameters = get_parameters();
+    parameters->always_avoid_if_geometrically_possible = true;
+    const auto planner_data = get_planner_data();
+
+    ObjectData object_data;
+    object_data.is_parked = true;
+    object_data.distance_factor = 1.0;
+    object_data.to_road_shoulder_distance = 2.5;
+    object_data.object.classification.emplace_back(
+      autoware_perception_msgs::build<ObjectClassification>()
+        .label(ObjectClassification::TRUCK)
+        .probability(1.0));
+
+    const auto output = filtering_utils::getAvoidMargin(object_data, planner_data, parameters);
+    EXPECT_FALSE(output.has_value());
+  }
+
+  // (b) computeFeasibleShiftProfile(): even with the global override on and the object marked
+  // "committed", a vehicle too wide to physically fit beside the object (hard lateral margin
+  // check fails) must still be refused.
+  {
+    // A large vehicle_width forces the final hard-margin geometric feasibility check to fail
+    // regardless of how much shift is jerk-feasible.
+    AlwaysAvoidTestFixture fixture(/*vehicle_width=*/50.0);
+    fixture.parameters->always_avoid_if_geometrically_possible = true;
+
+    constexpr double desire_shift_length = 1.5;
+    const auto avoiding_shift = desire_shift_length;
+    const auto min_avoidance_distance = fixture.helper->getMinAvoidanceDistance(avoiding_shift);
+    const auto remaining_distance = 0.9 * min_avoidance_distance;
+    const auto prepare_distance = fixture.helper->getNominalPrepareDistance();
+
+    auto object = fixture.make_object(prepare_distance + remaining_distance);
+    object.is_avoidance_committed = true;
+
+    const auto result = fixture.generator.computeFeasibleShiftProfile(object, desire_shift_length, 0.0);
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(object.info, ObjectInfo::NEED_DECELERATION);
+  }
+}
+
+// fillObjectAvoidanceCommitted(): the sticky flag persists across cycles as long as
+// avoid_margin is still valid, and is dropped the moment lateral room is genuinely lost.
+TEST(TestUtils, FillObjectAvoidanceCommittedStickyBehavior)
+{
+  // No matching previous object -> not committed.
+  {
+    ObjectData current;
+    current.object.object_id = generate_uuid();
+    current.avoid_margin = 0.5;
+    ObjectDataArray previous;
+    fillObjectAvoidanceCommitted(current, previous);
+    EXPECT_FALSE(current.is_avoidance_committed);
+  }
+
+  // Previous object was avoidable, current still has room -> becomes committed.
+  {
+    ObjectData current;
+    current.object.object_id = generate_uuid();
+    current.avoid_margin = 0.5;
+
+    ObjectData previous_obj;
+    previous_obj.object.object_id = current.object.object_id;
+    previous_obj.is_avoidable = true;
+    previous_obj.is_avoidance_committed = false;
+    ObjectDataArray previous{previous_obj};
+
+    fillObjectAvoidanceCommitted(current, previous);
+    EXPECT_TRUE(current.is_avoidance_committed);
+  }
+
+  // Previous object was already committed (sticky) -> stays committed even if it wasn't
+  // is_avoidable in the immediately preceding cycle (e.g. it was rescued via the is_approved()
+  // path rather than the nominal one).
+  {
+    ObjectData current;
+    current.object.object_id = generate_uuid();
+    current.avoid_margin = 0.5;
+
+    ObjectData previous_obj;
+    previous_obj.object.object_id = current.object.object_id;
+    previous_obj.is_avoidable = false;
+    previous_obj.is_avoidance_committed = true;
+    ObjectDataArray previous{previous_obj};
+
+    fillObjectAvoidanceCommitted(current, previous);
+    EXPECT_TRUE(current.is_avoidance_committed);
+  }
+
+  // Lateral room genuinely lost this cycle (avoid_margin == nullopt) -> commitment is dropped
+  // regardless of history. This is the one check that must never be bypassed.
+  {
+    ObjectData current;
+    current.object.object_id = generate_uuid();
+    current.avoid_margin = std::nullopt;
+
+    ObjectData previous_obj;
+    previous_obj.object.object_id = current.object.object_id;
+    previous_obj.is_avoidable = true;
+    previous_obj.is_avoidance_committed = true;
+    ObjectDataArray previous{previous_obj};
+
+    fillObjectAvoidanceCommitted(current, previous);
+    EXPECT_FALSE(current.is_avoidance_committed);
+  }
+}
+
+// AvoidanceHelper::isReady()'s wait-and-see gate: the always-avoid flag bypasses the delayed-start
+// behavior for MERGING/DEVIATING vehicles once a valid avoid_margin exists; default behavior
+// (flag off) is unchanged.
+TEST(TestUtils, AlwaysAvoidFlagBypassesWaitAndSeeGate)
+{
+  auto parameters = get_parameters();
+  parameters->wait_and_see_target_behaviors = {"MERGING"};
+  parameters->wait_and_see_th_closest_distance = 0.0;
+
+  const auto planner_data = get_planner_data();
+  auto helper = std::make_shared<helper::static_obstacle_avoidance::AvoidanceHelper>(parameters);
+  helper->setData(planner_data);
+
+  ObjectData object_data;
+  object_data.object.classification.emplace_back(
+    autoware_perception_msgs::build<ObjectClassification>()
+      .label(ObjectClassification::TRUCK)
+      .probability(1.0));
+  object_data.direction = Direction::RIGHT;
+  object_data.overhang_points.emplace_back(0.0, Point{});
+  object_data.is_ambiguous = true;
+  object_data.behavior = ObjectData::Behavior::MERGING;
+  object_data.avoid_margin = 0.5;
+  // Far away: nominal wait-and-see logic says "not ready yet" (waits until closer).
+  object_data.longitudinal = helper->getNominalPrepareDistance(0.0) +
+                              helper->getFrontConstantDistance(object_data) +
+                              helper->getMinAvoidanceDistance(1.0) + 100.0;
+
+  parameters->always_avoid_if_geometrically_possible = false;
+  {
+    const auto [ready, ambiguous] = helper->isReady(ObjectDataArray{object_data});
+    EXPECT_FALSE(ready);
+    EXPECT_FALSE(ambiguous);
+  }
+
+  parameters->always_avoid_if_geometrically_possible = true;
+  {
+    const auto [ready, ambiguous] = helper->isReady(ObjectDataArray{object_data});
+    EXPECT_TRUE(ready);
+    EXPECT_FALSE(ambiguous);
+  }
 }
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance

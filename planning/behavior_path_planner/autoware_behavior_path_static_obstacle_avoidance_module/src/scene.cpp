@@ -434,6 +434,7 @@ void StaticObstacleAvoidanceModule::fillAvoidanceTargetData(ObjectDataArray & ob
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
   using utils::static_obstacle_avoidance::fillAvoidanceNecessity;
   using utils::static_obstacle_avoidance::fillObjectAvoidableByDesiredShiftLength;
+  using utils::static_obstacle_avoidance::fillObjectAvoidanceCommitted;
   using utils::static_obstacle_avoidance::fillObjectStoppableJudge;
 
   // Calculate the distance needed to safely decelerate the ego vehicle to a stop line.
@@ -444,6 +445,7 @@ void StaticObstacleAvoidanceModule::fillAvoidanceTargetData(ObjectDataArray & ob
     o.to_stop_line = calcDistanceToStopLine(o);
     fillObjectStoppableJudge(o, stored_objects_, feasible_stop_distance, parameters_);
     fillObjectAvoidableByDesiredShiftLength(o, avoid_data_.previous_target_objects);
+    fillObjectAvoidanceCommitted(o, avoid_data_.previous_target_objects);
   });
 }
 

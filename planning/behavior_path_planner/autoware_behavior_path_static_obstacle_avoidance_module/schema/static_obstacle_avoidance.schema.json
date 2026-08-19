@@ -1322,9 +1322,14 @@
               },
               "required": ["goal", "traffic_light"],
               "additionalProperties": false
+            },
+            "always_avoid_if_geometrically_possible": {
+              "type": "boolean",
+              "description": "If true, bypass every purely longitudinal-distance/timing-based rejection or cancellation gate and always attempt to avoid any object for which there is still a valid (non-nullopt) lateral avoid_margin. The lateral room-availability check is never bypassed by this flag.",
+              "default": false
             }
           },
-          "required": ["lateral", "longitudinal", "return_dead_line"],
+          "required": ["lateral", "longitudinal", "return_dead_line", "always_avoid_if_geometrically_possible"],
           "additionalProperties": false
         },
         "stop": {

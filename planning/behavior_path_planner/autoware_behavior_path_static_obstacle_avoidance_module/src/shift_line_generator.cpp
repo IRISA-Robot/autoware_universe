@@ -115,6 +115,148 @@ AvoidLineArray ShiftLineGenerator::generate(
   return generateCandidateShiftLine(raw_, data, debug);
 }
 
+std::optional<std::pair<double, double>> ShiftLineGenerator::computeFeasibleShiftProfile(
+  ObjectData & object, const double desire_shift_length, const double current_ego_shift) const
+{
+  // use each object param
+  const auto object_type = utils::getHighestProbLabel(object.object.classification);
+  const auto object_parameter = parameters_->object_parameters.at(object_type);
+  const auto is_object_on_right = utils::static_obstacle_avoidance::isOnRight(object);
+
+  // use absolute dist for return-to-center, relative dist from current for avoiding.
+  const auto avoiding_shift = desire_shift_length - current_ego_shift;
+  const auto nominal_avoid_distance = helper_->getMaxAvoidanceDistance(avoiding_shift);
+
+  // calculate remaining distance.
+  const auto prepare_distance = helper_->getNominalPrepareDistance();
+  const auto constant_distance = helper_->getFrontConstantDistance(object);
+  const auto has_enough_distance =
+    object.longitudinal > constant_distance + prepare_distance + nominal_avoid_distance;
+  const auto remaining_distance = object.longitudinal - constant_distance - prepare_distance;
+  const auto avoidance_distance = has_enough_distance ? nominal_avoid_distance : remaining_distance;
+
+  // If true, every purely longitudinal-distance/timing-based rejection gate below is bypassed
+  // for this object: either the global "always avoid" override is on, or this specific object
+  // has already been committed to (found avoidable in a previous cycle) and still has a valid
+  // lateral avoid_margin. The lateral room-availability check (avoid_margin.has_value(), and
+  // the hard lateral-margin geometric feasibility check further below) is NEVER bypassed.
+  const auto bypass_longitudinal_gates =
+    parameters_->always_avoid_if_geometrically_possible || object.is_avoidance_committed;
+
+  // nominal case. avoidable.
+  if (has_enough_distance) {
+    return std::make_pair(desire_shift_length, avoidance_distance);
+  }
+
+  if (!isBestEffort(parameters_->policy_lateral_margin)) {
+    return std::make_pair(desire_shift_length, avoidance_distance);
+  }
+
+  // ego already has enough positive shift.
+  const auto has_enough_positive_shift = avoiding_shift < -1e-3 && desire_shift_length > 1e-3;
+  if (is_object_on_right && has_enough_positive_shift) {
+    return std::make_pair(desire_shift_length, avoidance_distance);
+  }
+
+  // ego already has enough negative shift.
+  const auto has_enough_negative_shift = avoiding_shift > 1e-3 && desire_shift_length < -1e-3;
+  if (!is_object_on_right && has_enough_negative_shift) {
+    return std::make_pair(desire_shift_length, avoidance_distance);
+  }
+
+  // don't relax shift length since it can stop in front of the object.
+  if (object.is_stoppable && !parameters_->use_shorten_margin_immediately) {
+    return std::make_pair(desire_shift_length, avoidance_distance);
+  }
+
+  // the avoidance path is already approved
+  const auto is_approved =
+    (helper_->getShift(object.getPosition()) > 0.0 && is_object_on_right) ||
+    (helper_->getShift(object.getPosition()) < 0.0 && !is_object_on_right);
+  if (is_approved) {
+    return std::make_pair(desire_shift_length, avoidance_distance);
+  }
+
+  // prepare distance is not enough. unavoidable -- unless the longitudinal gates are bypassed,
+  // in which case fall through and try to compute the best jerk-feasible shift we can still fit
+  // in whatever (possibly tiny) longitudinal room remains, rather than giving up outright.
+  constexpr double MIN_AVOIDANCE_DISTANCE_FLOOR = 1e-2;  // [m] avoid div-by-zero in jerk calc.
+  if (avoidance_distance < 1e-3) {
+    if (!bypass_longitudinal_gates) {
+      object.info = ObjectInfo::INSUFFICIENT_LONGITUDINAL_DISTANCE;
+      return std::nullopt;
+    }
+  }
+  const auto clamped_avoidance_distance =
+    bypass_longitudinal_gates ? std::max(avoidance_distance, MIN_AVOIDANCE_DISTANCE_FLOOR)
+                              : avoidance_distance;
+
+  if (object.is_avoidable_by_desired_shift_length) {
+    return std::make_pair(desire_shift_length, clamped_avoidance_distance);
+  }
+
+  // calculate lateral jerk.
+  const auto required_jerk = autoware::motion_utils::calc_jerk_from_lat_lon_distance(
+    avoiding_shift, clamped_avoidance_distance, helper_->getAvoidanceEgoSpeed());
+
+  // relax lateral jerk limit. avoidable.
+  if (required_jerk < helper_->getLateralMaxJerkLimit()) {
+    object.is_avoidable_by_desired_shift_length = true;
+    return std::make_pair(desire_shift_length, clamped_avoidance_distance);
+  }
+
+  constexpr double LON_DIST_BUFFER = 1e-3;
+
+  // avoidance distance is not enough. unavoidable -- unless the longitudinal gates are
+  // bypassed, in which case always relax to the best jerk-feasible shift length (skip the
+  // "reliable" policy's hard refusal / forced NEED_DECELERATION here).
+  if (!isBestEffort(parameters_->policy_deceleration) && !bypass_longitudinal_gates) {
+    if (avoidance_distance < helper_->getMinAvoidanceDistance(avoiding_shift) + LON_DIST_BUFFER) {
+      object.info = ObjectInfo::INSUFFICIENT_LONGITUDINAL_DISTANCE;
+      return std::nullopt;
+    } else {
+      object.info = ObjectInfo::NEED_DECELERATION;
+      return std::nullopt;
+    }
+  }
+
+  // output avoidance path under lateral jerk constraints.
+  const auto feasible_relative_shift_length = autoware::motion_utils::calc_lateral_dist_from_jerk(
+    clamped_avoidance_distance, helper_->getLateralMaxJerkLimit(), helper_->getAvoidanceEgoSpeed());
+
+  if (std::abs(feasible_relative_shift_length) < parameters_->lateral_execution_threshold) {
+    object.info = ObjectInfo::LESS_THAN_EXECUTION_THRESHOLD;
+    return std::nullopt;
+  }
+
+  const auto feasible_shift_length = desire_shift_length > 0.0
+                                        ? feasible_relative_shift_length + current_ego_shift
+                                        : -1.0 * feasible_relative_shift_length + current_ego_shift;
+
+  if (
+    !bypass_longitudinal_gates &&
+    avoidance_distance < helper_->getMinAvoidanceDistance(feasible_shift_length) + LON_DIST_BUFFER) {
+    object.info = ObjectInfo::INSUFFICIENT_LONGITUDINAL_DISTANCE;
+    return std::nullopt;
+  }
+
+  const double LAT_DIST_BUFFER = desire_shift_length > 0.0 ? 1e-3 : -1e-3;
+
+  const auto lateral_hard_margin = object.is_parked
+                                     ? object_parameter.lateral_hard_margin_for_parked_vehicle
+                                     : object_parameter.lateral_hard_margin;
+  const auto infeasible =
+    std::abs(feasible_shift_length - object.overhang_points.front().first) - LAT_DIST_BUFFER <
+    0.5 * data_->parameters.vehicle_width + lateral_hard_margin;
+  if (infeasible) {
+    RCLCPP_DEBUG(rclcpp::get_logger(""), "feasible shift length is not enough to avoid. ");
+    object.info = ObjectInfo::NEED_DECELERATION;
+    return std::nullopt;
+  }
+
+  return std::make_pair(feasible_shift_length - LAT_DIST_BUFFER, avoidance_distance);
+}
+
 AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
   AvoidancePlanningData & data, [[maybe_unused]] DebugData & debug) const
 {
@@ -122,129 +264,8 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
   const auto current_ego_shift = helper_->getEgoShift();
 
   // Calculate feasible shift length
-  const auto get_shift_profile =
-    [&](
-      auto & object, const auto & desire_shift_length) -> std::optional<std::pair<double, double>> {
-    // use each object param
-    const auto object_type = utils::getHighestProbLabel(object.object.classification);
-    const auto object_parameter = parameters_->object_parameters.at(object_type);
-    const auto is_object_on_right = utils::static_obstacle_avoidance::isOnRight(object);
-
-    // use absolute dist for return-to-center, relative dist from current for avoiding.
-    const auto avoiding_shift = desire_shift_length - current_ego_shift;
-    const auto nominal_avoid_distance = helper_->getMaxAvoidanceDistance(avoiding_shift);
-
-    // calculate remaining distance.
-    const auto prepare_distance = helper_->getNominalPrepareDistance();
-    const auto constant_distance = helper_->getFrontConstantDistance(object);
-    const auto has_enough_distance =
-      object.longitudinal > constant_distance + prepare_distance + nominal_avoid_distance;
-    const auto remaining_distance = object.longitudinal - constant_distance - prepare_distance;
-    const auto avoidance_distance =
-      has_enough_distance ? nominal_avoid_distance : remaining_distance;
-
-    // nominal case. avoidable.
-    if (has_enough_distance) {
-      return std::make_pair(desire_shift_length, avoidance_distance);
-    }
-
-    if (!isBestEffort(parameters_->policy_lateral_margin)) {
-      return std::make_pair(desire_shift_length, avoidance_distance);
-    }
-
-    // ego already has enough positive shift.
-    const auto has_enough_positive_shift = avoiding_shift < -1e-3 && desire_shift_length > 1e-3;
-    if (is_object_on_right && has_enough_positive_shift) {
-      return std::make_pair(desire_shift_length, avoidance_distance);
-    }
-
-    // ego already has enough negative shift.
-    const auto has_enough_negative_shift = avoiding_shift > 1e-3 && desire_shift_length < -1e-3;
-    if (!is_object_on_right && has_enough_negative_shift) {
-      return std::make_pair(desire_shift_length, avoidance_distance);
-    }
-
-    // don't relax shift length since it can stop in front of the object.
-    if (object.is_stoppable && !parameters_->use_shorten_margin_immediately) {
-      return std::make_pair(desire_shift_length, avoidance_distance);
-    }
-
-    // the avoidance path is already approved
-    const auto is_approved =
-      (helper_->getShift(object.getPosition()) > 0.0 && is_object_on_right) ||
-      (helper_->getShift(object.getPosition()) < 0.0 && !is_object_on_right);
-    if (is_approved) {
-      return std::make_pair(desire_shift_length, avoidance_distance);
-    }
-
-    // prepare distance is not enough. unavoidable.
-    if (avoidance_distance < 1e-3) {
-      object.info = ObjectInfo::INSUFFICIENT_LONGITUDINAL_DISTANCE;
-      return std::nullopt;
-    }
-
-    if (object.is_avoidable_by_desired_shift_length) {
-      return std::make_pair(desire_shift_length, avoidance_distance);
-    }
-
-    // calculate lateral jerk.
-    const auto required_jerk = autoware::motion_utils::calc_jerk_from_lat_lon_distance(
-      avoiding_shift, avoidance_distance, helper_->getAvoidanceEgoSpeed());
-
-    // relax lateral jerk limit. avoidable.
-    if (required_jerk < helper_->getLateralMaxJerkLimit()) {
-      object.is_avoidable_by_desired_shift_length = true;
-      return std::make_pair(desire_shift_length, avoidance_distance);
-    }
-
-    constexpr double LON_DIST_BUFFER = 1e-3;
-
-    // avoidance distance is not enough. unavoidable.
-    if (!isBestEffort(parameters_->policy_deceleration)) {
-      if (avoidance_distance < helper_->getMinAvoidanceDistance(avoiding_shift) + LON_DIST_BUFFER) {
-        object.info = ObjectInfo::INSUFFICIENT_LONGITUDINAL_DISTANCE;
-        return std::nullopt;
-      } else {
-        object.info = ObjectInfo::NEED_DECELERATION;
-        return std::nullopt;
-      }
-    }
-
-    // output avoidance path under lateral jerk constraints.
-    const auto feasible_relative_shift_length = autoware::motion_utils::calc_lateral_dist_from_jerk(
-      avoidance_distance, helper_->getLateralMaxJerkLimit(), helper_->getAvoidanceEgoSpeed());
-
-    if (std::abs(feasible_relative_shift_length) < parameters_->lateral_execution_threshold) {
-      object.info = ObjectInfo::LESS_THAN_EXECUTION_THRESHOLD;
-      return std::nullopt;
-    }
-
-    const auto feasible_shift_length =
-      desire_shift_length > 0.0 ? feasible_relative_shift_length + current_ego_shift
-                                : -1.0 * feasible_relative_shift_length + current_ego_shift;
-
-    if (
-      avoidance_distance <
-      helper_->getMinAvoidanceDistance(feasible_shift_length) + LON_DIST_BUFFER) {
-      object.info = ObjectInfo::INSUFFICIENT_LONGITUDINAL_DISTANCE;
-      return std::nullopt;
-    }
-
-    const double LAT_DIST_BUFFER = desire_shift_length > 0.0 ? 1e-3 : -1e-3;
-
-    const auto lateral_hard_margin = object.is_parked
-                                       ? object_parameter.lateral_hard_margin_for_parked_vehicle
-                                       : object_parameter.lateral_hard_margin;
-    const auto infeasible =
-      std::abs(feasible_shift_length - object.overhang_points.front().first) - LAT_DIST_BUFFER <
-      0.5 * data_->parameters.vehicle_width + lateral_hard_margin;
-    if (infeasible) {
-      RCLCPP_DEBUG(rclcpp::get_logger(""), "feasible shift length is not enough to avoid. ");
-      object.info = ObjectInfo::NEED_DECELERATION;
-      return std::nullopt;
-    }
-
-    return std::make_pair(feasible_shift_length - LAT_DIST_BUFFER, avoidance_distance);
+  const auto get_shift_profile = [&](auto & object, const auto & desire_shift_length) {
+    return computeFeasibleShiftProfile(object, desire_shift_length, current_ego_shift);
   };
 
   const auto is_forward_object = [](const auto & object) { return object.longitudinal > 0.0; };

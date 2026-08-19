@@ -229,6 +229,21 @@ void fillObjectStoppableJudge(
 void fillObjectAvoidableByDesiredShiftLength(
   ObjectData & object_data, const ObjectDataArray & previous_target_objects);
 
+/**
+ * @brief Persist the "avoidance committed" sticky flag across cycles by matching object_id
+ * against previous_target_objects. Once an object was found avoidable (is_avoidable == true) in
+ * ANY previous cycle, and its lateral avoid_margin is still available (non-nullopt) this cycle,
+ * it stays "committed" so that shift_line_generator's purely longitudinal-distance/timing gates
+ * can be bypassed for it going forward -- this prevents an already-in-progress avoidance shift
+ * from being silently reverted back to centerline just because remaining longitudinal distance
+ * shrank as ego approached. If avoid_margin is lost (no lateral room), the commitment is dropped:
+ * the lateral room-availability check is never bypassed.
+ * @param object_data current-cycle object data (object_data.avoid_margin must already be filled).
+ * @param previous_target_objects previous cycle's target object list.
+ */
+void fillObjectAvoidanceCommitted(
+  ObjectData & object_data, const ObjectDataArray & previous_target_objects);
+
 void updateClipObject(ObjectDataArray & clip_objects, AvoidancePlanningData & data);
 
 /**

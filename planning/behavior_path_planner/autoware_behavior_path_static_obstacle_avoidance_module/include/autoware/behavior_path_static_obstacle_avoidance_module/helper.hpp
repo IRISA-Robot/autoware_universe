@@ -413,6 +413,14 @@ public:
       ;
     }
 
+    // "always avoid if geometrically possible": don't make ego wait-and-see for a MERGING /
+    // DEVIATING vehicle once there is a valid lateral avoid_margin. This is a purely
+    // longitudinal-distance/timing gate (delay avoidance start until closer), not a lateral
+    // room-availability check, so it is safe to bypass here.
+    if (parameters_->always_avoid_if_geometrically_possible) {
+      return std::make_pair(true, false);
+    }
+
     const auto is_object_on_right = utils::static_obstacle_avoidance::isOnRight(object);
     const auto desire_shift_length =
       getShiftLength(object, is_object_on_right, object.avoid_margin.value());

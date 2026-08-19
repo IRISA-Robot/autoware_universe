@@ -112,6 +112,19 @@ struct AvoidanceParameters
 
   double force_deactivate_duration_time{0.0};
 
+  // If true, bypass every purely longitudinal-distance/timing-based rejection or cancellation
+  // gate (wait-and-see start delay, "not enough prepare/avoidance distance" rejection, cancel
+  // maneuver triggered solely by shrinking longitudinal room, etc.) and attempt to avoid ANY
+  // object for which there is still a valid (non-nullopt) lateral avoid_margin -- i.e. if there
+  // is physically enough LATERAL room to shift around the object, always try to shift, no matter
+  // how little longitudinal distance/time is nominally required for a comfortable, gradual
+  // maneuver. This can produce sharper/more abrupt shifts when triggered very close to an object,
+  // since the nominal jerk-limited prepare distance will not be honored -- that tradeoff is
+  // intentional (a sharp avoid is preferred over stopping directly in front of an object).
+  // The lateral room-availability check (getAvoidMargin()/getRoadShoulderDistance() returning a
+  // valid margin) is NEVER bypassed by this flag, regardless of its value.
+  bool always_avoid_if_geometrically_possible{false};
+
   // enable avoidance for all parking vehicle
   std::string policy_ambiguous_vehicle{"ignore"};
 
@@ -465,6 +478,16 @@ struct ObjectData  // avoidance target
 
   // is avoidable by desired shift length
   bool is_avoidable_by_desired_shift_length{false};
+
+  // Sticky/"once committed, stay committed" flag. Set to true the first cycle this object was
+  // found geometrically avoidable (valid avoid_margin + a feasible shift profile was produced).
+  // Persisted across cycles by matching object_id against previous_target_objects (see
+  // fillObjectAvoidanceCommitted()). While true, and as long as avoid_margin is still available
+  // (i.e. there is still physically enough LATERAL room -- that check is never bypassed), the
+  // purely longitudinal-distance/timing rejection gates in shift_line_generator.cpp are skipped
+  // for this object so an already-in-progress avoidance maneuver cannot be silently reverted back
+  // to centerline just because remaining longitudinal distance shrank as ego approached.
+  bool is_avoidance_committed{false};
 
   // is within intersection area
   bool is_within_intersection{false};

@@ -323,6 +323,13 @@ AvoidanceParameters getParameter(rclcpp::Node * node)
       get_or_declare_parameter<double>(*node, ns + "traffic_light.buffer");
   }
 
+  // always avoid if geometrically possible (bypass longitudinal-distance/timing gates)
+  {
+    const std::string ns = "avoidance.avoidance.";
+    p.always_avoid_if_geometrically_possible =
+      get_or_declare_parameter<bool>(*node, ns + "always_avoid_if_geometrically_possible");
+  }
+
   // cancel
   {
     const std::string ns = "avoidance.cancel.";
