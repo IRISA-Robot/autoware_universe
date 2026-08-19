@@ -1061,59 +1061,33 @@ bool isSatisfiedWithNonVehicleCondition(
   }
 
   object.is_on_ego_lane = isOnEgoLane(object, planner_data->route_handler);
-  const auto right_lane =
-    planner_data->route_handler->getRightLanelet(object.overhang_lanelet, true, true);
-  const bool ignore_right_object = [&]() {
-    if (!right_lane.has_value()) {
-      return false;
-    }
-    const lanelet::Attribute & sub_type =
-      right_lane.value().attribute(lanelet::AttributeName::Subtype);
-    if (sub_type == "road_shoulder") {
-      return !object.is_on_ego_lane;
-    }
-    return right_lane.has_value();
-  }();
-  if (ignore_right_object && isOnRight(object)) {
-    RCLCPP_DEBUG(
-      rclcpp::get_logger(logger_namespace), "object isn't on the edge lane. never avoid it.");
-    return false;
-  }
 
-  const auto left_lane =
-    planner_data->route_handler->getLeftLanelet(object.overhang_lanelet, true, true);
-  const bool ignore_left_object = [&]() {
-    if (!left_lane.has_value()) {
-      return false;
-    }
-    const lanelet::Attribute & sub_type =
-      left_lane.value().attribute(lanelet::AttributeName::Subtype);
-    if (sub_type == "road_shoulder") {
-      return !object.is_on_ego_lane;
-    }
-    return left_lane.has_value();
-  }();
-  if (ignore_left_object && !isOnRight(object)) {
-    RCLCPP_DEBUG(
-      rclcpp::get_logger(logger_namespace), "object isn't on the edge lane. never avoid it.");
-    return false;
-  }
-
-  const auto right_opposite_lanes =
-    planner_data->route_handler->getRightOppositeLanelets(object.overhang_lanelet);
-  if (!right_opposite_lanes.empty() && isOnRight(object)) {
-    RCLCPP_DEBUG(
-      rclcpp::get_logger(logger_namespace), "object isn't on the edge lane. never avoid it.");
-    return false;
-  }
-
-  const auto left_opposite_lanes =
-    planner_data->route_handler->getLeftOppositeLanelets(object.overhang_lanelet);
-  if (!left_opposite_lanes.empty() && !isOnRight(object)) {
-    RCLCPP_DEBUG(
-      rclcpp::get_logger(logger_namespace), "object isn't on the edge lane. never avoid it.");
-    return false;
-  }
+  // [SINGLE-LANE-PLATFORM] Upstream Autoware gates pedestrian/bicycle avoidance targets on being
+  // "near the edge lane": if the object's overhang lanelet has a real neighbor lane/shoulder (or a
+  // geometrically-opposite lanelet) on the same side as the object, the object is excluded
+  // outright regardless of how much lateral room is actually available. That assumption fits a
+  // multi-lane deployment (an object mid-lane is presumed to actually belong to the neighboring
+  // lane), but this platform's maps are predominantly single-lane-per-direction with
+  // `bidirectional_driving`-tagged lanelets for two-way single-lane travel, and frequently have a
+  // sidewalk/shoulder lanelet running alongside the one drivable lane. On this platform the
+  // "edge lane" gate fires even for a pedestrian standing well inside the middle of the only
+  // lane (e.g. because a shoulder or a same-root-fallback lanelet exists on one side), which is
+  // exactly the case the user wants avoided given genuinely sufficient shift room. Room
+  // availability is already validated correctly downstream (envelope / lateral margin
+  // computation), so we intentionally do NOT re-gate here on lateral position within the lane.
+  //
+  // Removed checks (kept here as history / for future multi-lane reconsideration):
+  //   - getRightLanelet/getLeftLanelet(object.overhang_lanelet, enable_same_root=true,
+  //     get_shoulder_lane=true) + subtype check -> excluded any object on a side that had *any*
+  //     right/left neighbor lanelet (real lane, shoulder, or same-root fallback), even when
+  //     is_on_ego_lane was true.
+  //   - getRightOppositeLanelets/getLeftOppositeLanelets(object.overhang_lanelet) -> excluded any
+  //     object on a side with a geometrically-opposite lanelet.
+  //
+  // NOTE for future multi-lane deployment: if/when this stack is used on a genuine multi-lane
+  // map, these 4 blocks (or an equivalent gate) should be reinstated -- ideally driven by a
+  // config flag rather than deleted code, so both platform shapes can be supported without
+  // re-deriving this analysis. See git history of this function for the original logic.
 
   return true;
 }

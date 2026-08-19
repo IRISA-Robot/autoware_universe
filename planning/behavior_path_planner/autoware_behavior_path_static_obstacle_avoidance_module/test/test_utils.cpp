@@ -1738,4 +1738,104 @@ TEST(TestUtils, getRoadShoulderDistanceTrueLaneRelativeClassification)
     }
   }
 }
+
+// Regression test for the "must be on the edge lane" gate that used to live in
+// isSatisfiedWithNonVehicleCondition(): a pedestrian/bicycle object was excluded from avoidance
+// outright whenever its overhang lanelet had *any* right/left neighbor lanelet (real lane or
+// shoulder) or geometrically-opposite lanelet on the object's side -- even if the object itself
+// was sitting well inside the middle of its own (only) lane with genuinely sufficient room to
+// shift around. That restriction has been removed for this platform (single-lane-per-direction
+// maps); this test builds exactly the trap configuration (a real, non-shoulder right-side
+// neighbor lane) and asserts a mid-lane pedestrian is no longer excluded by it.
+TEST(TestUtils, isSatisfiedWithNonVehicleConditionAllowsMidLanePedestrianWithAdjacentLane)
+{
+  constexpr double half_width = 1.75;  // 3.5m-wide lane, matching the documented repro.
+
+  const auto planner_data = get_planner_data();
+  const auto parameters = get_parameters();
+  // Match the tight production threshold (see static_obstacle_avoidance.param.yaml) so this test
+  // exercises the edge-lane gate specifically, not the (already correct) centerline gate.
+  parameters->threshold_distance_object_is_on_center = 0.05;
+
+  // Main lane A (ego's lane), and a genuine right-side neighbor lane B sharing A's right
+  // boundary -- i.e. a real second lane, not a shoulder. This is the configuration that used to
+  // make `getRightLanelet(..., get_shoulder_lane=true)` return a non-"road_shoulder" neighbor
+  // and unconditionally exclude any object on that side.
+  lanelet::LineString3d left_bound_ls(lanelet::utils::getId());
+  left_bound_ls.push_back(lanelet::Point3d(lanelet::utils::getId(), 0.0, half_width, 0.0));
+  left_bound_ls.push_back(lanelet::Point3d(lanelet::utils::getId(), 100.0, half_width, 0.0));
+
+  lanelet::LineString3d shared_bound_ls(lanelet::utils::getId());
+  shared_bound_ls.push_back(lanelet::Point3d(lanelet::utils::getId(), 0.0, -half_width, 0.0));
+  shared_bound_ls.push_back(lanelet::Point3d(lanelet::utils::getId(), 100.0, -half_width, 0.0));
+
+  lanelet::LineString3d right_far_bound_ls(lanelet::utils::getId());
+  right_far_bound_ls.push_back(
+    lanelet::Point3d(lanelet::utils::getId(), 0.0, -2.0 * half_width, 0.0));
+  right_far_bound_ls.push_back(
+    lanelet::Point3d(lanelet::utils::getId(), 100.0, -2.0 * half_width, 0.0));
+
+  lanelet::Lanelet lanelet_a(lanelet::utils::getId(), left_bound_ls, shared_bound_ls);
+  lanelet_a.attributes()[lanelet::AttributeName::Subtype] = lanelet::AttributeValueString::Road;
+  lanelet_a.attributes()[lanelet::AttributeName::Location] = lanelet::AttributeValueString::Urban;
+  lanelet_a.attributes()[lanelet::AttributeName::OneWay] = "yes";
+
+  lanelet::Lanelet lanelet_b(lanelet::utils::getId(), shared_bound_ls, right_far_bound_ls);
+  lanelet_b.attributes()[lanelet::AttributeName::Subtype] = lanelet::AttributeValueString::Road;
+  lanelet_b.attributes()[lanelet::AttributeName::Location] = lanelet::AttributeValueString::Urban;
+  lanelet_b.attributes()[lanelet::AttributeName::OneWay] = "yes";
+
+  const auto map = std::make_shared<lanelet::LaneletMap>();
+  map->add(lanelet_a);
+  map->add(lanelet_b);
+
+  autoware_map_msgs::msg::LaneletMapBin map_bin_msg;
+  map_bin_msg.header.frame_id = "map";
+  lanelet::utils::conversion::toBinMsg(map, &map_bin_msg);
+
+  auto route_handler = std::make_shared<autoware::route_handler::RouteHandler>();
+  route_handler->setMap(map_bin_msg);
+
+  // IMPORTANT: setMap() deserializes the map, so the RoutingGraph is built over brand-new
+  // Lanelet/LineString primitive instances (same ids, different underlying data pointers) --
+  // NOT the `lanelet_a` / `lanelet_b` locals constructed above. Routing-graph lookups
+  // (right()/left()/adjacentRight()/adjacentLeft(), all used by getRightLanelet()) key on the
+  // primitive identity backing the graph, so any lanelet passed into those queries (including
+  // `object.overhang_lanelet` and `data.current_lanelets`) must be re-fetched from the route
+  // handler's own map, exactly as production code does (e.g. via getLaneletsFromId()/
+  // getClosestLaneletWithinRoute()) -- never a locally-constructed lanelet with matching id.
+  const auto ego_lanelet = route_handler->getLaneletsFromId(lanelet_a.id());
+  route_handler->setRouteLanelets(lanelet::ConstLanelets{ego_lanelet});
+  planner_data->route_handler = route_handler;
+
+  // Sanity check: B is indeed discoverable as A's right neighbor, and is NOT a shoulder -- this
+  // is exactly the "must be on edge lane" trap the removed code fell into.
+  const auto right_lane = route_handler->getRightLanelet(ego_lanelet, true, true);
+  ASSERT_TRUE(right_lane.has_value());
+  EXPECT_NE(right_lane.value().attribute(lanelet::AttributeName::Subtype).value(), "road_shoulder");
+
+  AvoidancePlanningData data;
+  data.current_lanelets = {ego_lanelet};
+
+  // Pedestrian standing mid-lane: 0.3m right of centerline, well clear of both bounds (1.45m of
+  // clearance to the right/shared bound, 2.05m to the left bound) -- not "near the edge" by any
+  // reasonable definition.
+  constexpr double object_y = -0.3;
+  const auto object_pose = autoware::test_utils::createPose(10.0, object_y, 0.0, 0.0, 0.0, 0.0);
+
+  ObjectData object_data;
+  object_data.object.classification.emplace_back(
+    autoware_perception_msgs::build<ObjectClassification>()
+      .label(ObjectClassification::PEDESTRIAN)
+      .probability(1.0));
+  object_data.object.kinematics.initial_pose_with_covariance.pose = object_pose;
+  object_data.overhang_lanelet = ego_lanelet;
+  object_data.overhang_points.emplace_back(0.0, object_pose.position);
+  object_data.direction = Direction::RIGHT;
+
+  EXPECT_TRUE(filtering_utils::isSatisfiedWithNonVehicleCondition(
+    object_data, data, planner_data, parameters));
+  // is_on_ego_lane is still computed/populated (used elsewhere); confirm it reads correctly too.
+  EXPECT_TRUE(object_data.is_on_ego_lane);
+}
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
