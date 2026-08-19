@@ -1285,7 +1285,12 @@ double getRoadShoulderDistance(
     object.overhang_lanelet,
     autoware::experimental::lanelet2_utils::from_ros(object.getPosition()));
   // TODO(Satoshi OTA): check if the basic point is on right or left of bound.
-  const auto bound = isOnRight(object) ? data.left_bound : data.right_bound;
+  // Determine which side of the TRUE lane (not the possibly-biased reference path, e.g. under a
+  // prefer_lateral_ratio lanelet tag) the object actually sits on, reusing the same bias-independent
+  // arc-coordinate computation already used elsewhere for centerline-distance checks, so the correct
+  // real boundary is treated as the "far" side regardless of how far off-center the current path is.
+  const bool is_object_on_right_of_true_lane = getDistanceToCenterline(object, data) <= 0.0;
+  const auto bound = is_object_on_right_of_true_lane ? data.left_bound : data.right_bound;
   const auto envelope_polygon_width = boost::geometry::area(object.envelope_poly) /
                                       std::max(object.length, 1e-3);  // prevent division by zero
 
@@ -1296,7 +1301,8 @@ double getRoadShoulderDistance(
     for (size_t i = 1; i < bound.size(); i++) {
       {
         const auto p2 =
-          calc_offset_pose(p_tmp, 0.0, (isOnRight(object) ? 100.0 : -100.0), 0.0).position;
+          calc_offset_pose(p_tmp, 0.0, (is_object_on_right_of_true_lane ? 100.0 : -100.0), 0.0)
+            .position;
         const auto opt_intersect =
           autoware_utils::intersect(p1.second, p2, bound.at(i - 1), bound.at(i));
 
@@ -1309,7 +1315,7 @@ double getRoadShoulderDistance(
       {
         const auto p2 =
           calc_offset_pose(
-            p_tmp, 0.0, (isOnRight(object) ? -0.5 : 0.5) * envelope_polygon_width, 0.0)
+            p_tmp, 0.0, (is_object_on_right_of_true_lane ? -0.5 : 0.5) * envelope_polygon_width, 0.0)
             .position;
         const auto opt_intersect =
           autoware_utils::intersect(p1.second, p2, bound.at(i - 1), bound.at(i));

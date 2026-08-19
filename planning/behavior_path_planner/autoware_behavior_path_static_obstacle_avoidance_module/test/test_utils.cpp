@@ -1584,4 +1584,158 @@ TEST(TestUtils, calcErrorEclipseLongRadius)
 
   EXPECT_DOUBLE_EQ(calcErrorEclipseLongRadius(pose_with_covariance), 3.0);
 }
+
+namespace
+{
+// Builds a single, straight 100m-long lanelet of the given half-width (bounds run parallel to the
+// x-axis, centerline at y = 0), registers it as the sole lanelet of a minimal route so that
+// `RouteHandler::getClosestLaneletWithinRoute()` can resolve it, and returns both the handler and
+// the lanelet (the latter is what callers put into `AvoidancePlanningData::current_lanelets`).
+std::pair<std::shared_ptr<autoware::route_handler::RouteHandler>, lanelet::ConstLanelet>
+make_straight_lane_route_handler(const double half_width)
+{
+  lanelet::LineString3d left_bound_ls(lanelet::utils::getId());
+  left_bound_ls.push_back(lanelet::Point3d(lanelet::utils::getId(), 0.0, half_width, 0.0));
+  left_bound_ls.push_back(lanelet::Point3d(lanelet::utils::getId(), 100.0, half_width, 0.0));
+
+  lanelet::LineString3d right_bound_ls(lanelet::utils::getId());
+  right_bound_ls.push_back(lanelet::Point3d(lanelet::utils::getId(), 0.0, -half_width, 0.0));
+  right_bound_ls.push_back(lanelet::Point3d(lanelet::utils::getId(), 100.0, -half_width, 0.0));
+
+  lanelet::Lanelet lanelet_obj(lanelet::utils::getId(), left_bound_ls, right_bound_ls);
+  lanelet_obj.attributes()[lanelet::AttributeName::Subtype] =
+    lanelet::AttributeValueString::Road;
+  lanelet_obj.attributes()[lanelet::AttributeName::Location] =
+    lanelet::AttributeValueString::Urban;
+  lanelet_obj.attributes()[lanelet::AttributeName::OneWay] = "yes";
+
+  const auto map = std::make_shared<lanelet::LaneletMap>();
+  map->add(lanelet_obj);
+
+  autoware_map_msgs::msg::LaneletMapBin map_bin_msg;
+  map_bin_msg.header.frame_id = "map";
+  lanelet::utils::conversion::toBinMsg(map, &map_bin_msg);
+
+  auto route_handler = std::make_shared<autoware::route_handler::RouteHandler>();
+  route_handler->setMap(map_bin_msg);
+  route_handler->setRouteLanelets(lanelet::ConstLanelets{lanelet::ConstLanelet(lanelet_obj)});
+
+  return {route_handler, lanelet::ConstLanelet(lanelet_obj)};
+}
+
+// Builds a straight reference path (constant lateral offset `lateral_offset` from the true
+// centerline, heading along +x) spanning x in [0, 20].
+PathWithLaneId make_straight_reference_path(const double lateral_offset)
+{
+  PathWithLaneId path;
+  for (double x = 0.0; x <= 20.0 + 1e-6; x += 2.0) {
+    PathPointWithLaneId point;
+    point.point.pose = autoware::test_utils::createPose(x, lateral_offset, 0.0, 0.0, 0.0, 0.0);
+    path.points.push_back(point);
+  }
+  return path;
+}
+}  // namespace
+
+TEST(TestUtils, getRoadShoulderDistanceTrueLaneRelativeClassification)
+{
+  constexpr double half_width = 1.75;  // 3.5m-wide lane, matching the documented repro.
+  constexpr double path_bias = -0.5;   // reference path biased toward the right, e.g. by a
+                                        // prefer_lateral_ratio lanelet tag.
+
+  const auto planner_data = get_planner_data();
+
+  // Bias case: the reference path is off-center, and the object sits between the biased path
+  // and the TRUE centerline (x=-0.3, while path=-0.5, centerline=0). Relative to the biased
+  // path the object reads as being on its LEFT (isOnRight() == false), but relative to the true
+  // lane centerline it is actually on the RIGHT. The correct "far" boundary is therefore the
+  // left bound (ample real space), not the right bound the old path-relative classification
+  // would have selected.
+  {
+    auto [route_handler, lanelet_obj] = make_straight_lane_route_handler(half_width);
+    planner_data->route_handler = route_handler;
+
+    AvoidancePlanningData data;
+    data.reference_path = make_straight_reference_path(path_bias);
+    data.current_lanelets = {lanelet_obj};
+    for (double x = 0.0; x <= 100.0 + 1e-6; x += 10.0) {
+      data.left_bound.push_back(create_point(x, half_width, 0.0));
+      data.right_bound.push_back(create_point(x, -half_width, 0.0));
+    }
+
+    constexpr double object_y = -0.3;
+    const auto object_pose =
+      autoware::test_utils::createPose(10.0, object_y, 0.0, 0.0, 0.0, 0.0);
+
+    ObjectData object_data;
+    object_data.object.kinematics.initial_pose_with_covariance.pose = object_pose;
+    object_data.overhang_points.emplace_back(0.0, object_pose.position);
+
+    // Sanity-check the two classifications actually disagree for this geometry.
+    const double path_relative_deviation =
+      autoware_utils::calc_lateral_deviation(object_pose, object_pose.position);
+    // object_closest_pose used inside getRoadShoulderDistance is the reference_path pose at the
+    // object's x, i.e. (x, path_bias). Recompute the same deviation used by
+    // isOnRight()/object.direction (see scene.cpp) for clarity:
+    const auto path_pose_at_object =
+      autoware::test_utils::createPose(10.0, path_bias, 0.0, 0.0, 0.0, 0.0);
+    const double deviation_from_biased_path =
+      autoware_utils::calc_lateral_deviation(path_pose_at_object, object_pose.position);
+    EXPECT_GT(deviation_from_biased_path, 0.0);  // path-relative: LEFT (isOnRight() == false)
+    EXPECT_LE(object_y, 0.0);                    // true-lane-relative: RIGHT (getDistanceToCenterline <= 0)
+    (void)path_relative_deviation;
+
+    const auto distance = filtering_utils::getRoadShoulderDistance(object_data, data, planner_data);
+
+    // Correct behavior: far bound is the LEFT bound (true-lane-relative), giving ample space.
+    EXPECT_NEAR(distance, half_width - object_y, 1e-2);
+    EXPECT_GT(distance, 1.5);  // ample real clearance, not a false near-zero/insufficient verdict.
+  }
+
+  // Regression case (no bias): reference path matches the true centerline, so path-relative and
+  // true-lane-relative classification always agree. Verify both a left-side and a right-side
+  // object still resolve to the correct (opposite-side) far boundary as before this fix.
+  {
+    auto [route_handler, lanelet_obj] = make_straight_lane_route_handler(half_width);
+    planner_data->route_handler = route_handler;
+
+    AvoidancePlanningData data;
+    data.reference_path = make_straight_reference_path(0.0);
+    data.current_lanelets = {lanelet_obj};
+    for (double x = 0.0; x <= 100.0 + 1e-6; x += 10.0) {
+      data.left_bound.push_back(create_point(x, half_width, 0.0));
+      data.right_bound.push_back(create_point(x, -half_width, 0.0));
+    }
+
+    // object on the right side of the (unbiased) path/centerline -> far bound is left bound.
+    {
+      constexpr double object_y = -0.6;
+      const auto object_pose =
+        autoware::test_utils::createPose(10.0, object_y, 0.0, 0.0, 0.0, 0.0);
+
+      ObjectData object_data;
+      object_data.object.kinematics.initial_pose_with_covariance.pose = object_pose;
+      object_data.overhang_points.emplace_back(0.0, object_pose.position);
+
+      const auto distance =
+        filtering_utils::getRoadShoulderDistance(object_data, data, planner_data);
+      EXPECT_NEAR(distance, half_width - object_y, 1e-2);
+    }
+
+    // object on the left side of the (unbiased) path/centerline -> far bound is right bound.
+    {
+      constexpr double object_y = 0.6;
+      const auto object_pose =
+        autoware::test_utils::createPose(10.0, object_y, 0.0, 0.0, 0.0, 0.0);
+
+      ObjectData object_data;
+      object_data.object.kinematics.initial_pose_with_covariance.pose = object_pose;
+      object_data.overhang_points.emplace_back(0.0, object_pose.position);
+
+      const auto distance =
+        filtering_utils::getRoadShoulderDistance(object_data, data, planner_data);
+      EXPECT_NEAR(distance, half_width + object_y, 1e-2);
+    }
+  }
+}
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
