@@ -30,10 +30,14 @@
 #include <boost/geometry/algorithms/buffer.hpp>
 #include <boost/geometry/algorithms/convex_hull.hpp>
 #include <boost/geometry/algorithms/correct.hpp>
+#include <boost/geometry/algorithms/disjoint.hpp>
 #include <boost/geometry/algorithms/union.hpp>
 #include <boost/geometry/geometries/point_xy.hpp>
 
+#include <lanelet2_core/geometry/BoundingBox.h>
 #include <lanelet2_core/geometry/Lanelet.h>
+#include <lanelet2_core/geometry/Polygon.h>
+#include <lanelet2_core/primitives/BoundingBox.h>
 #include <lanelet2_routing/RoutingGraphContainer.h>
 
 #include <algorithm>
@@ -1207,6 +1211,36 @@ bool isNoNeedAvoidanceBehavior(
 }
 
 /**
+ * @brief check whether the object sits inside a lanelet tagged `narrow_lane=yes`.
+ * @param object data.
+ * @param planner data, which includes the route handler / lanelet map.
+ * @return true if the object's position falls inside a narrow_lane-tagged lanelet.
+ */
+bool isObjectPositionInNarrowLaneLanelet(
+  const ObjectData & object, const std::shared_ptr<const PlannerData> & planner_data)
+{
+  const auto & route_handler = planner_data->route_handler;
+  if (!route_handler) return false;
+  const auto lanelet_map_ptr = route_handler->getLaneletMapPtr();
+  if (!lanelet_map_ptr) return false;
+
+  const auto object_position = object.getPosition();
+  const lanelet::BasicPoint2d point(object_position.x, object_position.y);
+  constexpr double search_margin = 0.1;
+  const lanelet::BoundingBox2d bbox(
+    lanelet::BasicPoint2d(object_position.x - search_margin, object_position.y - search_margin),
+    lanelet::BasicPoint2d(object_position.x + search_margin, object_position.y + search_margin));
+  for (const auto & ll : lanelet_map_ptr->laneletLayer.search(bbox)) {
+    if (
+      ll.attributeOr("narrow_lane", false) &&
+      !boost::geometry::disjoint(point, ll.polygon2d().basicPolygon())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * @brief get avoidance lateral margin based on road width.
  * @param object data.
  * @param planner data, which includes ego vehicle footprint info.
@@ -1217,6 +1251,13 @@ std::optional<double> getAvoidMargin(
   const ObjectData & object, const std::shared_ptr<const PlannerData> & planner_data,
   const std::shared_ptr<AvoidanceParameters> & parameters)
 {
+  // `narrow_lane` lanelet-tag escape hatch: a user-authored tag for lanelets too narrow for safe
+  // in-lane avoidance -- forces zero shift there, relying on obstacle_stop's dedicated
+  // narrow-lane margin instead (see autoware_motion_velocity_obstacle_stop_module).
+  if (isObjectPositionInNarrowLaneLanelet(object, planner_data)) {
+    return std::nullopt;
+  }
+
   const auto & vehicle_width = planner_data->parameters.vehicle_width;
   const auto object_type = utils::getHighestProbLabel(object.object.classification);
   const auto object_parameter = parameters->object_parameters.at(object_type);

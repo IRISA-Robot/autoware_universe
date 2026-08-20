@@ -22,6 +22,7 @@
 #include <autoware_utils/ros/parameter.hpp>
 #include <autoware_utils_rclcpp/parameter.hpp>
 
+#include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -64,6 +65,15 @@ struct ObstacleFilteringParam
   double min_lat_margin{};
   double max_lat_margin{};
   double lat_hysteresis_margin{};
+  // Dedicated margin applied instead of max_lat_margin when the obstacle sits inside a
+  // `narrow_lane`-tagged lanelet (see the obstacle_stop_module's narrow_lane escape hatch and
+  // the static_obstacle_avoidance module's isObjectPositionInNarrowLaneLanelet()).
+  double narrow_lane_margin{};
+
+  // Permissive coarse pre-filter: takes the larger of the two so this never makes the rough
+  // lateral-distance filter reject a candidate too early (mirrors
+  // LateralMarginParam::max_margin() in the obstacle_stop_module).
+  double rough_filter_margin() const { return std::max(max_lat_margin, narrow_lane_margin); }
 
   double max_lat_velocity{};
 
@@ -83,6 +93,18 @@ struct ObstacleFilteringParam
       node, "obstacle_slow_down.obstacle_filtering.max_lat_margin");
     lat_hysteresis_margin = get_or_declare_parameter<double>(
       node, "obstacle_slow_down.obstacle_filtering.lat_hysteresis_margin");
+
+    // NOTE: not yet exposed via the standard yaml key (a later tuning pass will add the real
+    // default value); use an explicit has_parameter/declare_parameter fallback instead of the
+    // throwing get_or_declare_parameter() so missing yaml doesn't abort startup.
+    {
+      const std::string narrow_lane_margin_key =
+        "obstacle_slow_down.obstacle_filtering.narrow_lane_margin";
+      narrow_lane_margin = node.has_parameter(narrow_lane_margin_key)
+                             ? node.get_parameter(narrow_lane_margin_key).as_double()
+                             : node.declare_parameter<double>(narrow_lane_margin_key, 0.0);
+    }
+
     max_lat_velocity = get_or_declare_parameter<double>(
       node, "obstacle_slow_down.obstacle_filtering.max_lat_velocity");
     successive_num_to_entry_slow_down_condition = get_or_declare_parameter<int>(

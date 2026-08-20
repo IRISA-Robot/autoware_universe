@@ -460,6 +460,74 @@ TEST(TestUtils, getAvoidMargin)
   }
 }
 
+TEST(TestUtils, getAvoidMarginNarrowLaneLanelet)
+{
+  const auto parameters = get_parameters();
+  const auto planner_data = get_planner_data();
+
+  // Build a small lanelet map with a single lanelet tagged `narrow_lane=yes`, straddling the
+  // object position used below.
+  lanelet::LineString3d left_bound_ls(lanelet::utils::getId());
+  left_bound_ls.push_back(lanelet::Point3d(lanelet::utils::getId(), 0.0, 1.75, 0.0));
+  left_bound_ls.push_back(lanelet::Point3d(lanelet::utils::getId(), 100.0, 1.75, 0.0));
+
+  lanelet::LineString3d right_bound_ls(lanelet::utils::getId());
+  right_bound_ls.push_back(lanelet::Point3d(lanelet::utils::getId(), 0.0, -1.75, 0.0));
+  right_bound_ls.push_back(lanelet::Point3d(lanelet::utils::getId(), 100.0, -1.75, 0.0));
+
+  lanelet::Lanelet narrow_lanelet(lanelet::utils::getId(), left_bound_ls, right_bound_ls);
+  narrow_lanelet.attributes()[lanelet::AttributeName::Subtype] =
+    lanelet::AttributeValueString::Road;
+  narrow_lanelet.attributes()["narrow_lane"] = "yes";
+
+  const auto map = std::make_shared<lanelet::LaneletMap>();
+  map->add(narrow_lanelet);
+
+  autoware_map_msgs::msg::LaneletMapBin map_bin_msg;
+  map_bin_msg.header.frame_id = "map";
+  lanelet::utils::conversion::toBinMsg(map, &map_bin_msg);
+
+  auto route_handler = std::make_shared<autoware::route_handler::RouteHandler>();
+  route_handler->setMap(map_bin_msg);
+  planner_data->route_handler = route_handler;
+
+  // object well inside the narrow_lane-tagged lanelet's polygon -> forced nullopt (no in-lane
+  // shift), regardless of otherwise-favorable road width.
+  {
+    ObjectData object_data;
+    object_data.is_parked = false;
+    object_data.distance_factor = 1.0;
+    object_data.to_road_shoulder_distance = 5.0;
+    object_data.object.classification.emplace_back(
+      autoware_perception_msgs::build<ObjectClassification>()
+        .label(ObjectClassification::TRUCK)
+        .probability(1.0));
+    object_data.object.kinematics.initial_pose_with_covariance.pose =
+      autoware::test_utils::createPose(50.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+
+    const auto output = filtering_utils::getAvoidMargin(object_data, planner_data, parameters);
+    EXPECT_FALSE(output.has_value());
+  }
+
+  // control case: object in a normal (untagged) location -> unaffected, behaves as before.
+  {
+    ObjectData object_data;
+    object_data.is_parked = false;
+    object_data.distance_factor = 1.0;
+    object_data.to_road_shoulder_distance = 5.0;
+    object_data.object.classification.emplace_back(
+      autoware_perception_msgs::build<ObjectClassification>()
+        .label(ObjectClassification::TRUCK)
+        .probability(1.0));
+    object_data.object.kinematics.initial_pose_with_covariance.pose =
+      autoware::test_utils::createPose(500.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+
+    const auto output = filtering_utils::getAvoidMargin(object_data, planner_data, parameters);
+    ASSERT_TRUE(output.has_value());
+    EXPECT_DOUBLE_EQ(output.value(), 1.9);
+  }
+}
+
 TEST(TestUtils, isAvoidanceOpportunityRunningOut)
 {
   // Keep front-constant-distance computation independent of PlannerData vehicle geometry, which

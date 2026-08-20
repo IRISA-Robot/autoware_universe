@@ -22,12 +22,19 @@
 #include <autoware/motion_utils/marker/virtual_wall_marker_creator.hpp>
 #include <autoware/motion_utils/resample/resample.hpp>
 #include <autoware/motion_utils/trajectory/trajectory.hpp>
+#include <autoware/route_handler/route_handler.hpp>
 #include <autoware/signal_processing/lowpass_filter_1d.hpp>
 #include <autoware_utils/geometry/geometry.hpp>
 #include <autoware_utils/ros/marker_helper.hpp>
 #include <autoware_utils/ros/parameter.hpp>
 #include <autoware_utils/ros/update_param.hpp>
 #include <autoware_utils/ros/uuid_helper.hpp>
+
+#include <boost/geometry/algorithms/disjoint.hpp>
+
+#include <lanelet2_core/geometry/BoundingBox.h>
+#include <lanelet2_core/geometry/Polygon.h>
+#include <lanelet2_core/primitives/BoundingBox.h>
 
 #include <algorithm>
 #include <iostream>
@@ -65,6 +72,33 @@ geometry_msgs::msg::Point to_geom_point(const autoware_utils::Point2d & point)
   geom_point.x = point.x();
   geom_point.y = point.y();
   return geom_point;
+}
+
+// `narrow_lane` lanelet-tag escape hatch (see the static_obstacle_avoidance module's
+// isObjectPositionInNarrowLaneLanelet() and the obstacle_stop_module's mirrored helper): objects
+// positioned inside a lanelet tagged `narrow_lane=yes` are excluded from in-lane avoidance
+// shifting there, relying on this module's dedicated narrow_lane_margin check instead.
+bool is_position_in_narrow_lane_lanelet(
+  const std::shared_ptr<route_handler::RouteHandler> & route_handler,
+  const geometry_msgs::msg::Point & position)
+{
+  if (!route_handler) return false;
+  const auto lanelet_map_ptr = route_handler->getLaneletMapPtr();
+  if (!lanelet_map_ptr) return false;
+
+  const lanelet::BasicPoint2d point(position.x, position.y);
+  constexpr double search_margin = 0.1;
+  const lanelet::BoundingBox2d bbox(
+    lanelet::BasicPoint2d(position.x - search_margin, position.y - search_margin),
+    lanelet::BasicPoint2d(position.x + search_margin, position.y + search_margin));
+  for (const auto & ll : lanelet_map_ptr->laneletLayer.search(bbox)) {
+    if (
+      ll.attributeOr("narrow_lane", false) &&
+      !boost::geometry::disjoint(point, ll.polygon2d().basicPolygon())) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // TODO(murooka) following two functions are copied from behavior_velocity_planner.
@@ -224,7 +258,8 @@ std::vector<autoware::motion_velocity_planner::SlowDownPointData>
 ObstacleSlowDownModule::convert_point_cloud_to_slow_down_points(
   const PlannerData::Pointcloud & pointcloud, const std::vector<TrajectoryPoint> & traj_points,
   const std::vector<Polygon2d> & decimated_traj_polys_with_lat_margin,
-  const VehicleInfo & vehicle_info, const size_t ego_idx, const bool is_driving_forward)
+  const VehicleInfo & vehicle_info, const size_t ego_idx, const bool is_driving_forward,
+  const std::shared_ptr<route_handler::RouteHandler> & route_handler)
 {
   if (pointcloud.pointcloud.empty()) {
     return {};
@@ -259,8 +294,23 @@ ObstacleSlowDownModule::convert_point_cloud_to_slow_down_points(
       const auto min_lat_dist_to_traj_poly =
         std::abs(current_lat_dist_from_obstacle_to_traj) - vehicle_info.max_longitudinal_offset_m;
       // The trajectory polygon is ignored if the minimum lateral distance is more than maximum
-      // lateral margin
-      if (min_lat_dist_to_traj_poly >= p.max_lat_margin) {
+      // lateral margin. If the point sits inside a `narrow_lane`-tagged lanelet, apply
+      // narrow_lane_margin instead of the nominal max_lat_margin (see the obstacle_stop_module's
+      // narrow_lane escape hatch).
+      const bool is_obstacle_in_narrow_lane =
+        is_position_in_narrow_lane_lanelet(route_handler, obstacle_point);
+      RCLCPP_WARN_THROTTLE(
+        logger_, *clock_, 1000, "[NARROW-DEBUG] pointcloud is_obstacle_in_narrow_lane=%d",
+        is_obstacle_in_narrow_lane);
+      const double effective_max_lat_margin =
+        is_obstacle_in_narrow_lane ? p.narrow_lane_margin : p.max_lat_margin;
+      if (is_obstacle_in_narrow_lane) {
+        RCLCPP_WARN_THROTTLE(
+          logger_, *clock_, 1000,
+          "[SlowDown] pointcloud obstacle in narrow_lane lanelet: applying margin %2.2f",
+          p.narrow_lane_margin);
+      }
+      if (min_lat_dist_to_traj_poly >= effective_max_lat_margin) {
         continue;
       }
 
@@ -333,13 +383,13 @@ VelocityPlanningResult ObstacleSlowDownModule::plan(
     planner_data->ego_nearest_yaw_threshold, decimated_traj_polys_with_lat_margin,
     raw_trajectory_points, planner_data->objects,
     rclcpp::Time(planner_data->predicted_objects_header.stamp), planner_data->vehicle_info_,
-    planner_data->trajectory_polygon_collision_check);
+    planner_data->trajectory_polygon_collision_check, planner_data->route_handler);
 
   auto slow_down_obstacles_for_point_cloud = filter_slow_down_obstacle_for_point_cloud(
     raw_trajectory_points, decimated_traj_polys_with_lat_margin, planner_data->no_ground_pointcloud,
     planner_data->vehicle_info_,
     planner_data->find_index(raw_trajectory_points, planner_data->current_odometry.pose.pose),
-    planner_data->is_driving_forward);
+    planner_data->is_driving_forward, planner_data->route_handler);
 
   const auto slow_down_obstacles = autoware::motion_velocity_planner::utils::concat_vectors(
     std::move(slow_down_obstacles_for_predicted_object),
@@ -380,7 +430,8 @@ ObstacleSlowDownModule::filter_slow_down_obstacle_for_predicted_object(
   const std::vector<TrajectoryPoint> & traj_points,
   const std::vector<std::shared_ptr<PlannerData::Object>> & objects,
   const rclcpp::Time & predicted_objects_stamp, const VehicleInfo & vehicle_info,
-  const TrajectoryPolygonCollisionCheck & trajectory_polygon_collision_check)
+  const TrajectoryPolygonCollisionCheck & trajectory_polygon_collision_check,
+  const std::shared_ptr<route_handler::RouteHandler> & route_handler)
 {
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
 
@@ -399,9 +450,11 @@ ObstacleSlowDownModule::filter_slow_down_obstacle_for_predicted_object(
     }
 
     // 1.2. Check if the rough lateral distance is smaller than the threshold.
+    // NOTE: use the permissive rough_filter_margin() (max of max_lat_margin/narrow_lane_margin)
+    // so this coarse pre-filter never rejects a narrow_lane candidate too early.
     const double min_lat_dist_to_traj_poly =
       utils::calc_possible_min_dist_from_obj_to_traj_poly(object, traj_points, vehicle_info);
-    if (obstacle_filtering_param_.max_lat_margin < min_lat_dist_to_traj_poly) {
+    if (obstacle_filtering_param_.rough_filter_margin() < min_lat_dist_to_traj_poly) {
       continue;
     }
 
@@ -415,7 +468,7 @@ ObstacleSlowDownModule::filter_slow_down_obstacle_for_predicted_object(
       utils::calc_dist_to_traj_poly(object->predicted_object, traj_polys_for_lat_dist);
     const auto slow_down_obstacle = create_slow_down_obstacle_for_predicted_object(
       traj_points, decimated_traj_polys_with_lat_margin, object, predicted_objects_stamp,
-      dist_from_obj_poly_to_traj_poly);
+      dist_from_obj_poly_to_traj_poly, route_handler);
     if (slow_down_obstacle) {
       slow_down_obstacles.push_back(*slow_down_obstacle);
       continue;
@@ -434,7 +487,8 @@ std::vector<SlowDownObstacle> ObstacleSlowDownModule::filter_slow_down_obstacle_
   const std::vector<TrajectoryPoint> & traj_points,
   const std::vector<Polygon2d> & decimated_traj_polys_with_lat_margin,
   const PlannerData::Pointcloud & point_cloud, const VehicleInfo & vehicle_info, size_t ego_idx,
-  const bool is_driving_forward)
+  const bool is_driving_forward,
+  const std::shared_ptr<route_handler::RouteHandler> & route_handler)
 {
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
 
@@ -457,7 +511,7 @@ std::vector<SlowDownObstacle> ObstacleSlowDownModule::filter_slow_down_obstacle_
   const std::vector<autoware::motion_velocity_planner::SlowDownPointData> slow_down_points_data =
     convert_point_cloud_to_slow_down_points(
       point_cloud, traj_points, decimated_traj_polys_with_lat_margin, vehicle_info, ego_idx,
-      is_driving_forward);
+      is_driving_forward, route_handler);
 
   // slow down
   std::vector<SlowDownObstacle> slow_down_obstacles;
@@ -488,7 +542,8 @@ ObstacleSlowDownModule::create_slow_down_obstacle_for_predicted_object(
   const std::vector<TrajectoryPoint> & traj_points,
   const std::vector<Polygon2d> & decimated_traj_polys_with_lat_margin,
   const std::shared_ptr<PlannerData::Object> object, const rclcpp::Time & predicted_objects_stamp,
-  const double dist_from_obj_poly_to_traj_poly)
+  const double dist_from_obj_poly_to_traj_poly,
+  const std::shared_ptr<route_handler::RouteHandler> & route_handler)
 {
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
 
@@ -498,6 +553,22 @@ ObstacleSlowDownModule::create_slow_down_obstacle_for_predicted_object(
   const auto & obj_uuid_str = autoware_utils::to_hex_string(obj_uuid);
   const auto & obj_label = object->predicted_object.classification.at(0).label;
   slow_down_condition_counter_.add_current_uuid(obj_uuid);
+
+  const auto & obj_pose =
+    object->get_predicted_current_pose(clock_->now(), predicted_objects_stamp);
+  const bool is_obstacle_in_narrow_lane =
+    is_position_in_narrow_lane_lanelet(route_handler, obj_pose.position);
+  RCLCPP_WARN_THROTTLE(
+    logger_, *clock_, 1000, "[NARROW-DEBUG] obstacle (%s) is_obstacle_in_narrow_lane=%d",
+    obj_uuid_str.substr(0, 4).c_str(), is_obstacle_in_narrow_lane);
+  if (is_obstacle_in_narrow_lane) {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000,
+      "[SlowDown] obstacle (%s) in narrow_lane lanelet: applying margin %2.2f",
+      obj_uuid_str.substr(0, 4).c_str(), p.narrow_lane_margin);
+  }
+  const double effective_max_lat_margin =
+    is_obstacle_in_narrow_lane ? p.narrow_lane_margin : p.max_lat_margin;
 
   const bool is_prev_obstacle_slow_down =
     utils::get_obstacle_from_uuid(prev_slow_down_object_obstacles_, obj_uuid).has_value();
@@ -550,8 +621,8 @@ ObstacleSlowDownModule::create_slow_down_obstacle_for_predicted_object(
   // check lateral distance considering hysteresis
   const bool is_lat_dist_low = is_lower_considering_hysteresis(
     dist_from_obj_poly_to_traj_poly, is_prev_obstacle_slow_down,
-    p.max_lat_margin + p.lat_hysteresis_margin / 2.0,
-    p.max_lat_margin - p.lat_hysteresis_margin / 2.0);
+    effective_max_lat_margin + p.lat_hysteresis_margin / 2.0,
+    effective_max_lat_margin - p.lat_hysteresis_margin / 2.0);
   const bool is_lat_vel_low =
     std::abs(object->get_lat_vel_relative_to_traj(traj_points)) < p.max_lat_velocity;
   const bool is_slow_down_condition_met = is_lat_dist_low && is_lat_vel_low;
