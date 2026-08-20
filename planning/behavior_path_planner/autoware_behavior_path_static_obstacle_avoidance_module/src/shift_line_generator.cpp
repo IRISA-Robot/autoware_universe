@@ -597,8 +597,24 @@ void ShiftLineGenerator::generateTotalShiftLine(
 
   // Merge shift length of opposite directions.
   for (size_t i = 0; i < N; ++i) {
-    sl.shift_line.at(i) = sl.pos_shift_line.at(i) + sl.neg_shift_line.at(i);
-    sl.shift_line_grad.at(i) = sl.pos_shift_line_grad.at(i) + sl.neg_shift_line_grad.at(i);
+    const auto pos = sl.pos_shift_line.at(i);
+    const auto neg = sl.neg_shift_line.at(i);
+
+    if (pos > 0.0 && neg < 0.0) {
+      // Both a right-side and a left-side avoidance requirement are simultaneously active at this
+      // path index (e.g. two objects on opposite sides of the TRUE lane with longitudinally
+      // overlapping AvoidLines -- see applyJointLateralFeasibility() in utils.cpp, which already
+      // guarantees a single feasible shift value exists whenever both are non-nullopt). `pos` and
+      // `neg` were each computed independently as if the OTHER side offered unlimited room, so
+      // literal addition (pos + neg) always undershoots BOTH constraints at once (pos + neg < pos
+      // and pos + neg > neg whenever pos > 0 > neg). Average them instead, splitting the
+      // remaining slack evenly between the two objects.
+      sl.shift_line.at(i) = 0.5 * (pos + neg);
+      sl.shift_line_grad.at(i) = 0.5 * (sl.pos_shift_line_grad.at(i) + sl.neg_shift_line_grad.at(i));
+    } else {
+      sl.shift_line.at(i) = pos + neg;
+      sl.shift_line_grad.at(i) = sl.pos_shift_line_grad.at(i) + sl.neg_shift_line_grad.at(i);
+    }
   }
 
   // overwrite shift with current_ego_shift until ego pose.

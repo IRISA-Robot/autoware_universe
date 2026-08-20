@@ -1331,6 +1331,71 @@ double getRoadShoulderDistance(
 
   return std::get<0>(intersects.front());
 }
+
+/**
+ * @brief tighten to_road_shoulder_distance for pairs of avoidance-target objects that stand on
+ * opposite sides of the TRUE lane with longitudinally-overlapping footprints, so a single ego
+ * shift value has to satisfy both simultaneously. getAvoidMargin()/getRoadShoulderDistance() only
+ * ever check each object's own distance to the true lane boundary -- never against a second
+ * object standing in the way on the far side -- so without this pass, two such objects can each
+ * report a healthy individual avoid_margin while the actual gap between them is far too tight for
+ * both to be avoided at once.
+ * @param target_objects avoidance-target objects (mutated in place).
+ * @param planner_data planner data, used only to keep the signature consistent with sibling
+ * functions in this namespace (not currently referenced in the body).
+ * @param parameters avoidance parameters, for per-class lateral_hard_margin lookups.
+ */
+void applyJointLateralFeasibility(
+  ObjectDataArray & target_objects, const std::shared_ptr<const PlannerData> & planner_data,
+  const std::shared_ptr<AvoidanceParameters> & parameters)
+{
+  const auto lateral_hard_margin_of = [&](const ObjectData & o) {
+    const auto object_type = utils::getHighestProbLabel(o.object.classification);
+    const auto & object_parameter = parameters->object_parameters.at(object_type);
+    return o.is_parked ? object_parameter.lateral_hard_margin_for_parked_vehicle
+                        : object_parameter.lateral_hard_margin;
+  };
+
+  const auto longitudinal_overlap = [](const ObjectData & a, const ObjectData & b) {
+    const auto a_min = a.longitudinal - 0.5 * a.length;
+    const auto a_max = a.longitudinal + 0.5 * a.length;
+    const auto b_min = b.longitudinal - 0.5 * b.length;
+    const auto b_max = b.longitudinal + 0.5 * b.length;
+    return a_min <= b_max && b_min <= a_max;
+  };
+
+  for (size_t i = 0; i < target_objects.size(); ++i) {
+    for (size_t j = i + 1; j < target_objects.size(); ++j) {
+      auto & o_i = target_objects.at(i);
+      auto & o_j = target_objects.at(j);
+
+      // Only a genuine simultaneous squeeze needs joint handling: opposite sides of the TRUE
+      // lane, with longitudinally-overlapping footprints (so a single ego shift value has to
+      // satisfy both at the same path index).
+      if (o_i.is_on_right_of_true_lane == o_j.is_on_right_of_true_lane) continue;
+      if (!longitudinal_overlap(o_i, o_j)) continue;
+
+      // Real physical gap between the two obstacles' footprints -- independent of, and
+      // possibly much tighter than, the true lane bound each object's to_road_shoulder_distance
+      // was individually measured against.
+      const auto gap = boost::geometry::distance(o_i.envelope_poly, o_j.envelope_poly);
+
+      const auto hard_margin_i = lateral_hard_margin_of(o_i);
+      const auto hard_margin_j = lateral_hard_margin_of(o_j);
+
+      // Reserve the OTHER object's own hard margin out of the raw gap, then feed the remainder
+      // into to_road_shoulder_distance exactly like a to-bound distance (which itself only ever
+      // reserved hard_drivable_bound_margin on the far side). This lets getAvoidMargin()'s
+      // existing Step1/2/3 tiering do all the remaining work unmodified -- including correctly
+      // returning nullopt (-> ObjectInfo::INSUFFICIENT_DRIVABLE_SPACE downstream) when the pair
+      // is genuinely infeasible.
+      o_i.to_road_shoulder_distance =
+        std::min(o_i.to_road_shoulder_distance, gap - hard_margin_j);
+      o_j.to_road_shoulder_distance =
+        std::min(o_j.to_road_shoulder_distance, gap - hard_margin_i);
+    }
+  }
+}
 }  // namespace filtering_utils
 
 bool isOnRight(const ObjectData & obj)
@@ -2247,6 +2312,11 @@ void updateRoadShoulderDistance(
   for (auto & o : data.target_objects) {
     o.to_road_shoulder_distance = filtering_utils::getRoadShoulderDistance(o, data, planner_data);
     o.is_on_right_of_true_lane = filtering_utils::getDistanceToCenterline(o, data) <= 0.0;
+  }
+
+  filtering_utils::applyJointLateralFeasibility(data.target_objects, planner_data, parameters);
+
+  for (auto & o : data.target_objects) {
     o.avoid_margin = filtering_utils::getAvoidMargin(o, planner_data, parameters);
   }
 }

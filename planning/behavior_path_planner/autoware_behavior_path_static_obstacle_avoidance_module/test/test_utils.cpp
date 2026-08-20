@@ -2319,4 +2319,156 @@ TEST(TestUtils, isNoNeedAvoidanceBehaviorTrueLaneRelativeShiftLength)
     EXPECT_EQ(object_data.info, ObjectInfo::ENOUGH_LATERAL_DISTANCE);
   }
 }
+
+// Two avoidance-target objects on opposite sides of the TRUE lane, with longitudinally
+// overlapping footprints, force a single ego shift value to satisfy both constraints
+// simultaneously. getAvoidMargin()/getRoadShoulderDistance() alone only ever check each object's
+// own distance to the true lane boundary, so without applyJointLateralFeasibility() two such
+// objects could each report a healthy individual avoid_margin even when the real gap between them
+// is too tight for both to be avoided at once. These tests build the two objects' envelope_poly
+// directly as simple rectangles separated along the lateral (y) axis so the physical gap between
+// them is known exactly, then exercise applyJointLateralFeasibility() + getAvoidMargin().
+namespace
+{
+// TRUCK: lateral_hard_margin = 0.2 (non-parked), vehicle_width (get_planner_data()) = 2.0,
+// hard_drivable_bound_margin = 0.1, soft_drivable_bound_margin = 0.5 (see get_parameters()).
+ObjectData make_joint_feasibility_object(
+  const bool is_on_right, const double y_min, const double y_max, const double longitudinal,
+  const double length, const double original_to_road_shoulder_distance)
+{
+  ObjectData object_data;
+  object_data.object.classification.emplace_back(
+    autoware_perception_msgs::build<ObjectClassification>()
+      .label(ObjectClassification::TRUCK)
+      .probability(1.0));
+  object_data.is_parked = false;
+  object_data.distance_factor = 1.0;
+  object_data.is_on_right_of_true_lane = is_on_right;
+  object_data.longitudinal = longitudinal;
+  object_data.length = length;
+  object_data.to_road_shoulder_distance = original_to_road_shoulder_distance;
+
+  object_data.envelope_poly.outer() = {
+    Point2d{0.0, y_min}, Point2d{4.0, y_min}, Point2d{4.0, y_max}, Point2d{0.0, y_max},
+    Point2d{0.0, y_min}};
+
+  return object_data;
+}
+}  // namespace
+
+TEST(TestUtils, applyJointLateralFeasibilityFeasibleSqueezeTightensMargin)
+{
+  const auto parameters = get_parameters();
+  const auto planner_data = get_planner_data();
+
+  // Untouched (single-object) baseline: what getAvoidMargin() would report from each object's
+  // original, far-bound-relative to_road_shoulder_distance alone.
+  constexpr double original_distance = 10.0;
+  const auto baseline =
+    filtering_utils::getAvoidMargin(
+      make_joint_feasibility_object(true, -3.6, -1.6, 2.0, 4.0, original_distance), planner_data,
+      parameters)
+      .value();
+
+  // Rectangles separated by a 3.2 m lateral gap (closest edges at y = -1.6 and y = +1.6),
+  // longitudinally overlapping ([0, 4] for both).
+  ObjectDataArray objects{
+    make_joint_feasibility_object(true, -3.6, -1.6, 2.0, 4.0, original_distance),
+    make_joint_feasibility_object(false, 1.6, 3.6, 2.0, 4.0, original_distance)};
+
+  filtering_utils::applyJointLateralFeasibility(objects, planner_data, parameters);
+
+  // Both to_road_shoulder_distance values must have been tightened down from the untouched
+  // far-bound distance to (gap - other object's hard margin) = 3.2 - 0.2 = 3.0.
+  EXPECT_LT(objects.at(0).to_road_shoulder_distance, original_distance);
+  EXPECT_LT(objects.at(1).to_road_shoulder_distance, original_distance);
+  EXPECT_DOUBLE_EQ(objects.at(0).to_road_shoulder_distance, 3.0);
+  EXPECT_DOUBLE_EQ(objects.at(1).to_road_shoulder_distance, 3.0);
+
+  const auto margin_0 = filtering_utils::getAvoidMargin(objects.at(0), planner_data, parameters);
+  const auto margin_1 = filtering_utils::getAvoidMargin(objects.at(1), planner_data, parameters);
+
+  ASSERT_TRUE(margin_0.has_value());
+  ASSERT_TRUE(margin_1.has_value());
+  EXPECT_LT(margin_0.value(), baseline);
+  EXPECT_LT(margin_1.value(), baseline);
+}
+
+TEST(TestUtils, applyJointLateralFeasibilityInfeasibleSqueezeReturnsNullopt)
+{
+  const auto parameters = get_parameters();
+  const auto planner_data = get_planner_data();
+
+  // Rectangles separated by only a 2.0 m lateral gap (closest edges at y = -1.0 and y = +1.0) --
+  // below the feasibility threshold for two TRUCK objects with vehicle_width = 2.0.
+  ObjectDataArray objects{
+    make_joint_feasibility_object(true, -3.0, -1.0, 2.0, 4.0, 10.0),
+    make_joint_feasibility_object(false, 1.0, 3.0, 2.0, 4.0, 10.0)};
+
+  filtering_utils::applyJointLateralFeasibility(objects, planner_data, parameters);
+
+  EXPECT_FALSE(filtering_utils::getAvoidMargin(objects.at(0), planner_data, parameters).has_value());
+  EXPECT_FALSE(filtering_utils::getAvoidMargin(objects.at(1), planner_data, parameters).has_value());
+}
+
+TEST(TestUtils, applyJointLateralFeasibilityNoOpForSingleObject)
+{
+  const auto parameters = get_parameters();
+  const auto planner_data = get_planner_data();
+
+  constexpr double original_distance = 10.0;
+  ObjectDataArray objects{
+    make_joint_feasibility_object(true, -3.6, -1.6, 2.0, 4.0, original_distance)};
+
+  const auto expected_margin =
+    filtering_utils::getAvoidMargin(objects.at(0), planner_data, parameters);
+
+  filtering_utils::applyJointLateralFeasibility(objects, planner_data, parameters);
+
+  EXPECT_DOUBLE_EQ(objects.at(0).to_road_shoulder_distance, original_distance);
+  const auto actual_margin =
+    filtering_utils::getAvoidMargin(objects.at(0), planner_data, parameters);
+  ASSERT_EQ(expected_margin.has_value(), actual_margin.has_value());
+  if (expected_margin.has_value()) {
+    EXPECT_DOUBLE_EQ(expected_margin.value(), actual_margin.value());
+  }
+}
+
+TEST(TestUtils, applyJointLateralFeasibilityNoOpForSameSideObjects)
+{
+  const auto parameters = get_parameters();
+  const auto planner_data = get_planner_data();
+
+  constexpr double original_distance = 10.0;
+  // Same side (both is_on_right_of_true_lane == true), even though longitudinally overlapping and
+  // laterally close -- must be left untouched, since a same-side pair isn't a simultaneous
+  // opposite-side squeeze.
+  ObjectDataArray objects{
+    make_joint_feasibility_object(true, -3.6, -1.6, 2.0, 4.0, original_distance),
+    make_joint_feasibility_object(true, -1.4, 0.6, 2.0, 4.0, original_distance)};
+
+  filtering_utils::applyJointLateralFeasibility(objects, planner_data, parameters);
+
+  EXPECT_DOUBLE_EQ(objects.at(0).to_road_shoulder_distance, original_distance);
+  EXPECT_DOUBLE_EQ(objects.at(1).to_road_shoulder_distance, original_distance);
+}
+
+TEST(TestUtils, applyJointLateralFeasibilityNoOpForNonOverlappingLongitudinalRange)
+{
+  const auto parameters = get_parameters();
+  const auto planner_data = get_planner_data();
+
+  constexpr double original_distance = 10.0;
+  // Opposite sides, close laterally, but far apart longitudinally (ranges [-1, 1] and [19, 21] do
+  // not overlap) -- a single ego shift value never has to satisfy both at once, so must be left
+  // untouched.
+  ObjectDataArray objects{
+    make_joint_feasibility_object(true, -3.0, -1.0, 0.0, 2.0, original_distance),
+    make_joint_feasibility_object(false, 1.0, 3.0, 20.0, 2.0, original_distance)};
+
+  filtering_utils::applyJointLateralFeasibility(objects, planner_data, parameters);
+
+  EXPECT_DOUBLE_EQ(objects.at(0).to_road_shoulder_distance, original_distance);
+  EXPECT_DOUBLE_EQ(objects.at(1).to_road_shoulder_distance, original_distance);
+}
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
