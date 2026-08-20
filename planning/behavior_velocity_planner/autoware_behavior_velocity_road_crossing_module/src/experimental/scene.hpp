@@ -47,6 +47,10 @@ public:
     double stop_arrival_threshold{0.2};
     double stop_state_speed{0.05};
     double sustained_clear_sec{1.5};
+    // Plain-GO / bypass path bounded timeout (mirrors green_block_timeout_sec below, but
+    // for the non-signalized / bypass GO path): after this many seconds stuck `blocked`
+    // in CHECKING, force CHECKING → CROSSING anyway so a stale/false-positive block can't
+    // deadlock the module forever. Also still used as the WARN_THROTTLE threshold.
     double timeout_sec{30.0};
 
     // Prediction check
@@ -133,6 +137,12 @@ private:
   // GO_GREEN bounded-timeout: timestamp when robot first got blocked while gate==GO_GREEN.
   // Reset when gate is no longer GO_GREEN, when clear, or when entering CROSSING/STOPPING.
   std::optional<rclcpp::Time> green_blocked_since_;
+  // Plain-GO bounded-timeout (mirrors green_blocked_since_ above): timestamp when robot
+  // first got blocked on the plain-GO / bypass path (require_fsm_gate=false, GO, or
+  // disable_tf_light_check bypass/timeout). Reset when gate enters GO_GREEN, when clear,
+  // or when entering CROSSING/STOPPING. Prevents an indefinite deadlock if `blocked` gets
+  // stuck true (e.g. stale/false-positive predicted-object block) with no real obstacle.
+  std::optional<rclcpp::Time> go_blocked_since_;
   bool was_inside_polygon_{false};  // CROSSING exit detection: ever entered polygon?
   DebugData debug_data_;
 

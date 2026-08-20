@@ -13,6 +13,7 @@
 #include <autoware/trajectory/utils/closest.hpp>
 #include <autoware/trajectory/utils/crossed.hpp>
 #include <autoware_utils/geometry/geometry.hpp>
+#include <autoware_utils/ros/marker_helper.hpp>
 
 #include <autoware_perception_msgs/msg/object_classification.hpp>
 #include <autoware_perception_msgs/msg/predicted_objects.hpp>
@@ -293,6 +294,7 @@ void RoadCrossingModule::updateState(
       } else if (distance_to_stop_point < planner_param_.stop_distance_threshold) {
         state_ = State::STOPPING;
         green_blocked_since_.reset();
+        go_blocked_since_.reset();
         RCLCPP_INFO(
           logger_, "RoadCrossing %ld: APPROACHING → STOPPING (dist %.2f m)",
           getModuleId(), distance_to_stop_point);
@@ -307,6 +309,7 @@ void RoadCrossingModule::updateState(
         stopped_at_ = now;
         clear_since_.reset();
         green_blocked_since_.reset();
+        go_blocked_since_.reset();
         RCLCPP_INFO(
           logger_, "RoadCrossing %ld: STOPPING → CHECKING (arrived, ego stopped)",
           getModuleId());
@@ -358,6 +361,8 @@ void RoadCrossingModule::updateState(
       // does NOT enter this branch — those fall through to the sustained-clear logic below.
       if (planner_param_.require_fsm_gate &&
           current_gate == autoware_road_crossing_msgs::msg::RoadCrossingGate::GO_GREEN) {
+        // Plain-GO stale timer has no meaning on this path — reset it.
+        go_blocked_since_.reset();
         if (!blocked) {
           // Path is clear — cross immediately. Reset stale timer.
           green_blocked_since_.reset();
@@ -394,13 +399,28 @@ void RoadCrossingModule::updateState(
 
       if (blocked) {
         clear_since_.reset();
-        if (stopped_at_ && (now - *stopped_at_).seconds() > planner_param_.timeout_sec) {
+        // Bounded-timeout override (mirrors the GO_GREEN branch above): start (or continue)
+        // the clock the moment `blocked` first becomes true on this path. If it never clears
+        // for timeout_sec, force CHECKING → CROSSING anyway rather than deadlocking forever —
+        // this guards against a stale/false-positive predicted-object block with no real
+        // obstacle actually present (confirmed live: this path previously had no escape hatch).
+        if (!go_blocked_since_) go_blocked_since_ = now;
+        const double waited = (now - *go_blocked_since_).seconds();
+        if (waited >= planner_param_.timeout_sec) {
+          state_ = State::CROSSING;
+          RCLCPP_WARN(
+            logger_,
+            "RoadCrossing %ld: BLOCKED %.1fs >= timeout %.1fs on plain-GO path → "
+            "CROSSING anyway (timeout-forced, not a normal clear)",
+            getModuleId(), waited, planner_param_.timeout_sec);
+        } else {
           RCLCPP_WARN_THROTTLE(
             logger_, *clock_, 5000,
-            "RoadCrossing %ld: BLOCKED for >%.1f s — vehicle predictions still cross",
-            getModuleId(), planner_param_.timeout_sec);
+            "RoadCrossing %ld: BLOCKED for %.1f/%.1f s — vehicle predictions still cross",
+            getModuleId(), waited, planner_param_.timeout_sec);
         }
       } else {
+        go_blocked_since_.reset();
         if (!clear_since_) clear_since_ = now;
         const double clear_elapsed = (now - *clear_since_).seconds();
         if (clear_elapsed >= planner_param_.sustained_clear_sec) {
@@ -538,7 +558,31 @@ bool RoadCrossingModule::modifyPathVelocity(
 
 visualization_msgs::msg::MarkerArray RoadCrossingModule::createDebugMarkerArray()
 {
-  return visualization_msgs::msg::MarkerArray{};
+  visualization_msgs::msg::MarkerArray msg;
+
+  // No stop pose cached yet (e.g. still APPROACHING) — nothing useful to anchor a marker to.
+  if (!debug_data_.stop_pose) {
+    return msg;
+  }
+
+  static const char * kStateNames[] = {"APPROACHING", "STOPPING", "CHECKING", "CROSSING", "DONE"};
+  const auto state_idx = static_cast<size_t>(debug_data_.current_state);
+  const char * state_name =
+    state_idx < std::size(kStateNames) ? kStateNames[state_idx] : "UNKNOWN";
+
+  auto marker = autoware_utils::create_default_marker(
+    "map", clock_->now(), "road_crossing_state", static_cast<int32_t>(getModuleId()),
+    visualization_msgs::msg::Marker::TEXT_VIEW_FACING,
+    autoware_utils::create_marker_scale(0.0, 0.0, 1.0),
+    debug_data_.last_check_blocked ? autoware_utils::create_marker_color(1.0, 0.2, 0.2, 0.999)
+                                    : autoware_utils::create_marker_color(0.2, 1.0, 0.2, 0.999));
+  marker.pose = *debug_data_.stop_pose;
+  marker.pose.position.z += 2.0;
+  marker.text = "road_crossing[" + std::to_string(getModuleId()) + "]: " +
+                std::string(state_name) + (debug_data_.last_check_blocked ? " BLOCKED" : " clear");
+  msg.markers.push_back(marker);
+
+  return msg;
 }
 
 autoware::motion_utils::VirtualWalls RoadCrossingModule::createVirtualWalls()
