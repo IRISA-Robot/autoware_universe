@@ -469,6 +469,14 @@ private:
   // Returns -1.0 if active_pre_id_ is nullopt or map is not ready.
   double distanceToPreEntry() const;
 
+  // Shared implementation for distanceToCrossingEntry()/distanceToPreEntry():
+  // arc-length-along-centerline distance from ego to the lanelet's entry point,
+  // consistent with how autoware_behavior_velocity_road_crossing_module's
+  // scene.cpp measures the stop point (arc-length ahead of ego on the planned
+  // path), rather than plain Euclidean distance to a fixed vertex.
+  // Returns -1.0 on failure (no id, no odom, map not ready, lookup error).
+  double arcLengthDistanceToLaneletEntry(const std::optional<lanelet::Id> & id) const;
+
   // True if ego is past the exit of active_crossing_id_.
   bool egoPastCrossingExit() const;
 

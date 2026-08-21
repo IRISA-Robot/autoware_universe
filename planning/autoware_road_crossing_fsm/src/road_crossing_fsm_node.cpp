@@ -1721,52 +1721,100 @@ bool RoadCrossingFsmNode::crossingHasTag(const std::string & key) const
   return check(active_crossing_id_) || check(active_pre_id_);
 }
 
-double RoadCrossingFsmNode::distanceToCrossingEntry() const
+// ---------------------------------------------------------------------------
+// Arrival-gate distance: durable fix for the geometry mismatch that wedged
+// fsm_state=1 (ARMED_CROSSWALK) indefinitely (see param-bump commits
+// 97ffe21b6 / f8cb84d for the stopgap this supersedes).
+//
+// Root cause: this function used to return the plain 2D EUCLIDEAN distance
+// from ego's odom position to a fixed centerline vertex (cl.front()/back()).
+// autoware_behavior_velocity_road_crossing_module's scene.cpp — the node that
+// actually places the stop pose — instead works purely in ARC-LENGTH ALONG
+// THE PLANNED PATH: stop_s = raw_entry_s - (leading_edge_offset + margin),
+// with raw_entry_s the arc-length of the first path point covered by the
+// crossing lanelet's polygon (see scene.cpp findEgoAndStopPoint()). That
+// distance has NO lateral component. Euclidean-to-vertex does, so any lateral
+// offset between ego's actual (stopped) pose and the raw centerline vertex —
+// lane curvature, resampling, EKF noise, replanned/shifted trajectory — was
+// added straight into the "have I arrived" measurement, on top of whatever
+// margin scene.cpp already stopped short by. That is what left
+// distanceToPreEntry() reporting >3.0 m while the robot sat stopped at its
+// actual stop line.
+//
+// Fix: measure progress the same way scene.cpp does — along-track only.
+//
+// Design choice (duplicate the arc-length calc vs. subscribe to scene.cpp's
+// internal quantity): scene.cpp's raw_entry_s/stop_s are computed against the
+// resampled PathWithLaneId/Trajectory owned by behavior_velocity_planner,
+// which this node has no access to (and should not — it would add a topic
+// coupling between two independently-composable planning nodes, and the
+// scene module is dynamically created/destroyed per-episode, see
+// scene-modules-no-subscriptions policy). Instead we duplicate the
+// arc-length idea directly against the lanelet's own centerline via
+// lanelet::geometry::toArcCoordinates(), which is what the path is resampled
+// from in the first place — so the two should stay within a few tens of cm
+// of each other outside of sharp corner-cutting. This keeps the FSM
+// self-contained (map + route + odom only, its existing dependency set) and
+// avoids reinventing a full path-following arc-length machinery for a
+// coarse arrival gate that only needs meter-scale accuracy.
+//
+// Caveat: because we project onto the RAW lanelet centerline instead of the
+// smoothed/optimized path, this can still diverge from scene.cpp's exact
+// stop_s at sharp turns or where the optimizer shifts the path noticeably
+// off the centerline (e.g. avoidance shift, obstacle-triggered lateral
+// offset). In those edge cases this distance is still an along-track
+// approximation, not an exact duplicate — but it is no longer contaminated
+// by ego's lateral offset in the way Euclidean-to-vertex was, which was the
+// actual failure mode observed.
+double RoadCrossingFsmNode::arcLengthDistanceToLaneletEntry(
+  const std::optional<lanelet::Id> & id) const
 {
-  if (!active_crossing_id_ || !last_odom_) return -1.0;
+  if (!id || !last_odom_) return -1.0;
   if (!map_initialized_) return -1.0;
 
   try {
-    const auto llt =
-      route_handler_.getLaneletMapPtr()->laneletLayer.get(*active_crossing_id_);
-    const auto & cl = llt.centerline2d().basicLineString();
-    if (cl.empty()) return -1.0;
+    const auto llt = route_handler_.getLaneletMapPtr()->laneletLayer.get(*id);
+    const auto centerline_2d = llt.centerline2d();
+    if (centerline_2d.size() < 2) return -1.0;
+
+    const double total_length =
+      static_cast<double>(boost::geometry::length(centerline_2d.basicLineString()));
 
     const auto & ego_pos = last_odom_->pose.pose.position;
     const lanelet::BasicPoint2d ego2d{ego_pos.x, ego_pos.y};
-    // Entry is the endpoint ego actually arrives at first: front() when driving
-    // forward (lanelet centerline direction matches travel direction), back()
-    // when reversing through this lanelet.
-    const auto & entry_pt = is_driving_forward_ ? cl.front() : cl.back();
-    const lanelet::BasicPoint2d entry{entry_pt.x(), entry_pt.y()};
 
-    return boost::geometry::distance(ego2d, entry);
+    // Ego's arc-length position along the centerline, measured in the
+    // lanelet's own stored orientation (front()=0 .. back()=total_length).
+    // toArcCoordinates() projects onto the nearest segment and extrapolates
+    // (via that segment's direction) when ego is outside the [0, L] range —
+    // no lateral-offset contamination, unlike Euclidean-to-vertex.
+    const double ego_arc_s =
+      lanelet::geometry::toArcCoordinates(centerline_2d, ego2d).length;
+
+    // Entry is the endpoint ego actually arrives at first: arc-length 0
+    // (front()) when driving forward, total_length (back()) when reversing
+    // through this lanelet — same direction convention as before.
+    const double entry_arc_s = is_driving_forward_ ? 0.0 : total_length;
+
+    // Return an along-track (never lateral-inflated) gap. abs() keeps the
+    // same "always >= 0, sign-free proximity" contract the Euclidean version
+    // had (callers gate on d in [0, threshold]), so a robot that is already
+    // slightly past the entry still reads as "arrived" instead of silently
+    // failing the d >= 0.0 checks used throughout this file.
+    return std::abs(entry_arc_s - ego_arc_s);
   } catch (const lanelet::NoSuchPrimitiveError &) {
     return -1.0;
   }
 }
 
+double RoadCrossingFsmNode::distanceToCrossingEntry() const
+{
+  return arcLengthDistanceToLaneletEntry(active_crossing_id_);
+}
+
 double RoadCrossingFsmNode::distanceToPreEntry() const
 {
-  if (!active_pre_id_ || !last_odom_) return -1.0;
-  if (!map_initialized_) return -1.0;
-
-  try {
-    const auto llt =
-      route_handler_.getLaneletMapPtr()->laneletLayer.get(*active_pre_id_);
-    const auto & cl = llt.centerline2d().basicLineString();
-    if (cl.empty()) return -1.0;
-
-    const auto & ego_pos = last_odom_->pose.pose.position;
-    const lanelet::BasicPoint2d ego2d{ego_pos.x, ego_pos.y};
-    // See distanceToCrossingEntry(): entry endpoint swaps with travel direction.
-    const auto & entry_pt = is_driving_forward_ ? cl.front() : cl.back();
-    const lanelet::BasicPoint2d entry{entry_pt.x(), entry_pt.y()};
-
-    return boost::geometry::distance(ego2d, entry);
-  } catch (const lanelet::NoSuchPrimitiveError &) {
-    return -1.0;
-  }
+  return arcLengthDistanceToLaneletEntry(active_pre_id_);
 }
 
 bool RoadCrossingFsmNode::egoPastCrossingExit() const
