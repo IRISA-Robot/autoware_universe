@@ -568,6 +568,24 @@ bool RoadCrossingModule::modifyPathVelocity(
   updateState(
     dist_to_stop, planner_data.isVehicleStopped(), blocked, clock_->now(), planner_data, crossing);
 
+  // Diagnostic only (no behavior change): if we're in CROSSING (i.e. we believe we are NOT
+  // holding a stop) but the remaining path ahead of ego is tiny, that's consistent with a
+  // "starved path" bug elsewhere (route/behavior_path not extending past this lanelet) rather
+  // than road_crossing itself inserting a stop — this log line is the cheapest way to
+  // distinguish the two next time the vehicle is observed stuck with fsm_state=6/CROSSING and
+  // every wall-publishing module empty. Throttled (not tied to rosout's ~10s lifespan) so it is
+  // easy to catch live with `ros2 topic echo /rosout | grep STUCK-DIAG` or by grepping the node's
+  // own log file.
+  if (state_ == State::CROSSING) {
+    const double remaining_path_len = path.length() - ego_s;
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 2000,
+      "[STUCK-DIAG] RoadCrossing %ld: state=CROSSING ego_s=%.3f path.length()=%.3f "
+      "remaining_ahead=%.3f stop_s=%s",
+      getModuleId(), ego_s, path.length(), remaining_path_len,
+      stop_s ? std::to_string(*stop_s).c_str() : "none");
+  }
+
   // Insert stop velocity if in STOPPING or CHECKING state.
   const bool should_stop = (state_ == State::STOPPING || state_ == State::CHECKING);
   if (should_stop && stop_s && *stop_s > 0.0 && *stop_s < path.length()) {
