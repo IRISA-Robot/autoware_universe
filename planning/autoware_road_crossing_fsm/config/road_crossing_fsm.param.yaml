@@ -118,12 +118,12 @@
     # Position gates (mencegah FSM maju sebelum robot tiba di lokasi)
     # Memperbaiki bug: FSM balapan ke CROSSING saat robot masih di start (jauh dari crossing).
     # -------------------------------------------------------------------
-    pre_arrive_dist_m:       3.0        # [m] ego dianggap "sudah di pre" jika distanceToPreEntry()
+    pre_arrive_dist_m:       5.0        # [m] ego dianggap "sudah di pre" jika distanceToPreEntry()
                                         #     berada di rentang [0, pre_arrive_dist_m].
                                         #     Harus >= pre_stop_dist_m (≈2.0 m) agar gate aktif
                                         #     saat robot sudah berhenti di pre-stop.
                                         #     Gate ARMED_CROSSWALK: tahan sampai at_pre = true.
-    crossing_arrive_dist_m:  1.5        # [m] ego dianggap "sudah di crossing" jika
+    crossing_arrive_dist_m:  3.0        # [m] ego dianggap "sudah di crossing" jika
                                         #     distanceToCrossingEntry() berada di [0, crossing_arrive_dist_m].
                                         #     Gate WAIT_GREEN: tahan sampai at_crossing = true.
 
