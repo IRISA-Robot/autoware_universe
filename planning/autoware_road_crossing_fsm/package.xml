@@ -36,6 +36,7 @@
   <!-- Autoware libraries -->
   <depend>autoware_lanelet2_extension</depend>
   <depend>autoware_route_handler</depend>
+  <depend>autoware_utils_geometry</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>autoware_lint_common</test_depend>

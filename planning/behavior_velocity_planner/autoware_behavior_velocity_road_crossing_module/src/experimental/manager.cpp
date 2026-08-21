@@ -65,6 +65,11 @@ RoadCrossingModuleManager::RoadCrossingModuleManager(rclcpp::Node & node)
   p.green_block_timeout_sec =
     get_or_declare_parameter<double>(node, ns + ".green_block_timeout_sec");
 
+  // Gate-wait watchdog: max seconds to wait in "vehicle clear but FSM gate=HOLD" before
+  // concluding the FSM itself is stuck and forcing CROSSING anyway.
+  p.gate_wait_timeout_sec =
+    get_or_declare_parameter<double>(node, ns + ".gate_wait_timeout_sec");
+
   // Create ONE persistent gate subscription in the manager (not per-module).
   // Scene modules are created/destroyed dynamically; creating subscriptions inside
   // them corrupts the executor wait_set (SIGABRT).  The manager lives for the full

@@ -295,6 +295,7 @@ void RoadCrossingModule::updateState(
         state_ = State::STOPPING;
         green_blocked_since_.reset();
         go_blocked_since_.reset();
+        gate_wait_since_.reset();
         RCLCPP_INFO(
           logger_, "RoadCrossing %ld: APPROACHING → STOPPING (dist %.2f m)",
           getModuleId(), distance_to_stop_point);
@@ -310,6 +311,7 @@ void RoadCrossingModule::updateState(
         clear_since_.reset();
         green_blocked_since_.reset();
         go_blocked_since_.reset();
+        gate_wait_since_.reset();
         RCLCPP_INFO(
           logger_, "RoadCrossing %ld: STOPPING → CHECKING (arrived, ego stopped)",
           getModuleId());
@@ -329,6 +331,9 @@ void RoadCrossingModule::updateState(
           current_gate == autoware_road_crossing_msgs::msg::RoadCrossingGate::ABORT)
       {
         clear_since_.reset();
+        go_blocked_since_.reset();
+        green_blocked_since_.reset();
+        gate_wait_since_.reset();
         RCLCPP_WARN_THROTTLE(
           logger_, *clock_, 5000,
           "RoadCrossing %ld: FSM gate=ABORT — holding at crossing", getModuleId());
@@ -345,6 +350,7 @@ void RoadCrossingModule::updateState(
             getModuleId());
         } else {
           // Gate is GO or GO_GREEN (or require_fsm_gate is somehow false — shouldn't happen for PRE).
+          gate_wait_since_.reset();
           state_ = State::CROSSING;
           RCLCPP_INFO(
             logger_, "RoadCrossing %ld [PRE]: CHECKING → CROSSING (crosswalk gate=GO/GO_GREEN)",
@@ -366,6 +372,7 @@ void RoadCrossingModule::updateState(
         if (!blocked) {
           // Path is clear — cross immediately. Reset stale timer.
           green_blocked_since_.reset();
+          gate_wait_since_.reset();
           state_ = State::CROSSING;
           RCLCPP_INFO(
             logger_,
@@ -379,6 +386,7 @@ void RoadCrossingModule::updateState(
             // Timeout expired — cross anyway. Lampu HIJAU = hak jalan; jangan deadlock selamanya.
             // Collision safety for actually-present obstacles still handled by obstacle_stop /
             // dynamic_obstacle_stop (same as normal driving).
+            gate_wait_since_.reset();
             state_ = State::CROSSING;
             RCLCPP_WARN(
               logger_,
@@ -399,6 +407,7 @@ void RoadCrossingModule::updateState(
 
       if (blocked) {
         clear_since_.reset();
+        gate_wait_since_.reset();
         // Bounded-timeout override (mirrors the GO_GREEN branch above): start (or continue)
         // the clock the moment `blocked` first becomes true on this path. If it never clears
         // for timeout_sec, force CHECKING → CROSSING anyway rather than deadlocking forever —
@@ -407,12 +416,25 @@ void RoadCrossingModule::updateState(
         if (!go_blocked_since_) go_blocked_since_ = now;
         const double waited = (now - *go_blocked_since_).seconds();
         if (waited >= planner_param_.timeout_sec) {
-          state_ = State::CROSSING;
-          RCLCPP_WARN(
-            logger_,
-            "RoadCrossing %ld: BLOCKED %.1fs >= timeout %.1fs on plain-GO path → "
-            "CROSSING anyway (timeout-forced, not a normal clear)",
-            getModuleId(), waited, planner_param_.timeout_sec);
+          // Timeout only overrides the vehicle-scan block — it must NOT override an FSM
+          // gate that is still HOLD. Otherwise a robot could time out and cross on red.
+          const bool gate_permits_go =
+            !planner_param_.require_fsm_gate || isGoCommand(current_gate);
+          if (gate_permits_go) {
+            gate_wait_since_.reset();
+            state_ = State::CROSSING;
+            RCLCPP_WARN(
+              logger_,
+              "RoadCrossing %ld: BLOCKED %.1fs >= timeout %.1fs on plain-GO path → "
+              "CROSSING anyway (timeout-forced, not a normal clear)",
+              getModuleId(), waited, planner_param_.timeout_sec);
+          } else {
+            RCLCPP_WARN_THROTTLE(
+              logger_, *clock_, 5000,
+              "RoadCrossing %ld: BLOCKED %.1fs >= timeout %.1fs but FSM gate=HOLD — "
+              "timeout does NOT override the gate, still waiting",
+              getModuleId(), waited, planner_param_.timeout_sec);
+          }
         } else {
           RCLCPP_WARN_THROTTLE(
             logger_, *clock_, 5000,
@@ -427,11 +449,29 @@ void RoadCrossingModule::updateState(
           // When require_fsm_gate=true, additionally require gate GO or GO_GREEN.
           if (planner_param_.require_fsm_gate && !isGoCommand(current_gate))
           {
-            RCLCPP_INFO_THROTTLE(
-              logger_, *clock_, 2000,
-              "RoadCrossing %ld: vehicle clear (%.2f s) but FSM gate=HOLD — waiting for GO",
-              getModuleId(), clear_elapsed);
+            // Gate-wait watchdog: path is clear but FSM is still HOLD. Give it up to
+            // gate_wait_timeout_sec before concluding the FSM itself is stuck — without
+            // this, a wedged FSM would deadlock the robot here forever.
+            if (!gate_wait_since_) gate_wait_since_ = now;
+            const double gate_wait_elapsed = (now - *gate_wait_since_).seconds();
+            if (gate_wait_elapsed >= planner_param_.gate_wait_timeout_sec) {
+              state_ = State::CROSSING;
+              RCLCPP_ERROR(
+                logger_,
+                "RoadCrossing %ld: vehicle clear (%.2f s) but FSM gate=HOLD for %.1f/%.1fs — "
+                "FSM appears stuck, forcing CHECKING → CROSSING anyway",
+                getModuleId(), clear_elapsed, gate_wait_elapsed,
+                planner_param_.gate_wait_timeout_sec);
+            } else {
+              RCLCPP_INFO_THROTTLE(
+                logger_, *clock_, 2000,
+                "RoadCrossing %ld: vehicle clear (%.2f s) but FSM gate=HOLD — waiting for GO "
+                "(%.1f/%.1fs before gate-wait watchdog forces CROSSING)",
+                getModuleId(), clear_elapsed, gate_wait_elapsed,
+                planner_param_.gate_wait_timeout_sec);
+            }
           } else {
+            gate_wait_since_.reset();
             state_ = State::CROSSING;
             RCLCPP_INFO(
               logger_, "RoadCrossing %ld: CHECKING → CROSSING (clear %.2f s%s)",

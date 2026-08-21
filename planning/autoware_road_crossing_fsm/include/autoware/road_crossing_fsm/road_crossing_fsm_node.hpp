@@ -251,10 +251,48 @@ private:
   bool is_driving_forward_{true};
   static constexpr double kDrivingDirectionDeadbandMps{0.05};
 
+  // Debounce for the raw-twist deadband check above: require this many
+  // CONSECUTIVE ticks past the deadband, in the same direction, before
+  // actually flipping is_driving_forward_. Guards against a single noisy
+  // odom sample latching the wrong direction (no recovery path once latched,
+  // since checkArmCondition() refuses to arm a new episode while
+  // !is_driving_forward_).
+  static constexpr int kDrivingDirectionConsecutiveSamples{3};
+  int driving_direction_candidate_count_{0};
+  // Sign of the candidate direction currently being confirmed (true=forward
+  // candidate, false=backward candidate). Only meaningful while
+  // driving_direction_candidate_count_ > 0.
+  bool driving_direction_candidate_forward_{true};
+
+  // Fallback watchdog: how long (consecutive ticks worth of wall-clock time)
+  // the robot has been within the twist deadband — i.e. "near-stationary" —
+  // with no fresh direction confirmation from updateDrivingDirection()'s
+  // normal twist path. Once this exceeds kNearStationaryFallbackSec, direction
+  // is instead derived geometrically from the route (see
+  // deriveDrivingDirectionFromRoute()) rather than leaving is_driving_forward_
+  // latched at a possibly-stale value forever.
+  std::optional<rclcpp::Time> near_stationary_since_;
+  static constexpr double kNearStationaryFallbackSec{2.0};
+
   // Recompute is_driving_forward_ from last_odom_->twist.twist.linear.x.
-  // No-op (keeps previous value) if last_odom_ is null or speed is within
-  // the deadband (near-zero — direction is ambiguous while nearly stopped).
+  // No-op (keeps previous value) if last_odom_ is null. Requires
+  // kDrivingDirectionConsecutiveSamples consecutive samples past the deadband
+  // (in the same direction) before flipping is_driving_forward_, to reduce
+  // false latches from a single noisy sample. If the robot has been within
+  // the deadband (near-stationary) for more than kNearStationaryFallbackSec,
+  // falls back to deriveDrivingDirectionFromRoute() instead of leaving
+  // is_driving_forward_ stuck at whatever it last was.
   void updateDrivingDirection();
+
+  // Geometric fallback for direction-of-travel when the twist signal is
+  // uninformative (near-stationary for a while). Reuses the same geometric
+  // idea as autoware::motion_utils::isDrivingForward() / the underlying
+  // autoware_utils_geometry::is_driving_forward() helper (compare ego's own
+  // orientation against the azimuth toward the next point ahead on the
+  // path) — except sourced from the route centerline via route_handler_
+  // (this node has no Trajectory/Path subscription, only the route). Returns
+  // nullopt if it cannot be determined (e.g. ego not resolvable on route).
+  std::optional<bool> deriveDrivingDirectionFromRoute() const;
 
   // Ordered sequence of lanelet IDs extracted from the mission-planner route.
   // Populated in onRoute() from msg->segments[i].preferred_primitive.id (in route order).

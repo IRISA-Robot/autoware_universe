@@ -15,6 +15,7 @@
 #include "autoware/road_crossing_fsm/road_crossing_fsm_node.hpp"
 
 #include <autoware_lanelet2_extension/utility/message_conversion.hpp>
+#include <autoware_utils_geometry/geometry.hpp>
 
 #include <lanelet2_core/geometry/Lanelet.h>
 #include <lanelet2_core/geometry/LineString.h>
@@ -26,6 +27,7 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -326,12 +328,93 @@ void RoadCrossingFsmNode::onAdApiOpMode(
 void RoadCrossingFsmNode::updateDrivingDirection()
 {
   if (!last_odom_) return;
+  const rclcpp::Time now = this->now();
   const double vx = last_odom_->twist.twist.linear.x;
+
   if (std::abs(vx) <= kDrivingDirectionDeadbandMps) {
-    // Near-zero speed — direction is ambiguous, keep previous value.
+    // Near-zero speed on this sample — twist alone is ambiguous. Drop any
+    // in-progress consecutive-sample candidate (a stale candidate must not
+    // survive across a gap) and start/continue the near-stationary timer.
+    driving_direction_candidate_count_ = 0;
+    if (!near_stationary_since_) near_stationary_since_ = now;
+
+    const double near_stationary_elapsed = (now - *near_stationary_since_).seconds();
+    if (near_stationary_elapsed >= kNearStationaryFallbackSec) {
+      // Genuinely stopped for a while — twist will never recover on its own.
+      // Fall back to the route's own geometric heading at ego's position
+      // instead of leaving is_driving_forward_ latched at a stale value
+      // (which would otherwise deadlock checkArmCondition() forever).
+      const auto route_forward = deriveDrivingDirectionFromRoute();
+      if (route_forward) {
+        is_driving_forward_ = *route_forward;
+      }
+      // else: cannot resolve ego on the route yet — keep previous value.
+    }
     return;
   }
-  is_driving_forward_ = vx > 0.0;
+
+  // Speed is past the deadband — no longer near-stationary.
+  near_stationary_since_.reset();
+
+  // Require kDrivingDirectionConsecutiveSamples consecutive samples on the
+  // SAME side of the deadband before actually flipping is_driving_forward_,
+  // so a single noisy sample can't latch the wrong direction.
+  const bool candidate_forward = vx > 0.0;
+  if (driving_direction_candidate_count_ > 0 &&
+      driving_direction_candidate_forward_ == candidate_forward) {
+    ++driving_direction_candidate_count_;
+  } else {
+    driving_direction_candidate_forward_ = candidate_forward;
+    driving_direction_candidate_count_ = 1;
+  }
+
+  if (driving_direction_candidate_count_ >= kDrivingDirectionConsecutiveSamples) {
+    is_driving_forward_ = driving_direction_candidate_forward_;
+  }
+}
+
+std::optional<bool> RoadCrossingFsmNode::deriveDrivingDirectionFromRoute() const
+{
+  if (!last_odom_ || !route_initialized_) return std::nullopt;
+
+  lanelet::ConstLanelet cur;
+  if (!route_handler_.getClosestLaneletWithinRoute(last_odom_->pose.pose, &cur)) {
+    return std::nullopt;
+  }
+
+  const auto centerline = cur.centerline2d().basicLineString();
+  if (centerline.size() < 2) return std::nullopt;
+
+  // Find the centerline vertex closest to ego, then take the next vertex
+  // along the lanelet's own drawing direction as the "ahead" point — same
+  // role as points.at(1) in autoware::motion_utils::isDrivingForward().
+  const auto & ego_pos = last_odom_->pose.pose.position;
+  const lanelet::BasicPoint2d ego2d{ego_pos.x, ego_pos.y};
+  size_t nearest_idx = 0;
+  double nearest_dist = std::numeric_limits<double>::max();
+  for (size_t i = 0; i < centerline.size(); ++i) {
+    const double d = boost::geometry::distance(ego2d, centerline[i]);
+    if (d < nearest_dist) {
+      nearest_dist = d;
+      nearest_idx = i;
+    }
+  }
+  const size_t ahead_idx =
+    (nearest_idx + 1 < centerline.size()) ? nearest_idx + 1 : nearest_idx - 1;
+  const bool ahead_is_after = ahead_idx > nearest_idx;
+  const auto & ahead_pt = centerline[ahead_idx];
+
+  geometry_msgs::msg::Point dst_point;
+  dst_point.x = ahead_pt.x();
+  dst_point.y = ahead_pt.y();
+  dst_point.z = 0.0;
+
+  // If the "ahead" vertex is actually behind nearest_idx in the lanelet's own
+  // vertex order (only happens at the very last vertex), the forward/backward
+  // sense relative to the lanelet's drawing direction is flipped.
+  const bool forward_along_centerline =
+    autoware_utils_geometry::is_driving_forward(last_odom_->pose.pose, dst_point);
+  return ahead_is_after ? forward_along_centerline : !forward_along_centerline;
 }
 
 void RoadCrossingFsmNode::onTimer()
@@ -368,6 +451,19 @@ void RoadCrossingFsmNode::onTimer()
         "onTimer WATCHDOG: episode stuck in state=%d for %.1f s (max=%.1f s) — "
         "forcing resetEpisode()+IDLE (blanket safety watchdog, catch-all)",
         static_cast<int>(state_), episode_elapsed, param_.max_episode_duration_sec);
+      // Release any gate(s) we may still be holding at HOLD before tearing down the
+      // episode — mirrors every other forced-exit path in this file (no-alternate
+      // reroute fallback, REROUTING_TO_ALT failures, normal DONE). Without this the
+      // scene module(s) we were gating would be left stuck at HOLD forever even
+      // though the FSM itself moved on to IDLE.
+      publishGatePre(autoware_road_crossing_msgs::msg::RoadCrossingGate::GO);
+      publishGate(autoware_road_crossing_msgs::msg::RoadCrossingGate::GO);
+      // Suppress re-arming for the crossing we were managing BEFORE resetEpisode()
+      // clears active_crossing_id_ — same re-arm-cooldown mechanism used for normal
+      // DONE, so the same crossing doesn't immediately re-arm and re-wedge on the
+      // very next tick (checkArmCondition() already honors suppressed_crossing_id_
+      // generically, regardless of who set it).
+      suppressed_crossing_id_ = active_crossing_id_;
       resetEpisode();
       transitionTo(FsmState::IDLE);
       return;

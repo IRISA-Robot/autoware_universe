@@ -36,3 +36,9 @@
       # [ROAD, hijau] tunggu maksimal N detik kalau predicted-path kendaraan nge-block sebelum nyebrang anyway;
       # 0.0 = langsung nyebrang pas hijau; besar = nunggu kendaraan clear lebih lama.
       green_block_timeout_sec: 2.0
+      # [safety watchdog] kalau vehicle-path sudah clear (sustained_clear_sec terpenuhi) tapi FSM
+      # gate masih HOLD, tunggu maksimal gate_wait_timeout_sec sebelum menyimpulkan FSM-nya sendiri
+      # yang macet lalu paksa CROSSING anyway (ERROR log). Tanpa ini robot bisa nyangkut selamanya
+      # kalau FSM node wedged. Tidak berlaku untuk gate=ABORT (tetap indefinite hold) atau GO_GREEN
+      # (punya timeout sendiri: green_block_timeout_sec).
+      gate_wait_timeout_sec: 45.0

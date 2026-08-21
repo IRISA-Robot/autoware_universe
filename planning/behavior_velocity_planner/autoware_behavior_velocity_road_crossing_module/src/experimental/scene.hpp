@@ -91,6 +91,15 @@ public:
     // Plain GO (bypass/timeout/unsignalized) TIDAK menggunakan timeout ini — tetap pakai
     // sustained-clear normal.
     double green_block_timeout_sec{5.0};
+
+    // Gate-wait watchdog (plain-GO / sustained-clear path, require_fsm_gate=true only).
+    // Saat vehicle-path sudah clear (sustained_clear_sec terpenuhi) tapi FSM gate masih HOLD,
+    // sebelumnya modul ini menunggu selamanya tanpa jalan keluar — kalau FSM macet, robot ikut
+    // macet permanen. Setelah gate_wait_timeout_sec menunggu dalam kondisi clear-tapi-HOLD ini,
+    // paksa CHECKING → CROSSING (ERROR log, bukan WARN, karena ini indikasi FSM itu sendiri
+    // yang stuck, bukan kondisi normal). Tidak berlaku untuk gate ABORT (tetap indefinite hold)
+    // maupun GO_GREEN (punya timeout sendiri: green_block_timeout_sec).
+    double gate_wait_timeout_sec{45.0};
   };
 
   struct DebugData
@@ -143,6 +152,11 @@ private:
   // or when entering CROSSING/STOPPING. Prevents an indefinite deadlock if `blocked` gets
   // stuck true (e.g. stale/false-positive predicted-object block) with no real obstacle.
   std::optional<rclcpp::Time> go_blocked_since_;
+  // Gate-wait watchdog: timestamp when the vehicle-path first became clear (sustained_clear_sec
+  // satisfied) while FSM gate is still HOLD (require_fsm_gate=true). Reset whenever the gate
+  // becomes GO/GO_GREEN, whenever the clear condition is lost, or when entering CROSSING/STOPPING.
+  // See PlannerParam::gate_wait_timeout_sec for why this exists.
+  std::optional<rclcpp::Time> gate_wait_since_;
   bool was_inside_polygon_{false};  // CROSSING exit detection: ever entered polygon?
   DebugData debug_data_;
 
