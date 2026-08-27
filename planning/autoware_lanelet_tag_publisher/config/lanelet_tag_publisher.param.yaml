@@ -1,0 +1,32 @@
+/**:
+  ros__parameters:
+    # -------------------------------------------------------------------
+    # Timer rate
+    # -------------------------------------------------------------------
+    update_rate_hz: 10.0                # [Hz] tick frequency (mirrors road_crossing_fsm default)
+
+    # -------------------------------------------------------------------
+    # Tag / topic (genuinely reusable — a future similar tag/topic pair
+    # just needs another launch instance of this node with different
+    # values here, no code change).
+    # -------------------------------------------------------------------
+    tag_name: "enable_master_local_control"    # [-] boolean lanelet attribute to watch for
+    output_topic: "/autoware/master_control_local"  # topic to publish std_msgs/Bool on
+
+    # -------------------------------------------------------------------
+    # Input topics
+    # -------------------------------------------------------------------
+    topic_map: "/map/vector_map"
+    topic_ego_pose: "/localization/kinematic_state"
+
+    # -------------------------------------------------------------------
+    # Debounce / hysteresis
+    #
+    # Mitigates the known design tension that this fallback's own trigger
+    # depends on the same localization it's meant to backstop: require
+    # N consecutive ticks of the tag being true/false before flipping the
+    # published value, so transient jitter near a lanelet boundary doesn't
+    # flicker the output. First-pass conservative defaults — tune live.
+    # -------------------------------------------------------------------
+    debounce_ticks_on: 3                # consecutive true ticks required before publishing true
+    debounce_ticks_off: 3               # consecutive false ticks required before publishing false

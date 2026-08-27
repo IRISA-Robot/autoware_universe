@@ -1,0 +1,36 @@
+<launch>
+  <!-- Lanelet tag publisher standalone node.
+       Watches the vector map + ego pose and publishes a debounced Bool
+       indicating whether ego is currently inside ANY lanelet tagged with
+       `tag_name`. Does NOT subscribe to the route.
+
+       Usage (standalone):
+         ros2 launch autoware_lanelet_tag_publisher lanelet_tag_publisher.launch.xml
+
+       Arguments:
+         use_intra_process_comms  (default: false)
+         lanelet_tag_publisher_param_path  override to custom param file
+         tag_name       override just the tag name (leaves other params from file)
+         output_topic   override just the output topic (leaves other params from file)
+
+       To watch a different tag/topic pair, launch another instance with a
+       different tag_name/output_topic (or a different param file) — no code
+       change required.
+  -->
+
+  <arg name="use_intra_process_comms" default="false"/>
+  <arg name="lanelet_tag_publisher_param_path"
+       default="$(find-pkg-share autoware_lanelet_tag_publisher)/config/lanelet_tag_publisher.param.yaml"/>
+  <arg name="tag_name" default="enable_master_local_control"/>
+  <arg name="output_topic" default="/autoware/master_control_local"/>
+
+  <node pkg="autoware_lanelet_tag_publisher"
+        exec="lanelet_tag_publisher_node"
+        name="lanelet_tag_publisher"
+        output="screen">
+    <param name="use_intra_process_comms" value="$(var use_intra_process_comms)"/>
+    <param from="$(var lanelet_tag_publisher_param_path)"/>
+    <param name="tag_name" value="$(var tag_name)"/>
+    <param name="output_topic" value="$(var output_topic)"/>
+  </node>
+</launch>
