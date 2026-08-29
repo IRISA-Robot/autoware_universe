@@ -39,12 +39,14 @@ ReverseLaneFollowModule::ReverseLaneFollowModule(
   const std::unordered_map<std::string, std::shared_ptr<RTCInterface>> & rtc_interface_ptr_map,
   std::unordered_map<std::string, std::shared_ptr<ObjectsOfInterestMarkerInterface>> &
     objects_of_interest_marker_interface_ptr_map,
-  const std::shared_ptr<PlanningFactorInterface> planning_factor_interface)
+  const std::shared_ptr<PlanningFactorInterface> planning_factor_interface,
+  const std::shared_ptr<std::optional<lanelet::Id>> & last_exited_inverted_lanelet_id)
 : SceneModuleInterface{
     name, node, rtc_interface_ptr_map, objects_of_interest_marker_interface_ptr_map,
     planning_factor_interface},
   parameters_{parameters},
-  retrace_request_subscriber_{retrace_request_subscriber}
+  retrace_request_subscriber_{retrace_request_subscriber},
+  last_exited_inverted_lanelet_id_{last_exited_inverted_lanelet_id}
 {
 }
 
@@ -111,6 +113,9 @@ void ReverseLaneFollowModule::updateData()
 void ReverseLaneFollowModule::updateRouteReversedFollow()
 {
   const bool was_active = status_.is_route_reversed_active;
+  // Snapshot before clearing below -- needed to identify *which* lanelet we are exiting if this
+  // cycle turns out to be the true->false transition (see the one-way latch note in scene.hpp).
+  const auto previously_active_lanelets = status_.route_reversed_lanelets;
 
   status_.is_route_reversed_active = false;
   status_.route_reversed_path = PathWithLaneId{};
@@ -131,7 +136,19 @@ void ReverseLaneFollowModule::updateRouteReversedFollow()
   const auto follow = buildRouteReversedFollowPath(
     planner_data_->route_handler, getEgoPose(), parameters_->route_reversed_backward_distance_m,
     parameters_->route_reversed_forward_distance_m);
-  if (!follow) {
+
+  // [BIDIR-BUG-FIX] One-way latch: if `follow` succeeded for the same lanelet we most recently
+  // recorded a true->false exit from, this is boundary-line noise re-arming the module, not a
+  // genuine new reversed segment -- suppress it (treat exactly like the nullopt case below). See
+  // last_exited_inverted_lanelet_id_'s doc comment in scene.hpp for why this is safe/expected.
+  const bool reactivation_suppressed =
+    follow && last_exited_inverted_lanelet_id_->has_value() &&
+    std::any_of(
+      follow->lanelets.begin(), follow->lanelets.end(), [&](const auto & llt) {
+        return llt.id() == last_exited_inverted_lanelet_id_->value();
+      });
+
+  if (!follow || reactivation_suppressed) {
     // [BIDIR-DEBUG] edge-triggered, UNTHROTTLED (unlike buildRouteReversedFollowPath's own
     // 2000ms-throttled logging) so a rapid on/off flicker -- e.g. ego pose oscillating right at
     // the boundary between a forward and a reversed route segment, or between two lanelets where
@@ -141,11 +158,16 @@ void ReverseLaneFollowModule::updateRouteReversedFollow()
     // (not a one-shot end-of-segment transition) as the cause of the trajectory intermittently
     // disappearing: plan() falls back to getPreviousModuleOutput() every time this is inactive.
     if (was_active) {
+      if (!previously_active_lanelets.empty()) {
+        *last_exited_inverted_lanelet_id_ = previously_active_lanelets.back().id();
+      }
       RCLCPP_WARN(
         getLogger(),
-        "[BIDIR-DEBUG] is_route_reversed_active FLIP true->false: ego=(%.2f, %.2f) "
-        "buildRouteReversedFollowPath returned nullopt this cycle",
-        getEgoPose().position.x, getEgoPose().position.y);
+        "[BIDIR-DEBUG] is_route_reversed_active FLIP true->false: ego=(%.2f, %.2f) %s",
+        getEgoPose().position.x, getEgoPose().position.y,
+        reactivation_suppressed
+          ? "buildRouteReversedFollowPath succeeded but reactivation suppressed (one-way latch)"
+          : "buildRouteReversedFollowPath returned nullopt this cycle");
     }
     return;
   }
@@ -238,6 +260,18 @@ void ReverseLaneFollowModule::processOnEntry()
   status_.is_retracing = requested_distance_m_.has_value();
   status_.requested_distance_m =
     requested_distance_m_.value_or(parameters_->default_retrace_distance_m);
+
+  // [BIDIR-BUG-FIX] Deliberately NOT reset here (nor in processOnExit()): initially this was
+  // cleared in processOnEntry(), reasoning that it only fires once per genuinely new episode --
+  // wrong. SceneModuleManagerInterface::updateIdleModuleInstance() calls onEntry() (-> this) on
+  // the *same* still-idle module instance every single cycle it remains idle, not just once on a
+  // fresh instance/episode (confirmed live: clearing here made the latch a no-op, ~zero
+  // suppressions logged, identical flip-flop to having no latch at all). There is no reliable
+  // "genuinely new episode" signal available at this call site to gate a reset on, so this is
+  // intentionally a permanent, node-lifetime latch per lanelet id instead: once exited, a given
+  // lanelet id is never treated as a fresh reversed-follow activation again for the rest of this
+  // run. The only cost is the (rare, and not applicable to any route this fix was written for) case
+  // of a single route needing to reverse over the exact same lanelet id twice.
 }
 
 void ReverseLaneFollowModule::processOnExit()

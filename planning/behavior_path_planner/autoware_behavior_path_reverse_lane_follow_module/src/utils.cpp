@@ -15,6 +15,7 @@
 #include "autoware/behavior_path_reverse_lane_follow_module/utils.hpp"
 
 #include <autoware/motion_utils/trajectory/trajectory.hpp>
+#include <autoware_utils/geometry/geometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 
 #include <algorithm>
@@ -23,6 +24,58 @@
 
 namespace autoware::behavior_path_planner::reverse_lane_follow_utils
 {
+
+namespace
+{
+// [BIDIR-BUG-FIX #2] Tangent direction (radians) of a lanelet's centerline at its very start/end,
+// walked in whatever point order this ConstLanelet's own .inverted() bit implies.
+// lanelet2_core's Lanelet::centerline() already returns an inverted (point-order-reversed) view
+// when .inverted() is true -- same mechanism route_handler.cpp documents for
+// leftBound()/rightBound() (Lanelet.h:164-175) -- so these tangents already point in the
+// lanelet's *route-consistent* direction of travel, regardless of its fwd/inv route label.
+double laneletEntryTangentRad(const lanelet::ConstLanelet & llt)
+{
+  const auto & centerline = llt.centerline();
+  if (centerline.size() < 2) {
+    return 0.0;
+  }
+  const auto & p0 = centerline[0];
+  const auto & p1 = centerline[1];
+  return std::atan2(p1.y() - p0.y(), p1.x() - p0.x());
+}
+
+double laneletExitTangentRad(const lanelet::ConstLanelet & llt)
+{
+  const auto & centerline = llt.centerline();
+  const size_t n = centerline.size();
+  if (n < 2) {
+    return 0.0;
+  }
+  const auto & p0 = centerline[n - 2];
+  const auto & p1 = centerline[n - 1];
+  return std::atan2(p1.y() - p0.y(), p1.x() - p0.x());
+}
+
+// A generous bound: allows the window-extension walk below to continue through even a fairly
+// sharp real-world curve/switchback while still catching a genuine ~180 degree reversal -- the
+// one case this vehicle (fixed heading, forward/backward translation only, never rotates in
+// place) truly cannot drive through without stopping and changing gear.
+constexpr double kMaxContinuousHeadingChangeRad = 100.0 * M_PI / 180.0;
+
+// [BIDIR-BUG-FIX #2] Replaces the old isLaneletInvertedInRoute()-based "same label" trim: two
+// adjacent-in-route lanelets are treated as one continuous physical maneuver based purely on
+// whether their shared boundary is a smooth direction of travel, independent of whether either
+// side is flagged inverted in the route. See buildRouteReversedFollowPath()'s doc comment in
+// utils.hpp for the full rationale and live evidence.
+bool isHeadingContinuousAcross(
+  const lanelet::ConstLanelet & from_llt, const lanelet::ConstLanelet & to_llt)
+{
+  const double exit_tangent = laneletExitTangentRad(from_llt);
+  const double entry_tangent = laneletEntryTangentRad(to_llt);
+  const double diff = std::abs(autoware_utils::normalize_radian(entry_tangent - exit_tangent));
+  return diff < kMaxContinuousHeadingChangeRad;
+}
+}  // namespace
 
 std::optional<TraveledTail> extractTraveledTailPath(
   const std::shared_ptr<RouteHandler> & route_handler, const Pose & ego_pose,
@@ -114,26 +167,22 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
     return std::nullopt;
   }
 
-  const bool is_inverted = route_handler->isLaneletInvertedInRoute(current_lanelet);
+  // [BIDIR-BUG-FIX #2] No longer gate on current_lanelet's own isLaneletInvertedInRoute() here --
+  // see buildRouteReversedFollowPath()'s doc comment in utils.hpp. Logged for visibility only;
+  // the real activation decision now happens further down, after the heading-continuity walk.
   RCLCPP_WARN_THROTTLE(
     logger, steady_clock, 2000,
     "[BIDIR-DEBUG] buildRouteReversedFollowPath: ego=(%.2f, %.2f) closest_lanelet_id=%ld "
     "closest_lanelet.inverted()=%d isLaneletInvertedInRoute=%d",
     ego_pose.position.x, ego_pose.position.y, current_lanelet.id(), current_lanelet.inverted(),
-    is_inverted);
-
-  if (!is_inverted) {
-    // Not on a reversed route segment -- this activation trigger does not apply; the caller
-    // should fall back to the (still-supported standalone) retrace-request trigger.
-    return std::nullopt;
-  }
+    route_handler->isLaneletInvertedInRoute(current_lanelet));
 
   // following()/previous() on routing_graph_ptr_ already resolve correctly for an inverted
   // ConstLanelet (verified by the Phase-0 spike), so "forward"/"backward" here already mean
   // ahead-of/behind-ego in the actual direction of travel, not map/centerline-index order.
-  const auto lanelet_sequence = route_handler->getLaneletSequence(
+  const auto lanelet_sequence_raw = route_handler->getLaneletSequence(
     current_lanelet, ego_pose, backward_distance_m, forward_distance_m);
-  if (lanelet_sequence.empty()) {
+  if (lanelet_sequence_raw.empty()) {
     RCLCPP_WARN_THROTTLE(
       logger, steady_clock, 2000,
       "[BIDIR-DEBUG] buildRouteReversedFollowPath: getLaneletSequence returned EMPTY for "
@@ -142,14 +191,90 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
     return std::nullopt;
   }
 
+  // [BIDIR-BUG-FIX #2] getLaneletSequence()'s backward/forward window is built purely from
+  // requested distances and has no notion of the route's own inverted/forward direction flags --
+  // it will happily walk straight across a mid-route direction-change boundary (e.g. taman map's
+  // 18(inv) -> 291(fwd) -> 75(fwd), unlocked by RouteHandler::buildExtraBoundaryLinks()).
+  //
+  // An earlier version of this fix trimmed the window down to the maximal contiguous run of
+  // *actually inverted* lanelets containing current_lanelet -- i.e. it treated every fwd/inv
+  // route-label change as a mandatory gear-change boundary. That is wrong in general: a route can
+  // cross from an inverted lanelet into a forward-labeled one that continues the exact same
+  // physical direction of travel (18(inv) -> 291(fwd) is a ~40 degree curve, not a reversal --
+  // confirmed via lanelet geometry and a live repro). Forcing a stop-and-handoff there demanded a
+  // reference heading 180 degrees away from ego's actual (correct, continuous) heading -- this
+  // vehicle never rotates in place, so that handoff deadlocked permanently
+  // (yaw_err=pi, ego frozen, planning_validator rejecting every trajectory as a result).
+  //
+  // Fix: trim the window using *geometric heading continuity* instead of the route label --
+  // extend through any number of lanelets, inverted or not, as long as each join is an ordinary
+  // curve (see isHeadingContinuousAcross()), stopping only at a genuine near-180-degree flip
+  // (the one case this vehicle truly cannot drive through without stopping and changing gear).
+  const auto current_it = std::find_if(
+    lanelet_sequence_raw.begin(), lanelet_sequence_raw.end(), [&](const auto & llt) {
+      return llt.id() == current_lanelet.id() && llt.inverted() == current_lanelet.inverted();
+    });
+  const size_t current_idx = (current_it != lanelet_sequence_raw.end())
+                                ? static_cast<size_t>(std::distance(lanelet_sequence_raw.begin(), current_it))
+                                : lanelet_sequence_raw.size();
+
+  lanelet::ConstLanelets lanelet_sequence;
+  bool forward_end_is_genuine_discontinuity = false;
+  if (current_idx >= lanelet_sequence_raw.size()) {
+    // Defensive fallback: current_lanelet should always be present (getLaneletSequence's own
+    // contract always inserts it), but if it is somehow missing, do not risk emitting a path
+    // built from an unrelated/bled window -- fall back to just current_lanelet itself.
+    lanelet_sequence = {current_lanelet};
+  } else {
+    size_t begin_idx = current_idx;
+    while (begin_idx > 0 &&
+           isHeadingContinuousAcross(
+             lanelet_sequence_raw[begin_idx - 1], lanelet_sequence_raw[begin_idx])) {
+      --begin_idx;
+    }
+    size_t end_idx = current_idx;  // inclusive
+    while (end_idx + 1 < lanelet_sequence_raw.size() &&
+           isHeadingContinuousAcross(
+             lanelet_sequence_raw[end_idx], lanelet_sequence_raw[end_idx + 1])) {
+      ++end_idx;
+    }
+    // The forward walk above only ever stops early (before exhausting lanelet_sequence_raw)
+    // because isHeadingContinuousAcross() returned false right there -- i.e. this *is* a genuine
+    // discontinuity, not just the edge of the requested forward_distance_m window.
+    forward_end_is_genuine_discontinuity = (end_idx + 1 < lanelet_sequence_raw.size());
+    lanelet_sequence = lanelet::ConstLanelets(
+      lanelet_sequence_raw.begin() + static_cast<std::ptrdiff_t>(begin_idx),
+      lanelet_sequence_raw.begin() + static_cast<std::ptrdiff_t>(end_idx) + 1);
+  }
+
+  // This trigger only applies if the geometrically-continuous run just built actually contains a
+  // genuinely route-inverted lanelet somewhere -- otherwise ego is simply on an ordinary forward
+  // stretch with no reverse maneuver nearby, and this trigger should not fire.
+  const bool touches_inverted_lanelet = std::any_of(
+    lanelet_sequence.begin(), lanelet_sequence.end(),
+    [&route_handler](const auto & llt) { return route_handler->isLaneletInvertedInRoute(llt); });
+
   {
     std::string seq_str;
-    for (const auto & llt : lanelet_sequence) {
+    for (const auto & llt : lanelet_sequence_raw) {
       seq_str += std::to_string(llt.id()) + (llt.inverted() ? "(inv) " : "(fwd) ");
+    }
+    std::string trimmed_str;
+    for (const auto & llt : lanelet_sequence) {
+      trimmed_str += std::to_string(llt.id()) + (llt.inverted() ? "(inv) " : "(fwd) ");
     }
     RCLCPP_WARN_THROTTLE(
       logger, steady_clock, 2000,
-      "[BIDIR-DEBUG] buildRouteReversedFollowPath: lanelet_sequence = [ %s]", seq_str.c_str());
+      "[BIDIR-DEBUG] buildRouteReversedFollowPath: raw_lanelet_sequence = [ %s] "
+      "heading-continuous run = [ %s] touches_inverted_lanelet=%d",
+      seq_str.c_str(), trimmed_str.c_str(), touches_inverted_lanelet);
+  }
+
+  if (!touches_inverted_lanelet) {
+    // No actual reverse-in-route segment anywhere in the continuous run touching ego -- this
+    // activation trigger does not apply; the caller should fall back to the (still-supported
+    // standalone) retrace-request trigger.
+    return std::nullopt;
   }
 
   auto path =
@@ -196,7 +321,29 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
       "[BIDIR-DEBUG] buildRouteReversedFollowPath: goal is within this window's lanelet "
       "sequence -- truncated path to goal_idx=%zu and forced zero velocity there",
       goal_idx);
+  } else if (forward_end_is_genuine_discontinuity) {
+    // [BIDIR-BUG-FIX #2] The forward walk stopped short of the raw window's own end because
+    // isHeadingContinuousAcross() found a genuine ~180 degree flip right after
+    // lanelet_sequence.back() -- a real gear-change point this vehicle cannot drive through
+    // without stopping (unlike the old label-based trim, this is NOT triggered merely by the
+    // route's fwd/inv label changing). Force a stop there, same idiom as the goal-truncation
+    // branch above, so this module hands off to forward driving with a clean stop instead of
+    // still reversing across an actual reversal.
+    if (!path.points.empty()) {
+      path.points.back().point.longitudinal_velocity_mps = 0.0F;
+    }
+    RCLCPP_WARN_THROTTLE(
+      logger, steady_clock, 2000,
+      "[BIDIR-DEBUG] buildRouteReversedFollowPath: window trimmed at a genuine heading "
+      "discontinuity (lanelet %ld -> next raw lanelet requires an ~180 degree flip) -- forced "
+      "zero velocity at trimmed path end so this module hands off to forward driving with a "
+      "clean stop instead of attempting an impossible in-place reorientation",
+      lanelet_sequence.back().id());
   }
+  // else: the window simply ran out at backward_distance_m/forward_distance_m (or the raw
+  // sequence's own end near the route's start/end) with no genuine discontinuity -- leave the
+  // path riding at -abs(v) all the way to that edge, same as any other sliding-window path; the
+  // next cycle's recentered window naturally continues it.
 
   RCLCPP_WARN_THROTTLE(
     logger, steady_clock, 2000,

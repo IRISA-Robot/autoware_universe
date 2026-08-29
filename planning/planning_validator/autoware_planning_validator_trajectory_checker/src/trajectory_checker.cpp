@@ -684,6 +684,20 @@ bool TrajectoryChecker::check_trajectory_shift()
     return is_valid;
   }
 
+  // Defense-in-depth against a stale reference: last_valid_trajectory is only ever updated in
+  // the fully-valid branch of publishTrajectory(), so once this check (or any other) starts
+  // failing, the reference used here stops advancing. Combined with a route change it is reset
+  // explicitly (see PlanningValidatorData::set_route()), but within a single long-running route
+  // a reference that hasn't been refreshed for a long time is no longer a meaningful baseline for
+  // "sudden shift" detection -- treat it as expired (i.e. no reference) rather than comparing
+  // against it forever, so a transient trip cannot permanently latch this check to invalid.
+  static constexpr double kMaxReferenceAge = 5.0;  // [s]
+  const auto reference_age =
+    (clock_->now() - rclcpp::Time(data->last_valid_trajectory->header.stamp)).seconds();
+  if (reference_age > kMaxReferenceAge) {
+    return is_valid;
+  }
+
   auto & status = context_->validation_status;
   const auto & trajectory = *data->current_trajectory;
   const auto & prev_trajectory = *data->last_valid_trajectory;

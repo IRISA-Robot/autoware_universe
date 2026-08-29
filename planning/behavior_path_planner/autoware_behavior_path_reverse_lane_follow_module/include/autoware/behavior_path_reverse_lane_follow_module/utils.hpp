@@ -84,11 +84,35 @@ struct RouteReversedFollow
 };
 
 /**
- * @brief Build a reverse-direction follow path when ego's current route segment is itself
- * flagged reversed (RouteHandler::isLaneletInvertedInRoute()), independent of any explicit
- * retrace request. This is the Phase-2 activation trigger added alongside Phase-1's
- * retrace-request trigger (extractTraveledTailPath()/reversePathForRetrace()) -- see
+ * @brief Build a reverse-direction follow path covering the *geometrically continuous* run of
+ * lanelets around ego that contains at least one lanelet flagged reversed
+ * (RouteHandler::isLaneletInvertedInRoute()), independent of any explicit retrace request. This
+ * is the Phase-2 activation trigger added alongside Phase-1's retrace-request trigger
+ * (extractTraveledTailPath()/reversePathForRetrace()) -- see
  * bidirectional_plan/04-routing-foundation.md §4d.
+ *
+ * [BIDIR-BUG-FIX #2] This does NOT gate purely on ego's *current* lanelet being flagged inverted
+ * any more. That conflated two different questions: (1) which point-order/orientation convention
+ * a single lanelet's centerline should be walked in (what isLaneletInvertedInRoute() is actually
+ * for), and (2) whether the vehicle's gear/velocity-sign must be reverse *right now*. A route can
+ * cross from an inverted lanelet into a forward-labeled one that continues the exact same
+ * physical direction of travel -- e.g. taman map's 18(inv) -> 291(fwd), a ~40 degree curve, not a
+ * reversal (confirmed live via lanelet geometry + a frozen repro: ego's actual yaw stayed
+ * constant across the boundary while the old label-based trim forced a stop there and handed off
+ * to a normal-forward-mode reference demanding an instantaneous 180 degree heading flip --
+ * impossible for this vehicle, which never rotates in place -- producing a deterministic
+ * yaw_err=pi deadlock). The route's fwd/inv label is about which end of a lanelet's own
+ * centerline to start from for geometry purposes; it says nothing about whether the vehicle's
+ * physical direction of travel actually reverses at that boundary.
+ *
+ * Instead, this walks outward from ego's position through the raw lanelet window (see
+ * isHeadingContinuousAcross() in the .cpp) and includes every lanelet whose join with its
+ * neighbor is a geometrically continuous direction of travel (any ordinary curve, however tight)
+ * -- stopping only at a genuine near-180-degree flip, which is the one case this fixed-heading
+ * vehicle truly cannot drive through without stopping and changing gear. The resulting window is
+ * used as-is (reverse gear, negative velocity) as long as it contains at least one lanelet
+ * actually flagged inverted-in-route somewhere; otherwise ego is just on an ordinary forward
+ * stretch and this trigger does not apply.
  *
  * Unlike extractTraveledTailPath() (which reverses an already-forward-driven tail path point
  * order), this follows the route's own (auto-flipping) inverted centerline directly via
@@ -98,9 +122,10 @@ struct RouteReversedFollow
  * velocity sign is flipped negative, reusing the same convention as reversePathForRetrace()/
  * autoware_freespace_planning_algorithms.
  *
- * @return std::nullopt if ego is not within the route, or ego's current lanelet is not flagged
- *         reversed in the route's direction side-table (i.e. this trigger does not apply -- the
- *         caller should fall back to / keep using the retrace-request trigger).
+ * @return std::nullopt if ego is not within the route, or no geometrically continuous run
+ *         touching ego's current lanelet contains an actually-inverted lanelet (i.e. this trigger
+ *         does not apply -- the caller should fall back to / keep using the retrace-request
+ *         trigger).
  */
 std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
   const std::shared_ptr<RouteHandler> & route_handler, const Pose & ego_pose,

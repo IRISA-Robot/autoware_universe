@@ -24,7 +24,10 @@
 
 #include <std_msgs/msg/float64.hpp>
 
+#include <lanelet2_core/primitives/Lanelet.h>
+
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -42,7 +45,8 @@ public:
   {
     return std::make_unique<ReverseLaneFollowModule>(
       name_, *node_, parameters_, retrace_request_subscriber_, rtc_interface_ptr_map_,
-      objects_of_interest_marker_interface_ptr_map_, planning_factor_interface_);
+      objects_of_interest_marker_interface_ptr_map_, planning_factor_interface_,
+      last_exited_inverted_lanelet_id_);
   }
 
   void updateModuleParams(const std::vector<rclcpp::Parameter> & parameters) override;
@@ -65,6 +69,19 @@ private:
   // instance the manager creates gets a shared_ptr to the same, never-recreated subscriber.
   std::shared_ptr<autoware_utils::InterProcessPollingSubscriber<std_msgs::msg::Float64>>
     retrace_request_subscriber_;
+
+  // [BIDIR-BUG-FIX] Same "must not live inside the dynamically-created/destroyed module
+  // instance" constraint as retrace_request_subscriber_ above, for a different reason here: this
+  // is the one-way latch (see scene.hpp) that stops is_route_reversed_active from flip-flopping
+  // right at a mid-route direction-change boundary. Every reactivation attempt after a
+  // true->false transition is evaluated on a *brand-new* ReverseLaneFollowModule instance (the
+  // planner manager creates a fresh one via createNewSceneModuleInstance() each time), so a plain
+  // instance member would reset to empty on every single re-attempt and never actually suppress
+  // anything -- confirmed live: the flip-flop was completely unaffected until this was moved here.
+  // Owned by this always-alive manager and handed to every instance as a shared_ptr so it survives
+  // across create/destroy cycles.
+  std::shared_ptr<std::optional<lanelet::Id>> last_exited_inverted_lanelet_id_ =
+    std::make_shared<std::optional<lanelet::Id>>(std::nullopt);
 };
 
 }  // namespace autoware::behavior_path_planner

@@ -156,6 +156,15 @@ struct PlanningValidatorData
     if (msg) {
       if (!msg->segments.empty()) {
         route_handler->setRoute(*msg);
+        // A new route/goal has been received: the previously-frozen last_valid_trajectory
+        // (which may belong to a completely different, now-irrelevant route) can no longer be
+        // used as a meaningful reference for shift/continuity checks against the trajectory the
+        // planners are about to produce for this new route. Drop it so check_trajectory_shift()
+        // treats this as "no reference yet" (same as node startup) instead of comparing the first
+        // trajectory of the new route against a stale one from an earlier trial, which would
+        // otherwise report a large, essentially permanent shift that can never self-clear (since
+        // last_valid_trajectory is only ever updated while the trajectory is fully valid).
+        last_valid_trajectory.reset();
       }
     }
   }

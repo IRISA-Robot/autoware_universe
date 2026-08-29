@@ -527,10 +527,57 @@ BehaviorModuleOutput createGoalAroundPath(const std::shared_ptr<const PlannerDat
 
   constexpr double backward_length = 1.0;
   const auto arc_coord = lanelet::utils::getArcCoordinates({goal_lane}, goal_pose);
-  const double s_start = std::max(arc_coord.length - backward_length, 0.0);
-  const double s_end = arc_coord.length;
+  double s_start = std::max(arc_coord.length - backward_length, 0.0);
+  double s_end = arc_coord.length;
 
-  auto reference_path = route_handler->getCenterLinePath({goal_lane}, s_start, s_end);
+  // Self-recovering fallback: this function is only ever invoked once PlannerManager::run()
+  // decides ego is "out of route" with no module running (see isEgoOutOfRoute()) -- a condition
+  // that can fire on a transient/borderline lane-membership check (either side: ego not yet
+  // registering as "in" the lane, or ego having just barely crossed past the goal on the same
+  // lane), not only when ego is genuinely parked exactly at the goal. If we always build only the
+  // last `backward_length` (1m) before the nominal goal arc-length, and ego's actual position is
+  // some real distance before or after that window, the resulting path is a short stub teleported
+  // away from ego. Downstream, planning_validator's trajectory-shift check (correctly) rejects
+  // that as a discontinuous trajectory, which latches an MRM emergency stop with nothing left to
+  // ever publish a valid, ego-connected trajectory again -- a permanent stall with no
+  // self-recovery. If ego's own current position still projects validly onto this same goal
+  // lanelet, extend the fallback path's window to include it, so it always stays continuous with
+  // ego's actual position (still a stop-in-place path -- velocity is forced to zero below
+  // regardless of this extension).
+  const auto & ego_pose = planner_data->self_odometry->pose.pose;
+  const auto ego_arc_coord = lanelet::utils::getArcCoordinates({goal_lane}, ego_pose);
+  if (ego_arc_coord.length >= 0.0) {
+    s_start = std::min(s_start, ego_arc_coord.length);
+    s_end = std::max(s_end, ego_arc_coord.length);
+  }
+
+  // [BIDIR-BUG-FIX] The extension above only helps when ego still projects onto goal_lane at
+  // all -- it does nothing when "out of route" fires far from the goal, mid-route (e.g. right at
+  // a direction-change boundary such as taman's 18(inv) -> 291(fwd), where reverse_lane_follow's
+  // own hand-off can transiently race isEgoOutOfRoute()'s lane-membership check). In that case
+  // s_start/s_end are still the goal-relative window computed above, so the emitted path is a
+  // short stub built around the GOAL, potentially many tens of meters from where ego actually is
+  // -- exactly the "trajectory too far from ego in longitudinal direction" / MRM-latch failure
+  // mode this whole function's self-recovering fallback is meant to prevent. Determine ego's own
+  // closest route lanelet directly (do not rely on the sign/range of ego_arc_coord projected onto
+  // goal_lane to detect "ego is nowhere near the goal" -- that projection is not guaranteed to be
+  // negative just because ego is on a completely different, far-away lanelet). If ego's own
+  // lanelet differs from goal_lane, rebuild the stop-in-place window around THAT lanelet and
+  // ego's own arc-length position on it instead, so this fallback always stays continuous with
+  // ego's actual position, not just the "already near the goal" case the original window math
+  // assumed.
+  auto fallback_lane = goal_lane;
+  lanelet::ConstLanelet ego_lane;
+  if (
+    route_handler->getClosestLaneletWithinRoute(ego_pose, &ego_lane) &&
+    ego_lane.id() != goal_lane.id()) {
+    fallback_lane = ego_lane;
+    const auto ego_lane_arc_coord = lanelet::utils::getArcCoordinates({ego_lane}, ego_pose);
+    s_start = std::max(ego_lane_arc_coord.length - backward_length, 0.0);
+    s_end = std::max(ego_lane_arc_coord.length, s_start);
+  }
+
+  auto reference_path = route_handler->getCenterLinePath({fallback_lane}, s_start, s_end);
 
   const auto drivable_lanelets = getLaneletsFromPath(reference_path, route_handler);
   const auto drivable_lanes = generateDrivableLanes(drivable_lanelets);

@@ -39,12 +39,14 @@ void ArrivalChecker::set_goal()
 {
   // Ignore the modified goal after the route is cleared.
   goal_with_uuid_ = std::nullopt;
+  is_reversed_goal_ = false;
 }
 
-void ArrivalChecker::set_goal(const PoseWithUuidStamped & goal)
+void ArrivalChecker::set_goal(const PoseWithUuidStamped & goal, bool is_reversed_goal)
 {
   // Ignore the modified goal for the previous route using uuid.
   goal_with_uuid_ = goal;
+  is_reversed_goal_ = is_reversed_goal;
 }
 
 bool ArrivalChecker::is_arrived(const PoseStamped & pose) const
@@ -81,8 +83,12 @@ bool ArrivalChecker::is_arrived(const PoseStamped & pose) const
     longitudinal_offset_to_goal >= -arrival_check_longitudinal_undershoot_distance_ &&
     longitudinal_offset_to_goal <= arrival_check_longitudinal_overshoot_distance_;
 
-  // Check angle.
-  const bool is_within_angle_range = std::fabs(yaw_diff) <= angle_;
+  // Check angle. Bypassed entirely for a reversed-goal route (bidirectional-driving reverse
+  // approach): the vehicle's final heading when backing into a goal has no fixed, predictable
+  // relationship to the stored goal orientation (depends on approach curvature), so gating on it
+  // would spuriously fail arrival even when position is correct and the vehicle is stopped.
+  // Ordinary (non-reversed) goals are unaffected -- is_reversed_goal_ defaults to false.
+  const bool is_within_angle_range = is_reversed_goal_ || (std::fabs(yaw_diff) <= angle_);
 
   if (!is_within_lateral_range || !is_within_longitudinal_range || !is_within_angle_range) {
     return false;

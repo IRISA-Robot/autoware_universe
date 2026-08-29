@@ -319,6 +319,29 @@ bool DefaultPlanner::is_goal_valid(const geometry_msgs::msg::Pose & goal)
     if (std::abs(angle_diff) < th_angle) {
       return true;
     }
+
+    // Bidirectional-driving support: the forward-angle check above only ever compares against
+    // closest_lanelet_to_goal's forward tangent, so a goal facing "backward" relative to the lane
+    // (i.e. positioned for a reverse-lane-follow approach) would otherwise be rejected here before
+    // routing is ever attempted -- even on a lanelet that explicitly allows bidirectional driving.
+    // Gated on param_.allow_reverse_route (same flag that gates RouteHandler's reverse-candidate
+    // search) so this relaxation only activates where the reverse-route capability itself is
+    // enabled. The footprint-inside-lane geometric check above (unconditional) remains the real
+    // safety backstop regardless of orientation -- neither "forward" nor "exactly reversed" has any
+    // fixed physical relationship to a reverse-lane-follow goal's actual required heading, so a full
+    // bypass here is no more permissive than accepting a goal whose angle happens to fall within
+    // th_angle of forward.
+    if (
+      param_.allow_reverse_route &&
+      route_handler_.isBidirectionalDrivingLanelet(closest_lanelet_to_goal)) {
+      RCLCPP_INFO(
+        logger,
+        "Goal on bidirectional_driving lanelet %ld: bypassing goal_angle_threshold_deg check "
+        "(goal_yaw=%.1f deg, lane_yaw=%.1f deg, diff=%.1f deg).",
+        closest_lanelet_to_goal.id(), autoware_utils::rad2deg(goal_yaw),
+        autoware_utils::rad2deg(lane_yaw), autoware_utils::rad2deg(angle_diff));
+      return true;
+    }
   }
 
   // check if goal is in parking space

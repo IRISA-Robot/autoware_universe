@@ -522,16 +522,52 @@ bool isEgoOutOfRoute(
   // If ego vehicle is out of the closest lanelet, return true
   // Check if ego vehicle is in shoulder lane
   const bool is_in_shoulder_lane = !route_handler->getShoulderLaneletsAtPose(self_pose).empty();
-  // Check if ego vehicle is in road lane
+  // Check if ego vehicle is in road lane.
+  // NOTE: isInLanelet()'s default radius is 0 (a strict point-in-polygon test), which has no
+  // tolerance at all for ordinary localization/tracking noise right at a lane's edge -- easy to
+  // trip transiently on a perfectly normal, on-route vehicle (e.g. immediately after a route
+  // change, before the vehicle has re-centered). A small positive tolerance, reusing the same
+  // 1.0m buffer already used a few lines above in this same function's "ego pose is beyond goal"
+  // check, avoids flagging "out of route" (and the resulting createGoalAroundPath() fallback /
+  // possible MRM latch) on what is really just ordinary lateral slack.
+  constexpr double lane_membership_tolerance_m = 1.0;
   const bool is_in_road_lane = std::invoke([&]() {
-    if (lanelet::utils::isInLanelet(self_pose, closest_road_lane)) {
+    if (lanelet::utils::isInLanelet(self_pose, closest_road_lane, lane_membership_tolerance_m)) {
       return true;
     }
 
     // check previous lanes for backward driving (e.g. pull out)
-    const auto prev_lanes = route_handler->getPreviousLanelets(closest_road_lane);
+    //
+    // [BIDIR-BUG-FIX] Use the *WithinRoute() accessors (route-scoped, and aware of
+    // RouteHandler::extra_boundary_links_ -- the mirrored-adjacency fallback added for lanelets
+    // whose left/right boundary-way roles are intentionally authored mirrored relative to their
+    // neighbors, e.g. 291 <-> 18/265 in the taman map), not the plain stock-routing-graph
+    // getPreviousLanelets()/getNextLanelets() this used before. Those two only see the stock
+    // graph, which by construction has NO edge at all for a mirrored-boundary link (that is
+    // exactly why extra_boundary_links_ exists) -- so right at such a boundary, this "check
+    // neighbor lanelets" fallback silently did nothing, and a vehicle crossing that exact boundary
+    // (e.g. reverse_lane_follow handing off from a reversed lanelet to the forward lanelet on the
+    // other side of a mirrored link) could hit a single planning cycle where ego is judged out of
+    // every neighbor lane it's actually adjacent to. With !is_any_module_running also true right
+    // at a module hand-off, that single cycle takes the createGoalAroundPath() fallback branch
+    // above in PlannerManager::run(), which downstream tripped planning_validator's trajectory
+    // continuity check and latched an MRM emergency stop the vehicle never recovered from --
+    // confirmed live: reproducible at the exact same position every trial, immediately after
+    // reverse_lane_follow's is_route_reversed_active FLIP true->false log line.
+    lanelet::ConstLanelets prev_lanes;
+    route_handler->getPreviousLaneletsWithinRoute(closest_road_lane, &prev_lanes);
     for (const auto & lane : prev_lanes) {
-      if (lanelet::utils::isInLanelet(self_pose, lane)) {
+      if (lanelet::utils::isInLanelet(self_pose, lane, lane_membership_tolerance_m)) {
+        return true;
+      }
+    }
+
+    // check next lanes too: closest_road_lane can lag ego by one cycle right after ego crosses
+    // into the next lanelet (current_route_lanelet_ is only updated once per planning cycle).
+    lanelet::ConstLanelets next_lanes;
+    route_handler->getNextLaneletsWithinRoute(closest_road_lane, &next_lanes);
+    for (const auto & lane : next_lanes) {
+      if (lanelet::utils::isInLanelet(self_pose, lane, lane_membership_tolerance_m)) {
         return true;
       }
     }

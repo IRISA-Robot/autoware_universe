@@ -67,7 +67,21 @@ struct ReverseLaneFollowParameters
   // cycle since it recenters on ego every tick) for diminishing benefit. Revisit if reverse routes
   // routinely exceed ~100 m.
   double route_reversed_forward_distance_m{150.0};
-  double route_reversed_backward_distance_m{15.0};
+  // [BIDIR-BUG-FIX #2] Bumped from 15.0. buildRouteReversedFollowPath() no longer gates
+  // activation purely on ego's *current* lanelet being flagged inverted-in-route -- it instead
+  // walks outward from ego's position using geometric heading continuity (see
+  // isHeadingContinuousAcross() in utils.cpp) and only requires that *some* lanelet within that
+  // continuous run is flagged inverted. As ego progresses forward through a multi-lanelet reverse
+  // maneuver (e.g. taman map's 18(inv) -> 291(fwd) -> 75(fwd), a single continuous curve, not a
+  // reversal), the lanelet that's actually flagged inverted can end up further and further behind
+  // ego -- this distance is what bounds how far back that continuity walk is allowed to look to
+  // (re)confirm "yes, we are still mid the same reverse episode that started back there." Too
+  // small and the module incorrectly deactivates mid-maneuver once ego outruns the window (handing
+  // off to normal forward-driving mode with a stale/wrong heading target -- the exact deadlock this
+  // fix addresses); too large costs a bit of wasted lanelet-sequence/centerline work every cycle
+  // for routes with no reverse segment nearby. 100 m comfortably covers this vehicle's short
+  // parking/backing-out maneuvers; revisit if a route needs a longer one.
+  double route_reversed_backward_distance_m{100.0};
 };
 
 // This module's own "am I currently retracing" status flag -- the reverse-lane-follow analogue of

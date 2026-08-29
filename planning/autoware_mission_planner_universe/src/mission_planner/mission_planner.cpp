@@ -495,7 +495,14 @@ void MissionPlanner::change_route(const LaneletRoute & route)
 
   current_route_ = std::make_shared<LaneletRoute>(route);
   planner_->updateRoute(route);
-  arrival_checker_.set_goal(goal);
+  // Bidirectional-driving support: the route's final segment tells us whether ego approaches the
+  // goal traveling in the inverted (reverse) direction of the goal lanelet -- if so, arrival must
+  // not gate on yaw alignment (see ArrivalChecker::set_goal()/is_arrived()). This field is only
+  // populated authoritatively for routes built via the normal plan()/SetWaypointRoute path (what
+  // RViz's 2D Goal Pose uses); a route supplied via SetLaneletRoute with pre-built segments from
+  // some other producer could default is_reversed=false if that producer never set it.
+  const bool is_reversed_goal = !route.segments.empty() && route.segments.back().is_reversed;
+  arrival_checker_.set_goal(goal, is_reversed_goal);
 
   pub_route_->publish(route);
   pub_marker_->publish(planner_->visualize(route, goal_lanelet_transparency_));

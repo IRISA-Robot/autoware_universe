@@ -45,7 +45,8 @@ public:
     const std::unordered_map<std::string, std::shared_ptr<RTCInterface>> & rtc_interface_ptr_map,
     std::unordered_map<std::string, std::shared_ptr<ObjectsOfInterestMarkerInterface>> &
       objects_of_interest_marker_interface_ptr_map,
-    const std::shared_ptr<PlanningFactorInterface> planning_factor_interface);
+    const std::shared_ptr<PlanningFactorInterface> planning_factor_interface,
+    const std::shared_ptr<std::optional<lanelet::Id>> & last_exited_inverted_lanelet_id);
 
   bool isExecutionRequested() const override;
   bool isExecutionReady() const override;
@@ -89,6 +90,29 @@ private:
   // alternative/additional activation trigger alongside the retrace-request trigger -- see
   // buildRouteReversedFollowPath().
   void updateRouteReversedFollow();
+
+  // [BIDIR-BUG-FIX] One-way latch used to stop is_route_reversed_active from flip-flopping right
+  // at a mid-route direction-change boundary (e.g. taman map's 18(inv) -> 291(fwd)):
+  // getClosestLaneletWithinRoute() has no hysteresis, so as ego's pose sits within centimeters of
+  // the shared boundary line, "closest lanelet" (and therefore is_inverted) can toggle several
+  // times across consecutive planning cycles before settling. Each toggle re-emits a full
+  // buildRouteReversedFollowPath() window built from ego's pose *at that instant*, so a vehicle
+  // caught mid-oscillation can end up handed a forward-driving reference built from a slightly
+  // different ego pose/velocity state each cycle -- observed live as an intermittent, several
+  // -meter lateral excursion right at hand-off (ego ends up outside isEgoOutOfRoute()'s tolerance
+  // and the whole route stalls) roughly half the time, even though the module's own direction
+  // logic is otherwise correct. Once ego is seen to have genuinely left a given inverted lanelet
+  // (a false transition), physically it should never need to re-enter reverse mode for that same
+  // lanelet again -- re-arming only ever happens because of boundary-line noise, not a real
+  // reversal of travel intent. Remember the id of the lanelet we just exited and refuse to
+  // reactivate for it again, for the remaining lifetime of this node (see scene.cpp's
+  // processOnEntry() for why there is no reliable earlier point to reset this).
+  //
+  // Owned by the (always-alive) ReverseLaneFollowModuleManager, not this instance: the planner
+  // manager creates a *brand-new* ReverseLaneFollowModule via createNewSceneModuleInstance() for
+  // every activation attempt, so a plain instance member here would reset on every single
+  // re-attempt and never actually suppress anything (confirmed live).
+  std::shared_ptr<std::optional<lanelet::Id>> last_exited_inverted_lanelet_id_;
 
   std::shared_ptr<ReverseLaneFollowParameters> parameters_;
   std::shared_ptr<autoware_utils::InterProcessPollingSubscriber<std_msgs::msg::Float64>>
