@@ -623,13 +623,36 @@ void SimplePlanningSimulator::set_input(const Control & cmd, const double acc_by
   Eigen::VectorXd input(vehicle_model_ptr_->getDimU());
   const auto gear = vehicle_model_ptr_->getGear();
 
-  // TODO(Watanabe): The definition of the sign of acceleration in REVERSE mode is different
-  // between .auto and proposal.iv, and will be discussed later.
+  // NOTE: `acc_by_cmd` (Control.longitudinal.acceleration) is published by
+  // autoware_pid_longitudinal_controller as a gear-relative quantity: always positive to
+  // accelerate in the current direction of travel, regardless of gear (see
+  // PidLongitudinalController::applyVelocityFeedback / applySlopeCompensation, both explicitly
+  // documented "Acceleration command is always positive ... even if the ego drives backward").
+  // The REVERSE branch below must therefore negate it to convert to the frame/body-signed
+  // acceleration this vehicle model's VX (see calcModel()) is integrated in.
+  //
+  // `acc_by_slope`, by contrast, is already frame/body-signed: calculate_ego_pitch() computes it
+  // relative to the vehicle's own nose (yaw) direction, independent of gear, so it must NOT be
+  // negated here -- for FORWARD it is simply added.
+  //
+  // However, the controller's OWN slope pre-compensation (applySlopeCompensation) estimates pitch
+  // along the trajectory's direction-of-travel (not the vehicle's nose), and for REVERSE flips its
+  // sign relative to that estimate. When the vehicle's nose does not match the direction of
+  // travel (which is *always* true in reverse -- and doubly so when reverse_lane_follow drives an
+  // inverted lanelet backward), that controller-side compensation ends up in the SAME frame-signed
+  // direction as this simulator's own `acc_by_slope`, rather than the opposite. Since acc_by_cmd
+  // already carries that (same-signed) compensation baked in, adding acc_by_slope again on top (as
+  // the old `-acc_by_cmd + acc_by_slope` did) double-counts it and can flip combined_acc positive
+  // while gear==REVERSE, which permanently latches the hard VX>0 safety guard in
+  // updateStateWithGear() (freeze-in-a-loop). Subtracting acc_by_slope here instead cancels that
+  // double-count and was verified live (see [SLOPE-DEBUG]/[SLOPE-DEBUG-CTRL] traces) to keep VX
+  // negative during a real reverse-lane-follow descent/ascent on a sloped map, matching the
+  // FORWARD branch's cancellation behavior.
   const float combined_acc = [&] {
     if (gear == GearCommand::NONE) {
       return 0.0;
     } else if (gear == GearCommand::REVERSE || gear == GearCommand::REVERSE_2) {
-      return -acc_by_cmd + acc_by_slope;
+      return -acc_by_cmd - acc_by_slope;
     } else {
       return acc_by_cmd + acc_by_slope;
     }
