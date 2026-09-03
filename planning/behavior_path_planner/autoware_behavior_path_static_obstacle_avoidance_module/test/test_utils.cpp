@@ -2296,7 +2296,12 @@ TEST(TestUtils, AlwaysAvoidFlagNeverBypassesLateralRoomCheck)
 
   // (b) computeFeasibleShiftProfile(): even with the global override on and the object marked
   // "committed", a vehicle too wide to physically fit beside the object (hard lateral margin
-  // check fails) must still be refused.
+  // check fails) must still be refused -- eventually. [REV-F2 fix 2026-09-03] committed objects
+  // now get a small consecutive-cycle debounce on this specific check (see
+  // ObjectData::hard_margin_infeasible_streak / kHardMarginDebounceCycles in
+  // shift_line_generator.cpp) so a single noisy cycle doesn't immediately null out
+  // new_shift_line. This does NOT weaken the check itself: once the streak reaches the debounce
+  // threshold, the object is still refused, every time, from then on.
   {
     // A large vehicle_width forces the final hard-margin geometric feasibility check to fail
     // regardless of how much shift is jerk-feasible.
@@ -2309,13 +2314,99 @@ TEST(TestUtils, AlwaysAvoidFlagNeverBypassesLateralRoomCheck)
     const auto remaining_distance = 0.9 * min_avoidance_distance;
     const auto prepare_distance = fixture.helper->getNominalPrepareDistance();
 
+    // Must match shift_line_generator.cpp's kHardMarginDebounceCycles.
+    constexpr int kHardMarginDebounceCycles = 3;
+
     auto object = fixture.make_object(prepare_distance + remaining_distance);
     object.is_avoidance_committed = true;
 
-    const auto result = fixture.generator.computeFeasibleShiftProfile(object, desire_shift_length, 0.0);
+    // First kHardMarginDebounceCycles consecutive failing cycles are debounced: the check still
+    // fails underneath, but the object is not yet treated as genuinely infeasible.
+    for (int cycle = 0; cycle < kHardMarginDebounceCycles; ++cycle) {
+      const auto result =
+        fixture.generator.computeFeasibleShiftProfile(object, desire_shift_length, 0.0);
+      EXPECT_TRUE(result.has_value()) << "cycle " << cycle;
+      EXPECT_EQ(object.hard_margin_infeasible_streak, cycle + 1);
+    }
+
+    // The check has now failed kHardMarginDebounceCycles times in a row: refused for real, same
+    // outcome as the un-debounced check would have produced immediately.
+    const auto result =
+      fixture.generator.computeFeasibleShiftProfile(object, desire_shift_length, 0.0);
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(object.info, ObjectInfo::NEED_DECELERATION);
   }
+
+  // (c) The debounce in (b) only applies to already is_avoidance_committed objects -- a
+  // newly-encountered object (not yet committed) still gets the strict, non-debounced check and
+  // is refused on the very first cycle, exactly as before this fix.
+  {
+    AlwaysAvoidTestFixture fixture(/*vehicle_width=*/50.0);
+    fixture.parameters->always_avoid_if_geometrically_possible = true;
+
+    constexpr double desire_shift_length = 1.5;
+    const auto avoiding_shift = desire_shift_length;
+    const auto min_avoidance_distance = fixture.helper->getMinAvoidanceDistance(avoiding_shift);
+    const auto remaining_distance = 0.9 * min_avoidance_distance;
+    const auto prepare_distance = fixture.helper->getNominalPrepareDistance();
+
+    auto object = fixture.make_object(prepare_distance + remaining_distance);
+    object.is_avoidance_committed = false;
+
+    const auto result =
+      fixture.generator.computeFeasibleShiftProfile(object, desire_shift_length, 0.0);
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(object.info, ObjectInfo::NEED_DECELERATION);
+  }
+}
+
+// [REV-F2 fix 2026-09-03] direct regression test for the debounce mechanism itself: a committed
+// object whose hard-margin check flips infeasible for a single, isolated cycle (pose/overhang
+// jitter) must still produce a feasible shift that cycle, and the streak must reset to 0 the
+// moment the check passes again -- confirming this isn't a one-way ratchet toward permanent
+// refusal.
+TEST(TestUtils, ComputeFeasibleShiftProfileDebouncesSingleCycleHardMarginFlicker)
+{
+  AlwaysAvoidTestFixture fixture(/*vehicle_width=*/0.5);
+  fixture.parameters->always_avoid_if_geometrically_possible = false;
+
+  constexpr double desire_shift_length = 1.5;
+  const auto avoiding_shift = desire_shift_length;
+  const auto min_avoidance_distance = fixture.helper->getMinAvoidanceDistance(avoiding_shift);
+  ASSERT_GT(min_avoidance_distance, 0.0);
+  const auto remaining_distance = 0.9 * min_avoidance_distance;
+  const auto prepare_distance = fixture.helper->getNominalPrepareDistance();
+
+  auto object = fixture.make_object(prepare_distance + remaining_distance);
+  object.is_avoidance_committed = true;
+  // Overhang set at the object's expected shift target: with the nominal vehicle_width=0.5 below
+  // the hard-margin check passes (plenty of clearance vs. the small half-width + relaxed floor);
+  // temporarily inflating vehicle_width simulates the boundary-condition jitter (observed live as
+  // ~5.5mm from the threshold) without needing to reverse-engineer the exact jerk-limited
+  // feasible_shift_length value.
+  object.overhang_points.front().first = desire_shift_length;
+
+  // Cycle 1: hard-margin check passes normally (vehicle_width=0.5, plenty of clearance).
+  const auto pass_result =
+    fixture.generator.computeFeasibleShiftProfile(object, desire_shift_length, 0.0);
+  ASSERT_TRUE(pass_result.has_value());
+  EXPECT_EQ(object.hard_margin_infeasible_streak, 0);
+
+  // Cycle 2: simulate a single noisy cycle where the vehicle's effective half-width vs. the
+  // object's overhang trips the hard-margin check. Must still produce a feasible shift
+  // (debounced), not nullopt.
+  fixture.planner_data->parameters.vehicle_width = 50.0;
+  const auto jitter_result =
+    fixture.generator.computeFeasibleShiftProfile(object, desire_shift_length, 0.0);
+  EXPECT_TRUE(jitter_result.has_value());
+  EXPECT_EQ(object.hard_margin_infeasible_streak, 1);
+
+  // Cycle 3: jitter clears, vehicle_width back to normal -- streak resets to 0.
+  fixture.planner_data->parameters.vehicle_width = 0.5;
+  const auto recover_result =
+    fixture.generator.computeFeasibleShiftProfile(object, desire_shift_length, 0.0);
+  ASSERT_TRUE(recover_result.has_value());
+  EXPECT_EQ(object.hard_margin_infeasible_streak, 0);
 }
 
 // fillObjectAvoidanceCommitted(): the sticky flag persists across cycles as long as

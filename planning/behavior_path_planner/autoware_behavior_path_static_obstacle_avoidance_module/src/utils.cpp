@@ -2244,6 +2244,25 @@ void fillObjectAvoidanceCommitted(
     same_id_obj->is_avoidance_committed || same_id_obj->is_avoidable;
 }
 
+void fillObjectHardMarginDebounce(
+  ObjectData & object_data, const ObjectDataArray & previous_target_objects)
+{
+  // [REV-F2 debounce, 2026-09-03] see the sibling doc comment in utils.hpp / the field comment on
+  // ObjectData::hard_margin_infeasible_streak. Default to 0 (no prior failing streak) unless the
+  // previous cycle had a matching object with a streak already in progress.
+  const auto id = object_data.object.object_id;
+  const auto same_id_obj = std::find_if(
+    previous_target_objects.begin(), previous_target_objects.end(),
+    [&id](const auto & o) { return o.object.object_id == id; });
+
+  if (same_id_obj == previous_target_objects.end()) {
+    object_data.hard_margin_infeasible_streak = 0;
+    return;
+  }
+
+  object_data.hard_margin_infeasible_streak = same_id_obj->hard_margin_infeasible_streak;
+}
+
 void compensateLostTargetObjects(
   AvoidancePlanningData & data, const ObjectDataArray & stored_objects,
   const std::shared_ptr<const PlannerData> & planner_data)

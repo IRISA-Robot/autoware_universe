@@ -272,11 +272,41 @@ std::optional<std::pair<double, double>> ShiftLineGenerator::computeFeasibleShif
     std::abs(feasible_shift_length - object.overhang_points.front().first) - LAT_DIST_BUFFER <
     0.5 * data_->parameters.vehicle_width + kRelaxedHardMarginFloor;
   if (infeasible) {
+    // [REV-F2 fix 2026-09-03] This hard lateral-margin check is the one feasibility gate that
+    // is_avoidance_committed deliberately never bypasses (see the comment above
+    // bypass_longitudinal_gates) -- and rightly so, since it is a real physical-clearance
+    // boundary. But with no debounce, a single noisy cycle where pose/overhang jitter flips this
+    // check (observed margins as tight as 5.5mm at the boundary in the field) immediately
+    // returns nullopt here, which empties new_shift_line for the object, which makes
+    // isExecutionRequested() false that cycle, which makes the module manager treat the whole
+    // module as idle and reset it -- publishing a plain centerline path that cascades into
+    // obstacle_stop, then a fresh WAITING_APPROVAL re-request next cycle. See
+    // docs/research/avoidance-test-campaign.md, "Session 4 -- REV-F2" for the full root cause.
+    //
+    // Fix: for an object that is already is_avoidance_committed, require this check to fail for
+    // kHardMarginDebounceCycles consecutive cycles before actually treating it as infeasible.
+    // This does NOT loosen kRelaxedHardMarginFloor (the real safety boundary) at all -- it only
+    // delays acting on a failing outcome long enough to ride out single-cycle noise. A
+    // newly-encountered (not yet committed) object still gets the strict, non-debounced check,
+    // same as before this fix.
+    constexpr int kHardMarginDebounceCycles = 3;
+    if (
+      object.is_avoidance_committed &&
+      object.hard_margin_infeasible_streak < kHardMarginDebounceCycles) {
+      object.hard_margin_infeasible_streak += 1;
+      RCLCPP_DEBUG(
+        rclcpp::get_logger(""),
+        "hard margin check failed but debouncing for committed object (streak=%d/%d).",
+        object.hard_margin_infeasible_streak, kHardMarginDebounceCycles);
+      return std::make_pair(feasible_shift_length - LAT_DIST_BUFFER, avoidance_distance);
+    }
     RCLCPP_DEBUG(rclcpp::get_logger(""), "feasible shift length is not enough to avoid. ");
     object.info = ObjectInfo::NEED_DECELERATION;
     return std::nullopt;
   }
 
+  // hard margin check passed cleanly this cycle -- reset the debounce streak.
+  object.hard_margin_infeasible_streak = 0;
   return std::make_pair(feasible_shift_length - LAT_DIST_BUFFER, avoidance_distance);
 }
 

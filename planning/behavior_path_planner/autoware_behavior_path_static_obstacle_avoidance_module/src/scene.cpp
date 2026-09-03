@@ -281,29 +281,43 @@ void StaticObstacleAvoidanceModule::fillFundamentalData(
     return !planner_data_->route_handler->getRoutingGraphPtr()->right(*red_signal_lane_itr);
   }();
 
+  // [REV-F1 fix 2026-09-03] calcBound() (and the getRoadShoulderDistance()/getAvoidMargin() ray-
+  // cast that consumes its output) needs a densely-sampled path to produce a correct
+  // to_road_shoulder_distance. getPreviousModuleOutput().path is the raw/coarse upstream path --
+  // ordinarily dense, but as few as ~15 points across multiple lanelets/bends when
+  // reverse_lane_follow's "retrace" output is the active previous-module path. Feeding that raw
+  // path straight into calcBound() corrupted the ray-cast enough to make getAvoidMargin()'s hard-
+  // feasibility gate fail spuriously, which silently dropped otherwise-valid avoidance targets
+  // (root-caused in docs/research/avoidance-test-campaign.md, "ROOT CAUSE ANALYSIS: REV-F1").
+  // Fix: resample a local copy with the same interval used for data.reference_path before handing
+  // it to calcBound(), so the bound polyline's vertex density matches true lane geometry
+  // regardless of which upstream module produced the path.
+  const auto resampled_path_for_bound = utils::resamplePathWithSpline(
+    getPreviousModuleOutput().path, parameters_->resample_interval_for_planning);
+
   {
-    auto tmp_path = getPreviousModuleOutput().path;
+    auto tmp_path = resampled_path_for_bound;
     const auto shorten_lanes = utils::cutOverlappedLanes(tmp_path, data.drivable_lanes);
     data.left_bound = utils::calcBound(
-      getPreviousModuleOutput().path, planner_data_, shorten_lanes,
+      resampled_path_for_bound, planner_data_, shorten_lanes,
       use_left_side_hatched_road_marking_area, parameters_->use_intersection_areas,
       parameters_->use_freespace_areas, true);
     data.right_bound = utils::calcBound(
-      getPreviousModuleOutput().path, planner_data_, shorten_lanes,
+      resampled_path_for_bound, planner_data_, shorten_lanes,
       use_right_side_hatched_road_marking_area, parameters_->use_intersection_areas,
       parameters_->use_freespace_areas, false);
   }
 
   if (parameters_->policy_detection_reliability == "not_enough") {
-    auto tmp_path = getPreviousModuleOutput().path;
+    auto tmp_path = resampled_path_for_bound;
     const auto shorten_lanes =
       utils::cutOverlappedLanes(tmp_path, data.drivable_lanes_same_direction);
     data.left_bound_same_direction = utils::calcBound(
-      getPreviousModuleOutput().path, planner_data_, shorten_lanes,
+      resampled_path_for_bound, planner_data_, shorten_lanes,
       use_left_side_hatched_road_marking_area, parameters_->use_intersection_areas,
       parameters_->use_freespace_areas, true);
     data.right_bound_same_direction = utils::calcBound(
-      getPreviousModuleOutput().path, planner_data_, shorten_lanes,
+      resampled_path_for_bound, planner_data_, shorten_lanes,
       use_right_side_hatched_road_marking_area, parameters_->use_intersection_areas,
       parameters_->use_freespace_areas, false);
   }
@@ -442,6 +456,7 @@ void StaticObstacleAvoidanceModule::fillAvoidanceTargetData(ObjectDataArray & ob
   using utils::static_obstacle_avoidance::fillAvoidanceNecessity;
   using utils::static_obstacle_avoidance::fillObjectAvoidableByDesiredShiftLength;
   using utils::static_obstacle_avoidance::fillObjectAvoidanceCommitted;
+  using utils::static_obstacle_avoidance::fillObjectHardMarginDebounce;
   using utils::static_obstacle_avoidance::fillObjectStoppableJudge;
 
   // Calculate the distance needed to safely decelerate the ego vehicle to a stop line.
@@ -460,6 +475,9 @@ void StaticObstacleAvoidanceModule::fillAvoidanceTargetData(ObjectDataArray & ob
     fillObjectStoppableJudge(o, stored_objects_, feasible_stop_distance, parameters_);
     fillObjectAvoidableByDesiredShiftLength(o, avoid_data_.previous_target_objects);
     fillObjectAvoidanceCommitted(o, avoid_data_.previous_target_objects);
+    // [REV-F2 fix 2026-09-03] seed the hard-margin-check debounce streak from last cycle's
+    // matching object, before computeFeasibleShiftProfile() reads/updates it this cycle.
+    fillObjectHardMarginDebounce(o, avoid_data_.previous_target_objects);
   });
 }
 

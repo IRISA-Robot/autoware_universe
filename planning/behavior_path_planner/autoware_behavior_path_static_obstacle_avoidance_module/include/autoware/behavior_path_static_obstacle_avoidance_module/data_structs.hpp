@@ -497,6 +497,20 @@ struct ObjectData  // avoidance target
   // to centerline just because remaining longitudinal distance shrank as ego approached.
   bool is_avoidance_committed{false};
 
+  // [REV-F2 debounce, 2026-09-03] Consecutive-cycle counter for
+  // ShiftLineGenerator::computeFeasibleShiftProfile()'s hard lateral-margin feasibility check
+  // failing for this object while is_avoidance_committed is true. Persisted across cycles by
+  // matching object_id against previous_target_objects (see fillObjectHardMarginDebounce()).
+  // A single noisy cycle (e.g. pose/overhang jitter right at the hard-margin boundary -- observed
+  // margins as tight as 5.5mm in the field) must not immediately null out new_shift_line for an
+  // already-committed object, since that cascades into the module manager treating the whole
+  // module as idle and publishing a plain centerline path (see
+  // docs/research/avoidance-test-campaign.md, "Session 4 -- REV-F2"). Reset to 0 whenever the
+  // check passes; only after this streak reaches kHardMarginDebounceCycles consecutive failures
+  // is the object treated as genuinely infeasible. Does NOT change the hard-margin threshold
+  // itself (kRelaxedHardMarginFloor) -- purely a debounce on acting on the outcome.
+  int hard_margin_infeasible_streak{0};
+
   // is within intersection area
   bool is_within_intersection{false};
 

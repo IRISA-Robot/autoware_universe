@@ -244,6 +244,20 @@ void fillObjectAvoidableByDesiredShiftLength(
 void fillObjectAvoidanceCommitted(
   ObjectData & object_data, const ObjectDataArray & previous_target_objects);
 
+/**
+ * @brief [REV-F2 debounce, 2026-09-03] carry forward object_data.hard_margin_infeasible_streak
+ * from the previous cycle's matching object (by object_id), defaulting to 0 if not found (first
+ * time seen, or the previous cycle's hard-margin check passed / was never checked). This seeds
+ * the counter that ShiftLineGenerator::computeFeasibleShiftProfile() increments/resets on its own
+ * hard lateral-margin feasibility check, so a single noisy cycle at the boundary doesn't
+ * immediately null out new_shift_line for an already-committed object. See
+ * docs/research/avoidance-test-campaign.md, "Session 4 -- REV-F2".
+ * @param object_data current-cycle object data.
+ * @param previous_target_objects previous cycle's target object list.
+ */
+void fillObjectHardMarginDebounce(
+  ObjectData & object_data, const ObjectDataArray & previous_target_objects);
+
 void updateClipObject(ObjectDataArray & clip_objects, AvoidancePlanningData & data);
 
 /**
