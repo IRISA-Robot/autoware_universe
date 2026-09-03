@@ -28,6 +28,11 @@
        RC_PL_BACKEND). Selalu di-set (override param_file dgn nilai yang sama). Default 'hsv'
        buat pemakaian standalone tanpa run script. -->
   <arg name="backend" default="hsv"/>
+  <!-- map_path: path absolut ke file lanelet2 OSM, dan satu-satunya sumber nilainya
+       (sengaja tidak ada di param_file supaya tidak saling menimpa).
+       Diteruskan oleh tier4_road_crossing_component.launch.xml dari map_path global.
+       Kosong = ROI berbasis map nonaktif (roi_source=map tidak akan dapat lampu). -->
+  <arg name="map_path" default=""/>
 
   <node
     pkg="autoware_pedestrian_light_detector"
@@ -38,5 +43,6 @@
     <param name="use_sim_time" value="$(var use_sim_time)"/>
     <param from="$(var param_file)"/>
     <param name="backend" value="$(var backend)"/>
+    <param name="map_path" value="$(var map_path)"/>
   </node>
 </launch>

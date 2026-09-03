@@ -131,7 +131,9 @@
     # map_path: path absolut ke file lanelet2 OSM.
     # Node akan mem-parse way dengan tag tf_pedestrian="true" dari file ini.
     # Parse dilakukan sekali saat startup (map dianggap statis).
-    map_path: "/home/ubuntu/sim_ws/maps/map1/lanelet2_map.osm"
+    # map_path SENGAJA tidak di-set di sini. Satu-satunya sumber adalah launch arg
+    # 'map_path' (tier4_road_crossing_component meneruskan map_path global Autoware).
+    # Kalau di-set di file ini, nilainya menimpa arg launch dan bikin path basi terpakai.
 
     # cameras: daftar nama kamera yang dimonitor untuk proyeksi.
     # Untuk setiap nama N, node men-subscribe:

@@ -179,6 +179,13 @@
   <group scoped="false" if="$(eval '&quot;$(var mode)&quot;==&quot;lidar&quot;')">
     <let name="switch/filter/pointcloud" value="true"/>
     <let name="switch/detector/lidar_dnn" value="true"/>
+    <!-- 2026-09-01: euclidean cluster (lidar_rule detector) DIAKTIFKAN KEMBALI (sempat
+         false sejak 2026-08-31). Objek UNKNOWN (blob) kembali terdeteksi — ini yang
+         dibutuhkan static_obstacle_avoidance, karena modul avoidance hanya bisa
+         menghindari PredictedObjects, bukan pointcloud mentah.
+         Tetap aman terhadap stall: use_multi_channel_tracker_merger=true di
+         tier4_perception_component.launch.xml, jadi switch/merger/lidar di bawah
+         bernilai false dan lidar_merger (message_filters sync) tidak dijalankan. -->
     <let name="switch/detector/lidar_rule" value="true"/>
     <let name="switch/merger/lidar" value="true" unless="$(var use_multi_channel_tracker_merger)"/>
     <let name="switch/detector/irregular_object" value="false"/>

@@ -166,10 +166,9 @@ class PedestrianLightDetectorNode(Node):
 
         # ---------- parameters: Fase 2 (map-based ROI) ----------
         # map_path: path ke file lanelet2 OSM
-        self.declare_parameter(
-            'map_path',
-            '/home/ubuntu/sim_ws/maps/map1/lanelet2_map.osm',
-        )
+        # Default kosong: path sebenarnya di-pass dari launch (map_path global).
+        # Jangan hardcode path mesin lain - bikin map mode diam-diam mati.
+        self.declare_parameter('map_path', '')
         # cameras: daftar nama kamera yang dimonitor
         self.declare_parameter('cameras', ['front', 'left', 'rear', 'right'])
         # roi_margin_px: margin piksel perluasan bbox proyeksi (padded bbox)
@@ -514,6 +513,14 @@ class PedestrianLightDetectorNode(Node):
 
     def _parse_map(self):
         """Parse OSM map dan cache hasilnya ke self._lights."""
+        if not self._map_path:
+            self.get_logger().error(
+                '[Fase 2] map_path kosong — ROI berbasis map nonaktif. '
+                'Set lewat launch arg map_path (tier4_road_crossing_component '
+                'meneruskannya dari map_path global).'
+            )
+            self._lights = []
+            return
         try:
             self._lights = parse_tf_pedestrian_lights(self._map_path)
             self.get_logger().info(

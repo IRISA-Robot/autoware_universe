@@ -1,7 +1,9 @@
 /**:
   ros__parameters:
     # Path to the lanelet2 OSM map file containing tf_pedestrian=true ways.
-    map_path: "/home/ubuntu/sim_ws/maps/map1/lanelet2_map.osm"
+    # map_path SENGAJA tidak di-set di sini. Satu-satunya sumber adalah launch arg
+    # 'map_path' (tier4_road_crossing_component meneruskan map_path global Autoware).
+    # Kalau di-set di file ini, nilainya menimpa arg launch dan bikin path basi terpakai.
 
     # TF frames
     base_frame: "base_link"

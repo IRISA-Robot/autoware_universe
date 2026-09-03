@@ -113,10 +113,9 @@ class RotaryAimerNode(Node):
         super().__init__('rotary_aimer')
 
         # ------------------------------------------------------------------ params
-        self.declare_parameter(
-            'map_path',
-            '/home/ubuntu/sim_ws/maps/map1/lanelet2_map.osm',
-        )
+        # Default kosong: path sebenarnya di-pass dari launch (map_path global).
+        # Jangan hardcode path mesin lain.
+        self.declare_parameter('map_path', '')
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('output_topic', '/control/rotary_angle_cmd')

@@ -10,8 +10,7 @@
        default="$(find-pkg-share autoware_rotary_aimer)/config/rotary_aimer.param.yaml"/>
 
   <!-- Optional: override map path via launch arg (convenience shortcut) -->
-  <arg name="map_path"
-       default="/home/ubuntu/sim_ws/maps/map1/lanelet2_map.osm"/>
+  <arg name="map_path" default=""/>
 
   <!-- Optional: start enabled -->
   <arg name="start_enabled" default="false"/>
