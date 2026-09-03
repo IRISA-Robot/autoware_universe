@@ -119,8 +119,14 @@ std::optional<std::pair<double, double>> ShiftLineGenerator::computeFeasibleShif
   ObjectData & object, const double desire_shift_length, const double current_ego_shift) const
 {
   // use each object param
+  //
+  // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] object_type/object_parameter were previously used below to
+  // look up the per-object-class lateral_hard_margin for the "infeasible" gate; that gate now uses
+  // a fixed kRelaxedHardMarginFloor instead (see the comment at that gate), so these two locals
+  // are unused here now. Left as [[maybe_unused]] rather than deleted in case a future config-flag
+  // reinstatement of the original gate wants them back.
   const auto object_type = utils::getHighestProbLabel(object.object.classification);
-  const auto object_parameter = parameters_->object_parameters.at(object_type);
+  [[maybe_unused]] const auto object_parameter = parameters_->object_parameters.at(object_type);
   const auto is_object_on_right = utils::static_obstacle_avoidance::isOnRight(object);
 
   // use absolute dist for return-to-center, relative dist from current for avoiding.
@@ -142,21 +148,6 @@ std::optional<std::pair<double, double>> ShiftLineGenerator::computeFeasibleShif
   // the hard lateral-margin geometric feasibility check further below) is NEVER bypassed.
   const auto bypass_longitudinal_gates =
     parameters_->always_avoid_if_geometrically_possible || object.is_avoidance_committed;
-
-  {
-    static auto logger = rclcpp::get_logger("static_obstacle_avoidance_shift_line_generator");
-    static rclcpp::Clock steady_clock{RCL_ROS_TIME};
-    RCLCPP_WARN_THROTTLE(
-      logger, steady_clock, 1000,
-      "[AVOID-DEBUG] computeFeasibleShiftProfile: always_avoid_if_geometrically_possible=%s "
-      "is_avoidance_committed=%s bypass_longitudinal_gates=%s prepare_distance=%.2f "
-      "constant_distance=%.2f nominal_avoid_distance=%.2f has_enough_distance=%s "
-      "avoidance_distance=%.2f",
-      (parameters_->always_avoid_if_geometrically_possible ? "true" : "false"),
-      (object.is_avoidance_committed ? "true" : "false"),
-      (bypass_longitudinal_gates ? "true" : "false"), prepare_distance, constant_distance,
-      nominal_avoid_distance, (has_enough_distance ? "true" : "false"), avoidance_distance);
-  }
 
   // nominal case. avoidable.
   if (has_enough_distance) {
@@ -239,7 +230,20 @@ std::optional<std::pair<double, double>> ShiftLineGenerator::computeFeasibleShif
   const auto feasible_relative_shift_length = autoware::motion_utils::calc_lateral_dist_from_jerk(
     clamped_avoidance_distance, helper_->getLateralMaxJerkLimit(), helper_->getAvoidanceEgoSpeed());
 
-  if (std::abs(feasible_relative_shift_length) < parameters_->lateral_execution_threshold) {
+  // NOTE: when bypass_longitudinal_gates is true and avoidance_distance was negative/near-zero
+  // (object very close, e.g. right after the "prepare + constant distance" buffers already
+  // exceed the remaining longitudinal room), clamped_avoidance_distance above was floored to
+  // MIN_AVOIDANCE_DISTANCE_FLOOR (1cm). calc_lateral_dist_from_jerk() over 1cm of travel is
+  // essentially always going to be smaller than lateral_execution_threshold, so this check used
+  // to fire unconditionally in that situation -- silently defeating the whole point of
+  // always_avoid_if_geometrically_possible / is_avoidance_committed (both feed
+  // bypass_longitudinal_gates), which exist specifically to keep attempting avoidance instead of
+  // giving up, for as long as there is still valid lateral room (avoid_margin.has_value(), never
+  // bypassed -- see the has_enough_distance block above). Same exemption pattern already used for
+  // the other two longitudinal gates in this function (lines above / below).
+  if (
+    !bypass_longitudinal_gates &&
+    std::abs(feasible_relative_shift_length) < parameters_->lateral_execution_threshold) {
     object.info = ObjectInfo::LESS_THAN_EXECUTION_THRESHOLD;
     return std::nullopt;
   }
@@ -257,12 +261,16 @@ std::optional<std::pair<double, double>> ShiftLineGenerator::computeFeasibleShif
 
   const double LAT_DIST_BUFFER = desire_shift_length > 0.0 ? 1e-3 : -1e-3;
 
-  const auto lateral_hard_margin = object.is_parked
-                                     ? object_parameter.lateral_hard_margin_for_parked_vehicle
-                                     : object_parameter.lateral_hard_margin;
+  // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] Second occurrence of the hard lateral-margin safety floor
+  // named in the user's directive (see docs/research/always-avoid-constraint-removal.md and the
+  // sibling comment at getAvoidMargin() in utils.cpp -- same rationale, same blocked-full-removal
+  // situation, same fix pattern). Relaxed to a few cm floor instead of the full per-object-class
+  // lateral_hard_margin; half the vehicle width is kept in full since it is the ego's actual
+  // physical footprint, not a tunable buffer.
+  constexpr double kRelaxedHardMarginFloor = 0.03;  // [m], ~3cm, intentionally non-zero.
   const auto infeasible =
     std::abs(feasible_shift_length - object.overhang_points.front().first) - LAT_DIST_BUFFER <
-    0.5 * data_->parameters.vehicle_width + lateral_hard_margin;
+    0.5 * data_->parameters.vehicle_width + kRelaxedHardMarginFloor;
   if (infeasible) {
     RCLCPP_DEBUG(rclcpp::get_logger(""), "feasible shift length is not enough to avoid. ");
     object.info = ObjectInfo::NEED_DECELERATION;
@@ -327,8 +335,56 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
     // is laterally biased (e.g. prefer_lateral_ratio). See data_structs.hpp for details.
     const auto desire_shift_length =
       helper_->getShiftLength(o, o.is_on_right_of_true_lane, o.avoid_margin.value());
-    if (utils::static_obstacle_avoidance::isSameDirectionShift(
-          o.is_on_right_of_true_lane, desire_shift_length)) {
+    // ROOT CAUSE (confirmed): isSameDirectionShift(is_right, shift) is, by construction, the exact
+    // logical complement of isShiftNecessary(is_right, shift) -- i.e. is_same_direction_shift==true
+    // can ONLY happen for an object whose (is_on_right_of_true_lane, overhang_dist, avoid_margin)
+    // triple would ALSO fail isNoNeedAvoidanceBehavior()'s ENOUGH_LATERAL_DISTANCE check, using the
+    // SAME inputs. Every object here already passed that exact gate once in filterTargetObjects().
+    // The only way to reach this point with is_same_direction_shift==true is for avoid_margin /
+    // is_on_right_of_true_lane to have been RE-DERIVED afterward against a STALE overhang_dist:
+    //  - updateRoadShoulderDistance() (utils.cpp) re-derives both fields for every object already
+    //    in data.target_objects, every cycle, without re-running isNoNeedAvoidanceBehavior() -- if
+    //    avoid_margin narrows (e.g. another object now clips the drivable road-shoulder), the
+    //    object's fixed overhang_dist can end up on the "already clear" side of the new margin.
+    //  - compensateLostTargetObjects() carries a previous-cycle object straight into
+    //    data.target_objects with no filtering at all.
+    // "Already clear relative to the (possibly narrowed) margin" is exactly the same, harmless
+    // ENOUGH_LATERAL_DISTANCE condition isNoNeedAvoidanceBehavior treats as a silent no-op -- it is
+    // NOT a wrong-signed "shift toward the object" and must not be escalated to
+    // SAME_DIRECTION_SHIFT, which callers treat as "absolutely not avoidable" and which can
+    // `break` outline generation for every other target object behind this one. Re-validate with
+    // isShiftNecessary (the same check isNoNeedAvoidanceBehavior uses) right before trusting the
+    // sign, so a stale/narrowed margin degrades to a harmless skip instead of a false "unavoidable".
+    const auto is_shift_still_necessary = utils::static_obstacle_avoidance::isShiftNecessary(
+      o.is_on_right_of_true_lane, desire_shift_length);
+    const auto is_same_direction_shift =
+      is_shift_still_necessary && utils::static_obstacle_avoidance::isSameDirectionShift(
+                                     o.is_on_right_of_true_lane, desire_shift_length);
+    {
+      static auto logger = rclcpp::get_logger("static_obstacle_avoidance_shift_line_generator");
+      static rclcpp::Clock steady_clock{RCL_ROS_TIME};
+      RCLCPP_WARN_THROTTLE(
+        logger, steady_clock, 500,
+        "[AVOID-DEBUG] generateAvoidOutline id=%s longitudinal=%.2f is_on_right_of_true_lane=%s "
+        "avoid_margin=%.3f desire_shift_length=%.3f is_shift_still_necessary=%s "
+        "is_same_direction_shift=%s current_ego_shift=%.3f",
+        autoware_utils::to_hex_string(o.object.object_id).c_str(), o.longitudinal,
+        (o.is_on_right_of_true_lane ? "true" : "false"), o.avoid_margin.value(),
+        desire_shift_length, (is_shift_still_necessary ? "true" : "false"),
+        (is_same_direction_shift ? "true" : "false"), current_ego_shift);
+    }
+    if (!is_shift_still_necessary) {
+      // See the ROOT CAUSE comment above `is_shift_still_necessary`: reaching here with a
+      // shift that is no longer necessary (per the SAME check isNoNeedAvoidanceBehavior uses)
+      // means avoid_margin/is_on_right_of_true_lane were re-derived (e.g. by
+      // updateRoadShoulderDistance()) against a stale overhang_dist after this object already
+      // passed the filter once. Treat it exactly like isNoNeedAvoidanceBehavior would: harmless,
+      // not "unavoidable" -- do not mark SAME_DIRECTION_SHIFT and do not break/limit downstream
+      // objects.
+      o.info = ObjectInfo::ENOUGH_LATERAL_DISTANCE;
+      continue;
+    }
+    if (is_same_direction_shift) {
       o.info = ObjectInfo::SAME_DIRECTION_SHIFT;
       if (o.avoid_required && is_forward_object(o) && is_on_path(o)) {
         break;
@@ -341,6 +397,15 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
     // calculate feasible shift length based on behavior policy
     const auto feasible_shift_profile = get_shift_profile(o, desire_shift_length);
     if (!feasible_shift_profile.has_value()) {
+      static auto logger = rclcpp::get_logger("static_obstacle_avoidance_shift_line_generator");
+      static rclcpp::Clock steady_clock{RCL_ROS_TIME};
+      RCLCPP_WARN_THROTTLE(
+        logger, steady_clock, 500,
+        "[AVOID-DEBUG] generateAvoidOutline id=%s NO_FEASIBLE_SHIFT_PROFILE is_approved=%s "
+        "avoid_required=%s is_forward=%s is_on_path=%s",
+        autoware_utils::to_hex_string(o.object.object_id).c_str(),
+        (is_approved(o) ? "true" : "false"), (o.avoid_required ? "true" : "false"),
+        (is_forward_object(o) ? "true" : "false"), (is_on_path(o) ? "true" : "false"));
       if (is_approved(o)) {
         // the avoidance path for this object has already approved
         o.is_avoidable = true;
@@ -530,6 +595,19 @@ AvoidLineArray ShiftLineGenerator::generateCandidateShiftLine(
 {
   AvoidLineArray processed_shift_lines = shift_lines;
 
+  // Same "longitudinal gates bypassed" condition as
+  // ShiftLineGenerator::computeFeasibleShiftProfile(): either the global "always avoid" override
+  // is on, or at least one of this cycle's target objects has already been committed to (found
+  // avoidable in a previous cycle, still with a valid lateral avoid_margin). Recomputed here
+  // (rather than read off the post-merge AvoidLine) because the merge step
+  // (extractShiftLinesFromLine) rebuilds shift lines from the blended shift-length profile and
+  // does not carry over the originating object's is_avoidance_committed.
+  const auto bypass_longitudinal_gates =
+    parameters_->always_avoid_if_geometrically_possible ||
+    std::any_of(data.target_objects.begin(), data.target_objects.end(), [](const auto & o) {
+      return o.is_avoidance_committed;
+    });
+
   /**
    * Step1: Merge process.
    * Merge positive shift avoid lines and negative shift avoid lines.
@@ -540,13 +618,13 @@ AvoidLineArray ShiftLineGenerator::generateCandidateShiftLine(
    * Step2: Clean up process.
    * Remove noisy shift line and concat same gradient shift lines.
    */
-  processed_shift_lines = applyTrimProcess(processed_shift_lines, debug);
+  processed_shift_lines = applyTrimProcess(processed_shift_lines, debug, bypass_longitudinal_gates);
 
   /**
    * Step3: Extract new shift lines.
    * Compare processed shift lines and registered shift lines in order to find new shift lines.
    */
-  return findNewShiftLine(processed_shift_lines, debug);
+  return findNewShiftLine(processed_shift_lines, debug, bypass_longitudinal_gates);
 }
 
 void ShiftLineGenerator::generateTotalShiftLine(
@@ -960,7 +1038,7 @@ AvoidLineArray ShiftLineGenerator::applyMergeProcess(
 }
 
 AvoidLineArray ShiftLineGenerator::applyTrimProcess(
-  const AvoidLineArray & shift_lines, DebugData & debug) const
+  const AvoidLineArray & shift_lines, DebugData & debug, bool bypass_longitudinal_gates) const
 {
   if (shift_lines.empty()) {
     return shift_lines;
@@ -974,7 +1052,7 @@ AvoidLineArray ShiftLineGenerator::applyTrimProcess(
   // - Change the shift length to the previous one if the deviation is small.
   {
     constexpr double SHIFT_DIFF_THRES = 1.0;
-    applySmallShiftFilter(sl_array_trimmed, SHIFT_DIFF_THRES);
+    applySmallShiftFilter(sl_array_trimmed, SHIFT_DIFF_THRES, bypass_longitudinal_gates);
   }
 
   // - Combine avoid points that have almost same gradient.
@@ -996,7 +1074,7 @@ AvoidLineArray ShiftLineGenerator::applyTrimProcess(
   // - Change the shift length to the previous one if the deviation is small.
   {
     constexpr double SHIFT_DIFF_THRES = 1.0;
-    applySmallShiftFilter(sl_array_trimmed, SHIFT_DIFF_THRES);
+    applySmallShiftFilter(sl_array_trimmed, SHIFT_DIFF_THRES, bypass_longitudinal_gates);
     debug.step3_noise_filtered = sl_array_trimmed;
   }
 
@@ -1032,7 +1110,7 @@ void ShiftLineGenerator::applyQuantizeProcess(
 }
 
 void ShiftLineGenerator::applySmallShiftFilter(
-  AvoidLineArray & shift_lines, const double threshold) const
+  AvoidLineArray & shift_lines, const double threshold, bool bypass_longitudinal_gates) const
 {
   if (shift_lines.empty()) {
     return;
@@ -1042,12 +1120,14 @@ void ShiftLineGenerator::applySmallShiftFilter(
   shift_lines.clear();
 
   for (const auto & s : input) {
-    if (s.getRelativeLongitudinal() < threshold) {
-      continue;
-    }
+    if (!bypass_longitudinal_gates) {
+      if (s.getRelativeLongitudinal() < threshold) {
+        continue;
+      }
 
-    if (!helper_->isEnoughPrepareDistance(s.start_longitudinal)) {
-      continue;
+      if (!helper_->isEnoughPrepareDistance(s.start_longitudinal)) {
+        continue;
+      }
     }
 
     shift_lines.push_back(s);
@@ -1340,7 +1420,7 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
 }
 
 AvoidLineArray ShiftLineGenerator::findNewShiftLine(
-  const AvoidLineArray & shift_lines, DebugData & debug) const
+  const AvoidLineArray & shift_lines, DebugData & debug, bool bypass_longitudinal_gates) const
 {
   if (shift_lines.empty()) {
     return {};
@@ -1409,8 +1489,11 @@ AvoidLineArray ShiftLineGenerator::findNewShiftLine(
   for (size_t i = 0; i < shift_lines.size(); ++i) {
     const auto & candidate = shift_lines.at(i);
 
-    // prevent sudden steering.
-    if (!helper_->isEnoughPrepareDistance(candidate.start_longitudinal)) {
+    // prevent sudden steering -- unless the longitudinal gates are bypassed (same
+    // "geometrically possible avoidance already committed to / always-avoid" semantics as
+    // ShiftLineGenerator::computeFeasibleShiftProfile()), in which case a compressed but
+    // otherwise-feasible shift line should not be discarded here either.
+    if (!bypass_longitudinal_gates && !helper_->isEnoughPrepareDistance(candidate.start_longitudinal)) {
       break;
     }
 

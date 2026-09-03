@@ -419,13 +419,6 @@ public:
     // longitudinal-distance/timing gate (delay avoidance start until closer), not a lateral
     // room-availability check, so it is safe to bypass here.
     if (parameters_->always_avoid_if_geometrically_possible) {
-      static auto logger = rclcpp::get_logger("static_obstacle_avoidance_helper");
-      static rclcpp::Clock steady_clock{RCL_ROS_TIME};
-      RCLCPP_WARN_THROTTLE(
-        logger, steady_clock, 1000,
-        "[AVOID-DEBUG] isReady: always_avoid_if_geometrically_possible=true "
-        "is_avoidance_committed=%s -> bypassing wait-and-see enough_distance gate",
-        (object.is_avoidance_committed ? "true" : "false"));
       return std::make_pair(true, false);
     }
 
@@ -444,17 +437,6 @@ public:
     const bool enough_distance =
       object.longitudinal < prepare_distance + constant_distance + avoidance_distance +
                               parameters_->wait_and_see_th_closest_distance;
-
-    {
-      static auto logger = rclcpp::get_logger("static_obstacle_avoidance_helper");
-      static rclcpp::Clock steady_clock{RCL_ROS_TIME};
-      RCLCPP_WARN_THROTTLE(
-        logger, steady_clock, 1000,
-        "[AVOID-DEBUG] isReady: is_avoidance_committed=%s prepare_distance=%.2f "
-        "constant_distance=%.2f avoidance_distance=%.2f longitudinal=%.2f enough_distance=%s",
-        (object.is_avoidance_committed ? "true" : "false"), prepare_distance, constant_distance,
-        avoidance_distance, object.longitudinal, (enough_distance ? "true" : "false"));
-    }
 
     return std::make_pair(enough_distance, false);
   }

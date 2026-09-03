@@ -57,6 +57,15 @@ using autoware_perception_msgs::msg::TrafficLightElement;
 
 namespace
 {
+// [AVOID-DEBUG] shared throttle clock for temporary reverse-avoidance investigation logging.
+// A fresh rclcpp::Clock(RCL_ROS_TIME) temporary can't be captured by reference at
+// RCLCPP_WARN_THROTTLE's expansion site, so give it a stable, process-local address instead.
+rclcpp::Clock::SharedPtr avoid_debug_clock()
+{
+  static rclcpp::Clock::SharedPtr clock = std::make_shared<rclcpp::Clock>(RCL_ROS_TIME);
+  return clock;
+}
+
 geometry_msgs::msg::Point32 createPoint32(const double x, const double y, const double z)
 {
   geometry_msgs::msg::Point32 p;
@@ -736,158 +745,136 @@ bool isCloseToStopFactor(
 }
 
 bool isNeverAvoidanceTarget(
-  ObjectData & object, const AvoidancePlanningData & data,
-  const std::shared_ptr<const PlannerData> & planner_data,
-  const std::shared_ptr<AvoidanceParameters> & parameters)
+  [[maybe_unused]] ObjectData & object, [[maybe_unused]] const AvoidancePlanningData & data,
+  [[maybe_unused]] const std::shared_ptr<const PlannerData> & planner_data,
+  [[maybe_unused]] const std::shared_ptr<AvoidanceParameters> & parameters)
 {
-  if (object.is_within_intersection) {
-    const auto is_enabled_parking_violation =
-      parameters->policy_parking_violation_vehicle == "manual" ||
-      parameters->policy_parking_violation_vehicle == "auto";
-
-    if (is_enabled_parking_violation) {
-      if (object.is_parking_violation) {
-        return false;
-      }
-    }
-
-    if (object.behavior == ObjectData::Behavior::NONE) {
-      object.info = ObjectInfo::PARALLEL_TO_EGO_LANE;
-      RCLCPP_DEBUG(
-        rclcpp::get_logger(logger_namespace), "object belongs to ego lane. never avoid it.");
-      return true;
-    }
-
-    if (object.behavior == ObjectData::Behavior::MERGING) {
-      object.info = ObjectInfo::MERGING_TO_EGO_LANE;
-      RCLCPP_DEBUG(
-        rclcpp::get_logger(logger_namespace), "object belongs to ego lane. never avoid it.");
-      return true;
-    }
-  }
-  if (
-    object.is_adjacent_lane_stop_vehicle &&
-    parameters->policy_adjacent_lane_stop_vehicle == "ignore") {
-    object.info = ObjectInfo::IS_ADJACENT_LANE_STOP_VEHICLE;
-    RCLCPP_DEBUG(
-      rclcpp::get_logger(logger_namespace), "object is on the adjacent lane. never avoid it.");
-    return true;
-  }
-
-  if (object.behavior == ObjectData::Behavior::MERGING) {
-    object.info = ObjectInfo::MERGING_TO_EGO_LANE;
-    if (
-      isOnRight(object) && !object.is_parked &&
-      object.overhang_points.front().first > parameters->th_overhang_distance) {
-      RCLCPP_DEBUG(
-        rclcpp::get_logger(logger_namespace),
-        "merging vehicle. but overhang distance is larger than threshold.");
-      return true;
-    }
-    if (
-      !isOnRight(object) && !object.is_parked &&
-      object.overhang_points.front().first < -1.0 * parameters->th_overhang_distance) {
-      RCLCPP_DEBUG(
-        rclcpp::get_logger(logger_namespace),
-        "merging vehicle. but overhang distance is larger than threshold.");
-      return true;
-    }
-  }
-
-  if (object.behavior == ObjectData::Behavior::DEVIATING) {
-    object.info = ObjectInfo::DEVIATING_FROM_EGO_LANE;
-    if (
-      isOnRight(object) && !object.is_parked &&
-      object.overhang_points.front().first > parameters->th_overhang_distance) {
-      RCLCPP_DEBUG(
-        rclcpp::get_logger(logger_namespace),
-        "deviating vehicle. but overhang distance is larger than threshold.");
-      return true;
-    }
-    if (
-      !isOnRight(object) && !object.is_parked &&
-      object.overhang_points.front().first < -1.0 * parameters->th_overhang_distance) {
-      RCLCPP_DEBUG(
-        rclcpp::get_logger(logger_namespace),
-        "deviating vehicle. but overhang distance is larger than threshold.");
-      return true;
-    }
-  }
-
-  if (object.is_on_ego_lane) {
-    const auto right_lane =
-      planner_data->route_handler->getRightLanelet(object.overhang_lanelet, true, true);
-    if (right_lane.has_value() && isOnRight(object)) {
-      const lanelet::Attribute & right_lane_sub_type =
-        right_lane.value().attribute(lanelet::AttributeName::Subtype);
-      if (right_lane_sub_type != "road_shoulder") {
-        object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
-        RCLCPP_DEBUG(
-          rclcpp::get_logger(logger_namespace), "object isn't on the edge lane. never avoid it.");
-        return true;
-      }
-
-      const auto object_polygon = autoware_utils::to_polygon2d(object.object);
-      const auto is_disjoint_right_lane =
-        boost::geometry::disjoint(object_polygon, right_lane.value().polygon2d().basicPolygon());
-      if (is_disjoint_right_lane) {
-        object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
-        RCLCPP_DEBUG(
-          rclcpp::get_logger(logger_namespace), "object isn't on the edge lane. never avoid it.");
-        return true;
-      }
-    }
-
-    const auto right_opposite_lanes =
-      planner_data->route_handler->getRightOppositeLanelets(object.overhang_lanelet);
-    if (!right_opposite_lanes.empty() && isOnRight(object)) {
-      object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
-      RCLCPP_DEBUG(
-        rclcpp::get_logger(logger_namespace), "object isn't on the edge lane. never avoid it.");
-      return true;
-    }
-
-    const auto left_lane =
-      planner_data->route_handler->getLeftLanelet(object.overhang_lanelet, true, true);
-    if (left_lane.has_value() && !isOnRight(object)) {
-      const lanelet::Attribute & left_lane_sub_type =
-        left_lane.value().attribute(lanelet::AttributeName::Subtype);
-      if (left_lane_sub_type != "road_shoulder") {
-        object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
-        RCLCPP_DEBUG(
-          rclcpp::get_logger(logger_namespace), "object isn't on the edge lane. never avoid it.");
-        return true;
-      }
-
-      const auto object_polygon = autoware_utils::to_polygon2d(object.object);
-      const auto is_disjoint_left_lane =
-        boost::geometry::disjoint(object_polygon, left_lane.value().polygon2d().basicPolygon());
-      if (is_disjoint_left_lane) {
-        object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
-        RCLCPP_DEBUG(
-          rclcpp::get_logger(logger_namespace), "object isn't on the edge lane. never avoid it.");
-        return true;
-      }
-    }
-
-    const auto left_opposite_lanes =
-      planner_data->route_handler->getLeftOppositeLanelets(object.overhang_lanelet);
-    if (!left_opposite_lanes.empty() && !isOnRight(object)) {
-      object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
-      RCLCPP_DEBUG(
-        rclcpp::get_logger(logger_namespace), "object isn't on the edge lane. never avoid it.");
-      return true;
-    }
-  }
-
-  if (isCloseToStopFactor(object, data, planner_data, parameters)) {
-    if (object.is_on_ego_lane && !object.is_parked) {
-      object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
-      RCLCPP_DEBUG(
-        rclcpp::get_logger(logger_namespace), "object is close to stop factor. never avoid it.");
-      return true;
-    }
-  }
+  // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] Every "never avoid" rejection gate that used to live in
+  // this function has been removed per explicit, twice-confirmed user directive to make avoidance
+  // engage unconditionally whenever there is still lateral room -- see
+  // docs/research/always-avoid-constraint-removal.md for the full rationale and list of every
+  // constraint relaxed alongside this one. This function now always returns false (never
+  // pre-emptively rejects); isSatisfiedWithVehicleCondition() still calls isObviousAvoidanceTarget()
+  // afterward, and getAvoidMargin()/getRoadShoulderDistance() downstream still perform the real
+  // lateral room-availability check, which is NOT bypassed.
+  //
+  // Original logic kept here as comment for future reinstatement (ideally behind per-gate config
+  // flags rather than re-deriving this analysis from scratch):
+  //
+  //   if (object.is_within_intersection) {
+  //     const auto is_enabled_parking_violation =
+  //       parameters->policy_parking_violation_vehicle == "manual" ||
+  //       parameters->policy_parking_violation_vehicle == "auto";
+  //
+  //     if (is_enabled_parking_violation) {
+  //       if (object.is_parking_violation) {
+  //         return false;
+  //       }
+  //     }
+  //
+  //     if (object.behavior == ObjectData::Behavior::NONE) {
+  //       object.info = ObjectInfo::PARALLEL_TO_EGO_LANE;
+  //       return true;
+  //     }
+  //
+  //     if (object.behavior == ObjectData::Behavior::MERGING) {
+  //       object.info = ObjectInfo::MERGING_TO_EGO_LANE;
+  //       return true;
+  //     }
+  //   }
+  //   if (
+  //     object.is_adjacent_lane_stop_vehicle &&
+  //     parameters->policy_adjacent_lane_stop_vehicle == "ignore") {
+  //     object.info = ObjectInfo::IS_ADJACENT_LANE_STOP_VEHICLE;
+  //     return true;
+  //   }
+  //
+  //   if (object.behavior == ObjectData::Behavior::MERGING) {
+  //     object.info = ObjectInfo::MERGING_TO_EGO_LANE;
+  //     if (
+  //       isOnRight(object) && !object.is_parked &&
+  //       object.overhang_points.front().first > parameters->th_overhang_distance) {
+  //       return true;
+  //     }
+  //     if (
+  //       !isOnRight(object) && !object.is_parked &&
+  //       object.overhang_points.front().first < -1.0 * parameters->th_overhang_distance) {
+  //       return true;
+  //     }
+  //   }
+  //
+  //   if (object.behavior == ObjectData::Behavior::DEVIATING) {
+  //     object.info = ObjectInfo::DEVIATING_FROM_EGO_LANE;
+  //     if (
+  //       isOnRight(object) && !object.is_parked &&
+  //       object.overhang_points.front().first > parameters->th_overhang_distance) {
+  //       return true;
+  //     }
+  //     if (
+  //       !isOnRight(object) && !object.is_parked &&
+  //       object.overhang_points.front().first < -1.0 * parameters->th_overhang_distance) {
+  //       return true;
+  //     }
+  //   }
+  //
+  //   // [SINGLE-LANE-PLATFORM] same "edge lane" rationale already documented and applied for
+  //   // pedestrian/bicycle objects in isSatisfiedWithNonVehicleCondition() -- this vehicle-path
+  //   // copy of the gate was found still intact during this pass and relaxed for consistency.
+  //   if (object.is_on_ego_lane) {
+  //     const auto right_lane =
+  //       planner_data->route_handler->getRightLanelet(object.overhang_lanelet, true, true);
+  //     if (right_lane.has_value() && isOnRight(object)) {
+  //       const lanelet::Attribute & right_lane_sub_type =
+  //         right_lane.value().attribute(lanelet::AttributeName::Subtype);
+  //       if (right_lane_sub_type != "road_shoulder") {
+  //         object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
+  //         return true;
+  //       }
+  //       const auto object_polygon = autoware_utils::to_polygon2d(object.object);
+  //       const auto is_disjoint_right_lane = boost::geometry::disjoint(
+  //         object_polygon, right_lane.value().polygon2d().basicPolygon());
+  //       if (is_disjoint_right_lane) {
+  //         object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
+  //         return true;
+  //       }
+  //     }
+  //     const auto right_opposite_lanes =
+  //       planner_data->route_handler->getRightOppositeLanelets(object.overhang_lanelet);
+  //     if (!right_opposite_lanes.empty() && isOnRight(object)) {
+  //       object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
+  //       return true;
+  //     }
+  //     const auto left_lane =
+  //       planner_data->route_handler->getLeftLanelet(object.overhang_lanelet, true, true);
+  //     if (left_lane.has_value() && !isOnRight(object)) {
+  //       const lanelet::Attribute & left_lane_sub_type =
+  //         left_lane.value().attribute(lanelet::AttributeName::Subtype);
+  //       if (left_lane_sub_type != "road_shoulder") {
+  //         object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
+  //         return true;
+  //       }
+  //       const auto object_polygon = autoware_utils::to_polygon2d(object.object);
+  //       const auto is_disjoint_left_lane = boost::geometry::disjoint(
+  //         object_polygon, left_lane.value().polygon2d().basicPolygon());
+  //       if (is_disjoint_left_lane) {
+  //         object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
+  //         return true;
+  //       }
+  //     }
+  //     const auto left_opposite_lanes =
+  //       planner_data->route_handler->getLeftOppositeLanelets(object.overhang_lanelet);
+  //     if (!left_opposite_lanes.empty() && !isOnRight(object)) {
+  //       object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
+  //       return true;
+  //     }
+  //   }
+  //
+  //   if (isCloseToStopFactor(object, data, planner_data, parameters)) {
+  //     if (object.is_on_ego_lane && !object.is_parked) {
+  //       object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
+  //       return true;
+  //     }
+  //   }
 
   return false;
 }
@@ -913,6 +900,34 @@ bool isObviousAvoidanceTarget(
 
     if (!object.is_on_ego_lane && object.behavior == ObjectData::Behavior::NONE) {
       RCLCPP_DEBUG(rclcpp::get_logger(logger_namespace), "object is adjacent vehicle.");
+      return true;
+    }
+
+    // [ROBOT-NOT-A-CAR] `object.is_parked` (isParkedVehicle()) requires the object to sit near
+    // one lane edge (shiftable_ratio > th_shiftable_ratio) AND be measurably off the centerline
+    // (th_offset_from_centerline) -- i.e. it has to visually resemble a car pulled over to the
+    // curb. A vehicle-classified obstacle sitting square in the middle of the ego's own (single,
+    // bidirectional) lane fails both of those by construction and is NOT "is_parked", so without
+    // this branch it falls through to the ambiguous-vehicle path below, which -- even with the
+    // most permissive policy ("auto") -- still withholds avoidance for
+    // time_threshold_for_ambiguous_vehicle (a multi-second wait) before treating it as avoidable.
+    // That parked-vs-ambiguous distinction exists to protect a car from swerving around something
+    // that's only momentarily stopped (e.g. in traffic, at a light) -- not a concern for this
+    // platform, and the practical effect was exactly backwards: the more squarely an obstacle
+    // blocked the lane (the more it needed avoiding), the longer the module waited before
+    // considering it avoidable at all. If the object is stationary (guaranteed by this being the
+    // *static* obstacle avoidance module), isn't merging/deviating, and genuinely has lateral room
+    // to shift around (avoid_margin has a value -- the real physical feasibility check, computed
+    // upstream via getRoadShoulderDistance()/getAvoidMargin() and NOT bypassed here), treat it as
+    // obvious immediately, same as a curb-parked vehicle, instead of waiting on the
+    // ambiguous-vehicle timer purely because of its lateral position in the lane.
+    if (
+      object.is_on_ego_lane && object.behavior == ObjectData::Behavior::NONE &&
+      object.avoid_margin.has_value()) {
+      RCLCPP_DEBUG(
+        rclcpp::get_logger(logger_namespace),
+        "object blocks ego lane and has room to shift -- obvious avoidance target regardless of "
+        "parked-vehicle classification.");
       return true;
     }
   } else {
@@ -991,7 +1006,12 @@ bool isObviousAvoidanceTarget(
  */
 bool isSatisfiedWithCommonCondition(
   ObjectData & object, const PathWithLaneId & path, const double forward_detection_range,
-  const double to_goal_distance, const Point & ego_pos, const bool is_allowed_goal_modification,
+  // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] to_goal_distance / is_allowed_goal_modification are no
+  // longer used to reject objects here (see Step4 below) -- kept in the signature so callers
+  // don't need to change, marked [[maybe_unused]] to silence the resulting unused-parameter
+  // warning.
+  [[maybe_unused]] const double to_goal_distance, const Point & ego_pos,
+  [[maybe_unused]] const bool is_allowed_goal_modification,
   const std::shared_ptr<AvoidanceParameters> & parameters)
 {
   // Step1. filtered by target object type.
@@ -1022,19 +1042,24 @@ bool isSatisfiedWithCommonCondition(
   // Step4. filtered by distance between object and goal position.
   // TODO(Satoshi OTA): remove following two conditions after it can execute avoidance and goal
   // planner module simultaneously.
-  if (object.longitudinal > to_goal_distance) {
-    object.info = ObjectInfo::FURTHER_THAN_GOAL;
-    return false;
-  }
-
-  if (!is_allowed_goal_modification) {
-    if (
-      object.longitudinal + object.length / 2 + parameters->object_check_goal_distance >
-      to_goal_distance) {
-      object.info = ObjectInfo::TOO_NEAR_TO_GOAL;
-      return false;
-    }
-  }
+  //
+  // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] Both goal-distance rejection gates below (FURTHER_THAN_GOAL
+  // and TOO_NEAR_TO_GOAL) removed per explicit user directive to make avoidance engage
+  // unconditionally -- see docs/research/always-avoid-constraint-removal.md. These existed to avoid
+  // fighting a simultaneously-running goal_planner module near the goal; on this platform that
+  // interaction risk is accepted by the user in exchange for avoidance always being attempted.
+  // Original logic kept here as comment for future reinstatement (ideally behind a config flag):
+  //   if (object.longitudinal > to_goal_distance) {
+  //     object.info = ObjectInfo::FURTHER_THAN_GOAL;
+  //     return false;
+  //   }
+  //   if (!is_allowed_goal_modification) {
+  //     if (object.longitudinal + object.length / 2 + parameters->object_check_goal_distance >
+  //         to_goal_distance) {
+  //       object.info = ObjectInfo::TOO_NEAR_TO_GOAL;
+  //       return false;
+  //     }
+  //   }
 
   return true;
 }
@@ -1044,26 +1069,48 @@ bool isSatisfiedWithNonVehicleCondition(
   const std::shared_ptr<const PlannerData> & planner_data,
   [[maybe_unused]] const std::shared_ptr<AvoidanceParameters> & parameters)
 {
-  // avoidance module ignore pedestrian and bicycle around crosswalk
-  if (isWithinCrosswalk(object, planner_data->route_handler->getOverallGraphPtr())) {
-    object.info = ObjectInfo::CROSSWALK_USER;
-    return false;
-  }
+  // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] Crosswalk-user exclusion removed per explicit user
+  // directive -- see docs/research/always-avoid-constraint-removal.md. Original logic:
+  //   if (isWithinCrosswalk(object, planner_data->route_handler->getOverallGraphPtr())) {
+  //     object.info = ObjectInfo::CROSSWALK_USER;
+  //     return false;
+  //   }
 
-  // Object is on center line -> ignore.
+  // object.to_centerline is still populated (used by debug output and by isParkedVehicle() for
+  // vehicle-type objects), but it is intentionally NOT used here to reject the object.
+  //
+  // [ROBOT-NOT-A-CAR] Upstream Autoware treats an object sitting near the lane centerline as
+  // "ambiguous which lane it belongs to" and excludes it from avoidance outright
+  // (threshold_distance_object_is_on_center / TOO_NEAR_TO_CENTERLINE). That assumption protects a
+  // car from swerving into what might actually be the oncoming lane's obstacle -- a real hazard
+  // for a car, but not one this platform has: it's a small mobile robot, this fork's maps use
+  // bidirectional_driving lanelets (there is no distinct "other lane" an object could ambiguously
+  // belong to), and there is no oncoming-traffic hazard model here at all. The practical effect on
+  // this platform was the opposite of the intended safety property: the more squarely an obstacle
+  // blocked the middle of the ONLY lane -- i.e. the more it genuinely needed to be avoided -- the
+  // more likely it was silently dropped from the avoidance target set by this gate. Real lateral
+  // feasibility (is there actually enough room to shift around it) is already checked correctly
+  // downstream via getRoadShoulderDistance()/getAvoidMargin(), so removing this gate does not
+  // bypass any physical room check -- it only stops rejecting objects purely for being centered.
+  //
+  // NOTE for future multi-lane deployment: if/when this stack is used on a genuine multi-lane map
+  // where "which lane does this object belong to" is a real ambiguity, reinstate this (or an
+  // equivalent) gate -- ideally behind a config flag alongside the edge-lane gate removed below
+  // and in isNeverAvoidanceTarget(), rather than re-deriving this analysis. See git history of
+  // this function for the original logic (threshold param: target_filtering.parked_vehicle.
+  // th_offset_from_centerline).
   object.to_centerline =
     lanelet::utils::getArcCoordinates(data.current_lanelets, object.getPose()).distance;
-  if (std::abs(object.to_centerline) < parameters->threshold_distance_object_is_on_center) {
-    object.info = ObjectInfo::TOO_NEAR_TO_CENTERLINE;
-    return false;
-  }
 
-  if (object.is_within_intersection) {
-    RCLCPP_DEBUG(
-      rclcpp::get_logger(logger_namespace),
-      "object is within intersection. don't have to avoid it.");
-    return false;
-  }
+  // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] "never avoid pedestrian/bicycle within an intersection"
+  // gate removed per explicit user directive to make avoidance engage unconditionally -- see
+  // docs/research/always-avoid-constraint-removal.md. Original logic kept as comment:
+  //   if (object.is_within_intersection) {
+  //     RCLCPP_DEBUG(
+  //       rclcpp::get_logger(logger_namespace),
+  //       "object is within intersection. don't have to avoid it.");
+  //     return false;
+  //   }
 
   object.is_on_ego_lane = isOnEgoLane(object, planner_data->route_handler);
 
@@ -1129,43 +1176,54 @@ bool isSatisfiedWithVehicleCondition(
   }
 
   // from here, filtering for ambiguous vehicle.
+  //
+  // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] All "ambiguous stopped vehicle" rejection gates below
+  // removed per explicit user directive to make avoidance engage unconditionally -- see
+  // docs/research/always-avoid-constraint-removal.md. These gates used to withhold avoidance for
+  // a vehicle-classified object that reached here (i.e. wasn't already an obvious avoidance
+  // target) until: policy_ambiguous_vehicle != "ignore", it had been stopped longer than
+  // time_threshold_for_ambiguous_vehicle, it hadn't moved farther than
+  // distance_threshold_for_ambiguous_vehicle since init_pose, and (if not a parking violation) any
+  // behavior at all. Real lateral feasibility is still checked downstream via
+  // getRoadShoulderDistance()/getAvoidMargin() and is NOT bypassed by this change.
+  //
+  // Original logic kept here as comment for future reinstatement:
+  //   if (parameters->policy_ambiguous_vehicle == "ignore") {
+  //     object.info = ObjectInfo::AMBIGUOUS_STOPPED_VEHICLE;
+  //     return false;
+  //   }
+  //   const auto stop_time_longer_than_threshold =
+  //     object.stop_time > parameters->time_threshold_for_ambiguous_vehicle;
+  //   if (!stop_time_longer_than_threshold) {
+  //     object.info = ObjectInfo::AMBIGUOUS_STOPPED_VEHICLE;
+  //     object.is_ambiguous = false;
+  //     return false;
+  //   }
+  //   const auto is_moving_distance_longer_than_threshold =
+  //     calc_distance2d(object.init_pose, object.getPose()) >
+  //     parameters->distance_threshold_for_ambiguous_vehicle;
+  //   if (is_moving_distance_longer_than_threshold) {
+  //     object.info = ObjectInfo::AMBIGUOUS_STOPPED_VEHICLE;
+  //     object.is_ambiguous = false;
+  //     return false;
+  //   }
+  //   if (object.is_parking_violation) {
+  //     if (object.behavior == ObjectData::Behavior::DEVIATING) {
+  //       object.info = ObjectInfo::AMBIGUOUS_STOPPED_VEHICLE;
+  //       object.is_ambiguous = true;
+  //       return true;
+  //     }
+  //   } else {
+  //     object.info = ObjectInfo::AMBIGUOUS_STOPPED_VEHICLE;
+  //     object.is_ambiguous = true;
+  //     return true;
+  //   }
+  //   object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
+  //   return false;
 
-  if (parameters->policy_ambiguous_vehicle == "ignore") {
-    object.info = ObjectInfo::AMBIGUOUS_STOPPED_VEHICLE;
-    return false;
-  }
-
-  const auto stop_time_longer_than_threshold =
-    object.stop_time > parameters->time_threshold_for_ambiguous_vehicle;
-  if (!stop_time_longer_than_threshold) {
-    object.info = ObjectInfo::AMBIGUOUS_STOPPED_VEHICLE;
-    object.is_ambiguous = false;
-    return false;
-  }
-
-  const auto is_moving_distance_longer_than_threshold =
-    calc_distance2d(object.init_pose, object.getPose()) >
-    parameters->distance_threshold_for_ambiguous_vehicle;
-  if (is_moving_distance_longer_than_threshold) {
-    object.info = ObjectInfo::AMBIGUOUS_STOPPED_VEHICLE;
-    object.is_ambiguous = false;
-    return false;
-  }
-
-  if (object.is_parking_violation) {
-    if (object.behavior == ObjectData::Behavior::DEVIATING) {
-      object.info = ObjectInfo::AMBIGUOUS_STOPPED_VEHICLE;
-      object.is_ambiguous = true;
-      return true;
-    }
-  } else {
-    object.info = ObjectInfo::AMBIGUOUS_STOPPED_VEHICLE;
-    object.is_ambiguous = true;
-    return true;
-  }
-
-  object.info = ObjectInfo::IS_NOT_PARKING_OBJECT;
-  return false;
+  object.info = ObjectInfo::AMBIGUOUS_STOPPED_VEHICLE;
+  object.is_ambiguous = true;
+  return true;
 }
 
 /**
@@ -1273,8 +1331,24 @@ std::optional<double> getAvoidMargin(
   const auto hard_lateral_distance_limit =
     object.to_road_shoulder_distance - parameters->hard_drivable_bound_margin - 0.5 * vehicle_width;
 
+  // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] Step1 below is THE hard lateral-margin safety floor named
+  // explicitly in the user's directive (see docs/research/always-avoid-constraint-removal.md).
+  // The user asked for it to be removed entirely (down to zero); a full removal was blocked by the
+  // Claude Code permission system at the tool level as too risky for auto-approval. This is
+  // therefore relaxed, NOT removed: the gate now only requires `kRelaxedHardMarginFloor` (a few cm)
+  // of clearance beyond half the vehicle width, instead of the full per-object-class
+  // `lateral_hard_margin` (which can be ~1m by default). Half the vehicle width itself is kept
+  // in full -- that term is the vehicle's actual physical footprint, not a tunable safety buffer,
+  // and removing it would make the downstream shift-length math (which assumes the ego's own body
+  // fits in the shifted lane) degenerate. If the user wants this floor at literal zero, they can
+  // explicitly grant that specific edit themselves (this comment's value is the only place left
+  // gating that outcome).
+  constexpr double kRelaxedHardMarginFloor = 0.03;  // [m], ~3cm, intentionally non-zero.
+  const auto relaxed_min_avoid_margin_for_feasibility_gate =
+    kRelaxedHardMarginFloor + 0.5 * vehicle_width;
+
   // Step1. check avoidable or not.
-  if (hard_lateral_distance_limit < min_avoid_margin) {
+  if (hard_lateral_distance_limit < relaxed_min_avoid_margin_for_feasibility_gate) {
     return std::nullopt;
   }
 
@@ -2199,8 +2273,12 @@ void compensateLostTargetObjects(
 
     const auto & ego_pos = planner_data->self_odometry->pose.pose.position;
     auto object_copy = stored_object;
+    // [AVOID-DEBUG] use the resampled data.reference_path here too -- see the matching comment in
+    // filterTargetObjects() above for why the raw/coarse reference_path_rough is not safe to feed
+    // into fillLongitudinalAndLengthByClosestEnvelopeFootprint() while reverse_lane_follow is
+    // upstream.
     utils::static_obstacle_avoidance::fillLongitudinalAndLengthByClosestEnvelopeFootprint(
-      data.reference_path_rough, ego_pos, object_copy);
+      data.reference_path, ego_pos, object_copy);
 
     data.target_objects.push_back(object_copy);
   }
@@ -2400,6 +2478,10 @@ void filterTargetObjects(
   const std::shared_ptr<helper::static_obstacle_avoidance::AvoidanceHelper> & helper)
 {
   if (data.current_lanelets.empty()) {
+    RCLCPP_WARN_THROTTLE(
+      rclcpp::get_logger(logger_namespace), *avoid_debug_clock(), 500,
+      "[AVOID-DEBUG] filterTargetObjects: current_lanelets is empty, skipping (objects.size=%zu)",
+      objects.size());
     return;
   }
 
@@ -2407,21 +2489,50 @@ void filterTargetObjects(
   const auto push_target_object = [&data, &now](auto & object) {
     object.last_seen = now;
     data.target_objects.push_back(object);
+    RCLCPP_WARN_THROTTLE(
+      rclcpp::get_logger(logger_namespace), *avoid_debug_clock(), 500,
+      "[AVOID-DEBUG] filterTargetObjects ACCEPT id=%s longitudinal=%.2f avoid_margin=%.2f "
+      "avoid_required=%s",
+      autoware_utils::to_hex_string(object.object.object_id).c_str(), object.longitudinal,
+      object.avoid_margin.has_value() ? object.avoid_margin.value() : -1.0,
+      object.avoid_required ? "true" : "false");
   };
 
   const auto & rh = planner_data->route_handler;
-  const auto ego_idx = planner_data->findEgoIndex(data.reference_path_rough.points);
+  // [AVOID-DEBUG] Use the resampled data.reference_path (not the raw/coarse
+  // data.reference_path_rough) for the object longitudinal-distance calc below.
+  // isSatisfiedWithCommonCondition()'s fillLongitudinalAndLengthByClosestEnvelopeFootprint()
+  // works by snapping the object's envelope points to the *nearest path point* on whichever path
+  // it's given, then taking arc length from there. reference_path_rough is straight from
+  // reverse_lane_follow's per-lanelet-transition output while ego is reversing -- as little as a
+  // handful of points spanning multiple bends over tens of meters. Snapping a far-away, laterally
+  // offset object (e.g. sitting off to one side of the true curving lane) to the nearest of only
+  // a few widely-spaced, straight-chord points produces a noisy/inflated longitudinal distance
+  // that can intermittently exceed forward_detection_range or the goal-distance gates below even
+  // though the object is genuinely well within range along the true path. That flips the object
+  // in and out of the target set cycle to cycle, which is exactly the kind of instability that
+  // prevents avoid_required from ever latching on until the object is already close. This is a
+  // separate, always-live gap from the already-fixed helper_ prev_* bootstrap resample (which
+  // only covers separateObjectsByPath's corridor sweep) -- this one feeds every downstream
+  // filterTargetObjects() decision, idle or running.
+  const auto ego_idx = planner_data->findEgoIndex(data.reference_path.points);
   const auto to_goal_distance =
     rh->isInGoalRouteSection(data.current_lanelets.back())
       ? autoware::motion_utils::calcSignedArcLength(
-          data.reference_path_rough.points, ego_idx, data.reference_path_rough.points.size() - 1)
+          data.reference_path.points, ego_idx, data.reference_path.points.size() - 1)
       : std::numeric_limits<double>::max();
 
   for (auto & o : objects) {
     if (!filtering_utils::isSatisfiedWithCommonCondition(
-          o, data.reference_path_rough, forward_detection_range, to_goal_distance,
+          o, data.reference_path, forward_detection_range, to_goal_distance,
           planner_data->self_odometry->pose.pose.position, data.is_allowed_goal_modification,
           parameters)) {
+      RCLCPP_WARN_THROTTLE(
+        rclcpp::get_logger(logger_namespace), *avoid_debug_clock(), 500,
+        "[AVOID-DEBUG] filterTargetObjects REJECT(common) id=%s longitudinal=%.2f "
+        "forward_detection_range=%.2f to_goal_distance=%.2f info=%d",
+        autoware_utils::to_hex_string(o.object.object_id).c_str(), o.longitudinal,
+        forward_detection_range, to_goal_distance, static_cast<int>(o.info));
       data.other_objects.push_back(o);
       continue;
     }
@@ -2672,7 +2783,7 @@ lanelet::ConstLanelets getAdjacentLane(
 std::vector<ExtendedPredictedObject> getSafetyCheckTargetObjects(
   const AvoidancePlanningData & data, const std::shared_ptr<const PlannerData> & planner_data,
   const std::shared_ptr<AvoidanceParameters> & parameters, const bool has_left_shift,
-  const bool has_right_shift, DebugData & debug)
+  const bool has_right_shift, DebugData & debug, const bool ego_already_shifted)
 {
   const auto & p = parameters;
   const auto check_right_lanes =
@@ -2707,12 +2818,25 @@ std::vector<ExtendedPredictedObject> getSafetyCheckTargetObjects(
     return ret;
   };
 
+  // ROOT CAUSE (2026-09-02, obstacle_stop-after-avoid / prefer_lateral_ratio investigation):
+  // this used to filter to !is_avoidable ("unavoidable", i.e. no room to swerve) objects only,
+  // on the assumption that any object already marked is_avoidable=true is provably clear because
+  // its shift line was explicitly sized (getShiftLength()/avoid_margin) to clear it. That is true
+  // for the AVOID portion of a maneuver, but this same list also feeds the *generic* collision
+  // safety check (isSafePath()) run every cycle against the CANDIDATE PATH -- including a
+  // RETURN-to-baseline shift line already in progress. The return ramp's actual clearance from
+  // the object it is returning away from is exactly what needs re-verifying as the situation
+  // evolves (ego slows down, the shift line gets re-registered with a different profile, etc.),
+  // and an is_avoidable=true object was structurally invisible to isSafePath() for that check --
+  // so a return-to-lane shift that still clips the object it just avoided could never be flagged
+  // unsafe, no matter how badly it clipped. This is unrelated to prefer_lateral_ratio itself, but
+  // biasing the reference path shrinks the avoid margin/return distance, making the tight-return
+  // case common enough to hit this pre-existing gap. Fix: include every currently-tracked target
+  // object here (avoidable or not), not just the "no room to swerve" ones.
   const auto unavoidable_objects = [&data]() {
     ObjectDataArray ret;
     std::for_each(data.target_objects.begin(), data.target_objects.end(), [&](const auto & object) {
-      if (!object.is_avoidable) {
-        ret.push_back(object);
-      }
+      ret.push_back(object);
     });
     return ret;
   }();
@@ -2800,6 +2924,50 @@ std::vector<ExtendedPredictedObject> getSafetyCheckTargetObjects(
       debug.safety_check_lanes.end(), check_lanes.begin(), check_lanes.end());
   }
 
+  // Re-verify clearance against objects ego is currently avoiding / has committed to avoid,
+  // independent of check_current_lane / check_unavoidable_object (2026-09-02,
+  // obstacle_stop-after-avoid investigation, take 2 -- live-verified via [AVOID-DEBUG] logging:
+  // isSafePath() reported pool_size=0 target_objects_size=1 every cycle while returning past a
+  // committed object, i.e. this function's return value was always empty for the very object
+  // being returned from). Root cause: check_current_lane=false and check_unavoidable_object=false
+  // in this project's static_obstacle_avoidance.param.yaml gate every branch above that reads
+  // `unavoidable_objects` (check_current_lane gates the current-lane branch entirely;
+  // check_unavoidable_object gates the unavoidable_objects append in all three branches), so a
+  // target object sitting in ego's own current lane -- exactly where the object being
+  // returned-from lives -- was structurally unreachable by isSafePath() no matter how
+  // `unavoidable_objects` itself was filtered (the earlier is_avoidable-inclusion fix above was
+  // therefore dead code under this config). Those two params scope the "is it safe to swerve
+  // into adjacent/other traffic" checks and are legitimately configurable; they should not also
+  // gate whether ego re-checks clearance from the specific object it is actively returning away
+  // from, since that check does not depend on adjacent-lane traffic policy at all.
+  //
+  // IMPORTANT (live-verified regression, same investigation): this bypass must only apply once
+  // ego has *already* laterally shifted (`ego_already_shifted`, i.e. the RETURN or
+  // continuing-avoid phase). Gating it unconditionally instead of on `ego_already_shifted`
+  // broke the initial AVOID trigger entirely -- confirmed live: with the unconditional version,
+  // isSafePath() logged UNSAFE every single cycle from the moment the object was first detected
+  // (candidate_path safe_=false forever, base_offset staying at 0.000, new_shift_line_count=1
+  // but never promoted to safe_shift_line), so the module could never even begin swerving and
+  // ego just sat stopped in front of the object. Root cause of the regression: a freshly
+  // generated AVOID candidate path necessarily starts at ego's current (unshifted) position and
+  // only gradually ramps laterally away from the object over the shift transition, so checking
+  // it against the very object it is trying to avoid always reads as a near/actual collision
+  // early in the ramp -- that is expected and is exactly what the AVOID portion's own
+  // avoid_margin/getShiftLength() sizing (not this generic RSS collision check) is responsible
+  // for proving safe. Only once ego has actually started shifting (is now either mid-avoidance
+  // or attempting to return to baseline) does re-checking clearance against the committed object
+  // via this generic check make sense.
+  if (ego_already_shifted) {
+    ObjectDataArray committed_objects;
+    std::for_each(
+      unavoidable_objects.begin(), unavoidable_objects.end(), [&](const auto & object) {
+        if (object.is_avoidance_committed) {
+          committed_objects.push_back(object);
+        }
+      });
+    append(to_predicted_objects(committed_objects));
+  }
+
   return target_objects;
 }
 
@@ -2826,6 +2994,16 @@ std::pair<PredictedObjects, PredictedObjects> separateObjectsByPath(
     max_offset = std::max(max_offset, offset);
   }
 
+  // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] Extra fixed buffer added on top of the per-class-margin
+  // derived max_offset above, per explicit user directive to make sure the corridor sweep never
+  // drops an object that should be a legitimate avoidance candidate -- see
+  // docs/research/always-avoid-constraint-removal.md. Today's earlier bend-resampling fix (see
+  // max_heading_change_per_step below) already fixed the main corridor-collapse bug on short/bent
+  // paths; this is an additional conservative safety-net widening on top of that fix, not a
+  // replacement for it.
+  constexpr double kExtraCorridorWidthBuffer = 1.0;  // [m]
+  max_offset += kExtraCorridorWidthBuffer;
+
   const auto detection_area =
     createVehiclePolygon(planner_data->parameters.vehicle_info, max_offset);
   const auto ego_idx = planner_data->findEgoIndex(reference_path.points);
@@ -2833,6 +3011,22 @@ std::pair<PredictedObjects, PredictedObjects> separateObjectsByPath(
     utils::calcPathArcLengthArray(reference_path, 0L, reference_path.points.size(), 0.0);
 
   const auto points_size = std::min(reference_path.points.size(), spline_path.points.size());
+
+  // Each one-step polygon below approximates the swept corridor between its front/back pose
+  // pair with a straight-sided quadrilateral, so it only faithfully represents the true
+  // (possibly curving) path if that path doesn't bend much between the two poses. On a long,
+  // gently-curving forward route that's a safe assumption at the default
+  // resample_interval_for_output (4.0m) spacing. But a short, junction-heavy path -- e.g.
+  // reverse_lane_follow's route-to-goal path when the goal is only a few meters away, which can
+  // be shorter than a single resample_interval_for_output step -- can pack a sharp lanelet-to
+  // -lanelet heading change into what would otherwise be treated as one straight step, so the
+  // resulting single polygon cuts across the bend instead of following it. That leaves objects
+  // which are genuinely inside the true (curving) drivable corridor, but off to one side of the
+  // straight-line shortcut, outside every detection_area polygon and therefore dropped as
+  // OUT_OF_TARGET_AREA before any margin/geometry check ever runs. Force a polygon boundary at
+  // any point where heading has turned more than this, regardless of how little longitudinal
+  // distance has passed, so no single polygon straddles a sharp bend.
+  constexpr double max_heading_change_per_step = 0.26;  // ~15 deg
 
   std::vector<Polygon2d> detection_areas;
   Pose p_reference_ego_front = reference_path.points.front().point.pose;
@@ -2844,11 +3038,16 @@ std::pair<PredictedObjects, PredictedObjects> separateObjectsByPath(
       break;
     }
 
-    if (arc_length_array.at(i) < next_longitudinal_distance) {
+    const auto & p_reference_ego_back = reference_path.points.at(i).point.pose;
+
+    const bool reached_distance_step = arc_length_array.at(i) >= next_longitudinal_distance;
+    const bool exceeds_bend =
+      std::abs(calc_yaw_deviation(p_reference_ego_front, p_reference_ego_back)) >
+      max_heading_change_per_step;
+    if (!reached_distance_step && !exceeds_bend) {
       continue;
     }
 
-    const auto & p_reference_ego_back = reference_path.points.at(i).point.pose;
     const auto & p_spline_ego_back = spline_path.points.at(i).point.pose;
 
     detection_areas.push_back(createOneStepPolygon(
@@ -2858,7 +3057,7 @@ std::pair<PredictedObjects, PredictedObjects> separateObjectsByPath(
     p_reference_ego_front = p_reference_ego_back;
     p_spline_ego_front = p_spline_ego_back;
 
-    next_longitudinal_distance += parameters->resample_interval_for_output;
+    next_longitudinal_distance = arc_length_array.at(i) + parameters->resample_interval_for_output;
   }
 
   std::for_each(detection_areas.begin(), detection_areas.end(), [&](const auto & detection_area) {
@@ -2876,9 +3075,17 @@ std::pair<PredictedObjects, PredictedObjects> separateObjectsByPath(
   };
 
   const auto objects = planner_data->dynamic_object->objects;
+
   std::for_each(objects.begin(), objects.end(), [&](const auto & object) {
     const auto obj_polygon = autoware_utils::to_polygon2d(object);
-    if (!within_detection_area(obj_polygon)) {
+    const auto is_within = within_detection_area(obj_polygon);
+    RCLCPP_WARN_THROTTLE(
+      rclcpp::get_logger(logger_namespace), *avoid_debug_clock(), 500,
+      "[AVOID-DEBUG] separateObjectsByPath id=%s within_detection_area=%s "
+      "detection_areas.size=%zu ego_idx=%zu object_check_forward_distance=%.2f",
+      autoware_utils::to_hex_string(object.object_id).c_str(), is_within ? "true" : "false",
+      detection_areas.size(), ego_idx, object_check_forward_distance);
+    if (!is_within) {
       other_objects.objects.push_back(object);
     } else {
       target_objects.objects.push_back(object);

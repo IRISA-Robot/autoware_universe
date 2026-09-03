@@ -277,7 +277,11 @@
         # comfortable, gradual maneuver. This can produce sharper/more abrupt shifts when triggered
         # very close to an object. The lateral room-availability check is NEVER bypassed by this
         # flag, regardless of its value.
-        always_avoid_if_geometrically_possible: false   # [-]
+        # [ALWAYS-AVOID-DIRECTIVE 2026-09-03] Flipped false->true per explicit, twice-confirmed user
+        # directive to make avoidance engage unconditionally whenever there is still lateral room.
+        # See docs/research/always-avoid-constraint-removal.md for full rationale and the list of
+        # every other constraint relaxed alongside this one.
+        always_avoid_if_geometrically_possible: true   # [-]
 
       # For cancel maneuver
       cancel:

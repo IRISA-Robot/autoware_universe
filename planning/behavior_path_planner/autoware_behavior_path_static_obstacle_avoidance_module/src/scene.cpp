@@ -134,33 +134,8 @@ AvoidanceState StaticObstacleAvoidanceModule::getCurrentModuleState(
     std::abs(path_shifter_.getBaseOffset()) > parameters_->lateral_execution_threshold;
   const bool is_shifted = helper_->isShifted();
 
-  // [AVOID-DEBUG] AvoidanceState values: 0=RUNNING, 1=CANCEL, 2=SUCCEEDED
-  const auto to_state_string = [](const AvoidanceState state) -> const char * {
-    switch (state) {
-      case AvoidanceState::RUNNING:
-        return "RUNNING";
-      case AvoidanceState::CANCEL:
-        return "CANCEL";
-      case AvoidanceState::SUCCEEDED:
-        return "SUCCEEDED";
-      default:
-        return "UNKNOWN";
-    }
-  };
-
-  const auto log_state_and_return = [&](const AvoidanceState state) {
-    RCLCPP_WARN_THROTTLE(
-      getLogger(), *clock_, 1000,
-      "[AVOID-DEBUG] getCurrentModuleState: has_avoidance_target=%s has_shift_point=%s "
-      "has_base_offset=%s is_shifted=%s -> state=%s",
-      (has_avoidance_target ? "true" : "false"), (has_shift_point ? "true" : "false"),
-      (has_base_offset ? "true" : "false"), (is_shifted ? "true" : "false"),
-      to_state_string(state));
-    return state;
-  };
-
   if (has_avoidance_target) {
-    return log_state_and_return(AvoidanceState::RUNNING);
+    return AvoidanceState::RUNNING;
   }
 
   // If the ego is on the shift line, keep RUNNING.
@@ -171,26 +146,26 @@ AvoidanceState StaticObstacleAvoidanceModule::getCurrentModuleState(
     };
     for (const auto & shift_line : path_shifter_.getShiftLines()) {
       if (within(shift_line, idx)) {
-        return log_state_and_return(AvoidanceState::RUNNING);
+        return AvoidanceState::RUNNING;
       }
     }
   }
 
   if (has_base_offset) {
-    return log_state_and_return(AvoidanceState::RUNNING);
+    return AvoidanceState::RUNNING;
   }
 
   // Nothing to do. -> EXIT.
   if (!has_shift_point) {
-    return log_state_and_return(AvoidanceState::SUCCEEDED);
+    return AvoidanceState::SUCCEEDED;
   }
 
   // Be able to canceling avoidance path. -> EXIT.
   if (!is_shifted && parameters_->enable_cancel_maneuver) {
-    return log_state_and_return(AvoidanceState::CANCEL);
+    return AvoidanceState::CANCEL;
   }
 
-  return log_state_and_return(AvoidanceState::RUNNING);
+  return AvoidanceState::RUNNING;
 }
 
 bool StaticObstacleAvoidanceModule::canTransitSuccessState()
@@ -224,10 +199,6 @@ bool StaticObstacleAvoidanceModule::canTransitSuccessState()
 
   const bool is_cancel = data.state == AvoidanceState::CANCEL;
   const bool is_succeeded = data.state == AvoidanceState::SUCCEEDED;
-  RCLCPP_WARN_THROTTLE(
-    getLogger(), *clock_, 1000,
-    "[AVOID-DEBUG] canTransitSuccessState: exit_cause_cancel=%s exit_cause_succeeded=%s",
-    (is_cancel ? "true" : "false"), (is_succeeded ? "true" : "false"));
   return is_cancel || is_succeeded;
 }
 
@@ -361,11 +332,15 @@ void StaticObstacleAvoidanceModule::fillFundamentalData(
 
   data.is_allowed_goal_modification =
     utils::isAllowedGoalModification(planner_data_->route_handler);
+  // [AVOID-DEBUG] use the resampled data.reference_path (not the raw/coarse
+  // data.reference_path_rough) here as well -- both of these do arc-length distance calcs
+  // against the raw path's sparse points, same class of issue as the object longitudinal-distance
+  // calc fixed in filterTargetObjects()/compensateLostTargetObjects().
   data.distance_to_red_traffic_light = utils::traffic_light::calcDistanceToRedTrafficLight(
-    data.current_lanelets, data.reference_path_rough, planner_data_);
+    data.current_lanelets, data.reference_path, planner_data_);
 
   data.to_return_point = utils::static_obstacle_avoidance::calcDistanceToReturnDeadLine(
-    data.current_lanelets, data.reference_path_rough, planner_data_, parameters_,
+    data.current_lanelets, data.reference_path, planner_data_, parameters_,
     data.distance_to_red_traffic_light, data.is_allowed_goal_modification);
 
   data.to_start_point = utils::static_obstacle_avoidance::calcDistanceToAvoidStartLine(
@@ -474,6 +449,13 @@ void StaticObstacleAvoidanceModule::fillAvoidanceTargetData(ObjectDataArray & ob
   const auto feasible_stop_distance = helper_->getFeasibleDecelDistance(0.0, false);
   std::for_each(objects.begin(), objects.end(), [&, this](auto & o) {
     fillAvoidanceNecessity(o, stored_objects_, vehicle_width, parameters_);
+    RCLCPP_WARN_THROTTLE(
+      getLogger(), *clock_, 500,
+      "[AVOID-DEBUG] fillAvoidanceTargetData id=%s avoid_required=%s is_on_right=%s "
+      "overhang=%.3f vehicle_width=%.2f",
+      to_hex_string(o.object.object_id).c_str(), o.avoid_required ? "true" : "false",
+      utils::static_obstacle_avoidance::isOnRight(o) ? "true" : "false",
+      o.overhang_points.empty() ? -999.0 : o.overhang_points.front().first, vehicle_width);
     o.to_stop_line = calcDistanceToStopLine(o);
     fillObjectStoppableJudge(o, stored_objects_, feasible_stop_distance, parameters_);
     fillObjectAvoidableByDesiredShiftLength(o, avoid_data_.previous_target_objects);
@@ -643,19 +625,6 @@ void StaticObstacleAvoidanceModule::fillEgoStatus(
 {
   autoware_utils::ScopedTimeTrack st(__func__, *time_keeper_);
 
-  // [AVOID-DEBUG] per-object avoidability snapshot, right before getCurrentModuleState() reads
-  // data.target_objects. `info` is the ObjectInfo enum (see data_structs.hpp) logged as an int
-  // since no string-conversion helper exists for it yet.
-  for (const auto & o : data.target_objects) {
-    RCLCPP_WARN_THROTTLE(
-      getLogger(), *clock_, 1000,
-      "[AVOID-DEBUG] target_object avoidability: object_id=%s is_avoidance_committed=%s "
-      "has_avoid_margin=%s avoid_margin=%.2f info=%d is_absolutely_not_avoidable=%s",
-      to_hex_string(o.object.object_id).c_str(), (o.is_avoidance_committed ? "true" : "false"),
-      (o.avoid_margin.has_value() ? "true" : "false"), o.avoid_margin.value_or(-1.0),
-      static_cast<int>(o.info), (helper_->isAbsolutelyNotAvoidable(o) ? "true" : "false"));
-  }
-
   data.state = getCurrentModuleState(data);
 
   /**
@@ -732,6 +701,31 @@ void StaticObstacleAvoidanceModule::fillEgoStatus(
    * if the avoidance has already been initiated.
    */
   if (!can_yield_maneuver) {
+    // NOTE (2026-09-02, obstacle_stop-after-avoid investigation): the unsafe candidate here is
+    // frequently the RETURN-to-lane shift line firing too early -- i.e. isSafePath() correctly
+    // detects that ego's swept footprint would still clip the object during the return
+    // transition, but canYieldManeuver() already refused a yield/stop because
+    // helper_->isShifted() is true (avoidance is mid-maneuver). Previously this branch force-
+    // committed the unsafe candidate anyway ("overwrite safety judge"), which let a too-early
+    // return get baked into path_shifter_ -- downstream obstacle_stop (purely geometric, no
+    // awareness of avoidance intent) then sees the same real clip and stops the vehicle.
+    // Fix: only force the unsafe candidate through when there is no already-registered
+    // (previously-validated-safe) shift plan to fall back on. Otherwise, hold the current
+    // registered plan for this cycle -- data.new_shift_line/isSafePath() are recomputed every
+    // cycle from the live, continuously-updating object.longitudinal, so as ego keeps moving
+    // forward the return trigger naturally pushes out and gets adopted once it is genuinely
+    // safe, instead of being locked in early.
+    const auto has_registered_shift_line = !path_shifter_.getShiftLines().empty();
+    if (has_registered_shift_line) {
+      data.yield_required = false;
+      data.safe_shift_line.clear();
+      RCLCPP_WARN_THROTTLE(
+        getLogger(), *clock_, 500,
+        "unsafe (likely early return-to-lane) and could not transit yield status; "
+        "holding current registered shift plan instead of committing the unsafe candidate.");
+      return;
+    }
+
     data.safe = true;  // overwrite safety judge.
     data.yield_required = false;
     data.safe_shift_line = data.new_shift_line;
@@ -931,9 +925,16 @@ bool StaticObstacleAvoidanceModule::isSafePath(
 
   const auto hysteresis_factor = safe_ ? 1.0 : parameters_->hysteresis_factor_expand_rate;
 
+  // Only bypass check_current_lane/check_unavoidable_object for already-committed objects once
+  // ego has actually started shifting (mid-avoidance or attempting to return to baseline) -- see
+  // the ego_already_shifted doc comment in getSafetyCheckTargetObjects() for why this must not
+  // apply to the initial AVOID candidate.
+  const auto ego_already_shifted = helper_->isShifted();
+
   const auto safety_check_target_objects =
     utils::static_obstacle_avoidance::getSafetyCheckTargetObjects(
-      avoid_data_, planner_data_, parameters_, has_left_shift, has_right_shift, debug);
+      avoid_data_, planner_data_, parameters_, has_left_shift, has_right_shift, debug,
+      ego_already_shifted);
 
   if (safety_check_target_objects.empty()) {
     return true;
@@ -984,6 +985,28 @@ bool StaticObstacleAvoidanceModule::isSafePath(
         utils::path_safety_checker::updateCollisionCheckDebugMap(
           debug.collision_check, current_debug_data, false);
 
+        // [AVOID-DEBUG] isSafePath rejection -- this RSS-based safety check is a SEPARATE gate
+        // from the target-filtering/margin relaxations (always_avoid_if_geometrically_possible,
+        // getAvoidMargin floor, etc.). It compares the shifted candidate path's swept footprint
+        // against the object using rss_params (longitudinal_distance_min_threshold,
+        // lateral_distance_max_threshold, expected accel/decel), independent of avoid_margin.
+        {
+          static auto logger = rclcpp::get_logger("static_obstacle_avoidance_scene");
+          static rclcpp::Clock steady_clock{RCL_ROS_TIME};
+          RCLCPP_WARN_THROTTLE(
+            logger, steady_clock, 500,
+            "[AVOID-DEBUG] isSafePath REJECT rss_check id=%s is_object_front=%s "
+            "is_object_oncoming=%s v_norm=%.2f hysteresis_factor=%.2f "
+            "lateral_distance_max_threshold=%.2f longitudinal_distance_min_threshold=%.2f "
+            "front_margin=%.2f rear_margin=%.2f",
+            autoware_utils::to_hex_string(object.uuid).c_str(), (is_object_front ? "true" : "false"),
+            (is_object_oncoming ? "true" : "false"), v_norm, hysteresis_factor,
+            parameters_->rss_params.lateral_distance_max_threshold,
+            parameters_->rss_params.longitudinal_distance_min_threshold,
+            parameters_->rss_params.front_vehicle_deceleration,
+            parameters_->rss_params.rear_vehicle_deceleration);
+        }
+
         safe_count_ = 0;
         return false;
       }
@@ -993,6 +1016,18 @@ bool StaticObstacleAvoidanceModule::isSafePath(
   }
 
   safe_count_++;
+
+  {
+    static auto logger = rclcpp::get_logger("static_obstacle_avoidance_scene");
+    static rclcpp::Clock steady_clock{RCL_ROS_TIME};
+    RCLCPP_WARN_THROTTLE(
+      logger, steady_clock, 500,
+      "[AVOID-DEBUG] isSafePath PASS_ALL_CHECKS n_targets=%zu safe_(prev)=%s safe_count_=%d "
+      "hysteresis_factor_safe_count=%d -> returning %s",
+      safety_check_target_objects.size(), (safe_ ? "true" : "false"), safe_count_,
+      parameters_->hysteresis_factor_safe_count,
+      ((safe_ || safe_count_ > parameters_->hysteresis_factor_safe_count) ? "true" : "false"));
+  }
 
   return safe_ || safe_count_ > parameters_->hysteresis_factor_safe_count;
 }
@@ -1637,9 +1672,33 @@ void StaticObstacleAvoidanceModule::updateData()
   helper_->setData(planner_data_);
 
   if (!helper_->isInitialized()) {
-    helper_->setPreviousSplineShiftPath(toShiftedPath(getPreviousModuleOutput().path));
-    helper_->setPreviousLinearShiftPath(toShiftedPath(getPreviousModuleOutput().path));
-    helper_->setPreviousReferencePath(getPreviousModuleOutput().path);
+    // NOTE: getPreviousModuleOutput().path is the raw upstream path as produced by whichever
+    // module ran before this one. Under normal forward driving that path is already densely
+    // resampled (every ~1 path resolution), so using it as-is here was harmless. But when
+    // reverse_lane_follow is actively reversing ego through a lanelet, its output path is built
+    // directly from the (inverted) lanelet sequence with only one point per lanelet
+    // transition -- e.g. 4 points spanning several meters and multiple lanelets/bends. This
+    // module keeps re-bootstrapping prev_reference_path_/prev_spline_shift_path_ from that raw
+    // path every single cycle it stays idle (processOnEntry()->initVariables()->helper_->reset()
+    // runs each cycle an idle module is re-evaluated -- see
+    // SceneModuleManagerInterface::updateIdleModuleInstance()), so it is never a one-off. Those
+    // two members are exactly what fillAvoidanceTargetObjects()/separateObjectsByPath() use to
+    // build the per-cycle "is this object within my driving corridor" swept polygon. With only a
+    // handful of far-apart points, that sweep is built from straight chords across bends instead
+    // of the true (curving) lane shape, so an object that sits well inside the true lanelet but
+    // off to one side of the chord can fall outside the swept corridor and get dropped as
+    // OUT_OF_TARGET_AREA before any margin/geometry logic ever sees it -- even though the same
+    // object would correctly register on an equivalent forward (non-reversed) route, where the
+    // upstream path is already fine-grained. Resample here exactly like data.reference_path
+    // already is below, so the corridor sweep always operates on a densely-sampled path
+    // regardless of how coarse the upstream module's output happens to be. Resampling an
+    // already-fine forward path is a no-op in practice, so this does not change forward-driving
+    // behavior.
+    const auto resampled_previous_path = utils::resamplePathWithSpline(
+      getPreviousModuleOutput().path, parameters_->resample_interval_for_planning);
+    helper_->setPreviousSplineShiftPath(toShiftedPath(resampled_previous_path));
+    helper_->setPreviousLinearShiftPath(toShiftedPath(resampled_previous_path));
+    helper_->setPreviousReferencePath(resampled_previous_path);
     helper_->setPreviousDrivingLanes(
       utils::static_obstacle_avoidance::getCurrentLanesFromPath(
         getPreviousModuleOutput().reference_path, planner_data_));

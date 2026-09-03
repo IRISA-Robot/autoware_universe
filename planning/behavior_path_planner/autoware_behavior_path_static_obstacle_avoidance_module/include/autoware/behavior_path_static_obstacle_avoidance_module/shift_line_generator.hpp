@@ -205,7 +205,8 @@ private:
    * - Change the shift length to the previous one if the deviation is small.
    * - Remove unnecessary return shift (back to the center line).
    */
-  AvoidLineArray applyTrimProcess(const AvoidLineArray & shift_lines, DebugData & debug) const;
+  AvoidLineArray applyTrimProcess(
+    const AvoidLineArray & shift_lines, DebugData & debug, bool bypass_longitudinal_gates) const;
 
   /*
    * @brief extract new shift lines based on current shifted path. the module makes a RTC request
@@ -213,7 +214,8 @@ private:
    * @param candidate shift lines.
    * @return new shift lines.
    */
-  AvoidLineArray findNewShiftLine(const AvoidLineArray & shift_lines, DebugData & debug) const;
+  AvoidLineArray findNewShiftLine(
+    const AvoidLineArray & shift_lines, DebugData & debug, bool bypass_longitudinal_gates) const;
 
   /*
    * @brief generate total shift line. total shift line has shift length and gradient array.
@@ -236,8 +238,16 @@ private:
    * @brief trim shift line whose relative longitudinal distance is less than threshold.
    * @param target shift lines.
    * @param threshold.
+   * @param bypass_longitudinal_gates if true, skip the relative-longitudinal-distance and
+   * prepare-distance checks below (same "geometrically possible avoidance already committed to
+   * / always-avoid" bypass semantics as ShiftLineGenerator::computeFeasibleShiftProfile -- without
+   * this, an object that computeFeasibleShiftProfile already accepted with a compressed
+   * (bypass-only) longitudinal profile can still get silently dropped here, since this generic
+   * merge/trim step re-applies its own longitudinal minimums without any awareness of that
+   * upstream bypass decision).
    */
-  void applySmallShiftFilter(AvoidLineArray & shift_lines, const double threshold) const;
+  void applySmallShiftFilter(
+    AvoidLineArray & shift_lines, const double threshold, bool bypass_longitudinal_gates) const;
 
   /*
    * @brief merge multiple shift lines whose relative gradient is less than threshold.

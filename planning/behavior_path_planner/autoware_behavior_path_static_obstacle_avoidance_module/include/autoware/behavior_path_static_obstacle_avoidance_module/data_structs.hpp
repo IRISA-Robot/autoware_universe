@@ -123,7 +123,15 @@ struct AvoidanceParameters
   // intentional (a sharp avoid is preferred over stopping directly in front of an object).
   // The lateral room-availability check (getAvoidMargin()/getRoadShoulderDistance() returning a
   // valid margin) is NEVER bypassed by this flag, regardless of its value.
-  bool always_avoid_if_geometrically_possible{false};
+  //
+  // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] In-code default flipped false->true per explicit user
+  // directive (see docs/research/always-avoid-constraint-removal.md). This struct default is a
+  // fallback only -- the real runtime value comes from parameter_helper.hpp's
+  // get_or_declare_parameter(), which reads config/static_obstacle_avoidance.param.yaml (also
+  // flipped to true there). Kept in sync here so any code path constructing AvoidanceParameters
+  // without going through the yaml (e.g. some unit tests) still gets the "always avoid" behavior
+  // by default.
+  bool always_avoid_if_geometrically_possible{true};
 
   // enable avoidance for all parking vehicle
   std::string policy_ambiguous_vehicle{"ignore"};

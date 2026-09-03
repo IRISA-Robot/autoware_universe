@@ -444,12 +444,40 @@ TEST(TestUtils, getAvoidMargin)
     EXPECT_DOUBLE_EQ(output.value(), 1.2);
   }
 
-  // road width is not enough.
+  // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] This case used to be "road width is not enough" -> reject
+  // (EXPECT_FALSE), back when Step1's feasibility gate compared against the full
+  // lateral_hard_margin_for_parked_vehicle (0.7 here). Per explicit user directive (see
+  // docs/research/always-avoid-constraint-removal.md), that gate now only requires
+  // kRelaxedHardMarginFloor (0.03 m) of clearance beyond half the vehicle width, so this same
+  // to_road_shoulder_distance (2.5) is now geometrically feasible: hard_lateral_distance_limit =
+  // 2.5 - 0.1(hard_drivable_bound_margin) - 1.0(0.5*vehicle_width) = 1.4, which is now >= 1.03
+  // (0.03 + 1.0), so it no longer trips the Step1 gate. Falls through to Step2 (soft_distance_limit
+  // 1.0 < the *unrelaxed* min_avoid_margin 1.7, since Step2's sizing math was intentionally left
+  // untouched), which returns min_avoid_margin (1.7) as before.
   {
     ObjectData object_data;
     object_data.is_parked = true;
     object_data.distance_factor = 1.0;
     object_data.to_road_shoulder_distance = 2.5;
+    object_data.object.classification.emplace_back(
+      autoware_perception_msgs::build<ObjectClassification>()
+        .label(ObjectClassification::TRUCK)
+        .probability(1.0));
+
+    const auto output = filtering_utils::getAvoidMargin(object_data, planner_data, parameters);
+    ASSERT_TRUE(output.has_value());
+    EXPECT_DOUBLE_EQ(output.value(), 1.7);
+  }
+
+  // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] The Step1 gate still rejects when there is truly no
+  // physical room -- the relaxed floor (kRelaxedHardMarginFloor = 0.03 m) is a small non-zero
+  // floor, not a full removal. With to_road_shoulder_distance = 0.5:
+  // hard_lateral_distance_limit = 0.5 - 0.1 - 1.0 = -0.6, well below 1.03, so this still rejects.
+  {
+    ObjectData object_data;
+    object_data.is_parked = true;
+    object_data.distance_factor = 1.0;
+    object_data.to_road_shoulder_distance = 0.5;
     object_data.object.classification.emplace_back(
       autoware_perception_msgs::build<ObjectClassification>()
         .label(ObjectClassification::TRUCK)
@@ -758,7 +786,10 @@ TEST(TestUtils, isSatisfiedWithCommonCondition)
     EXPECT_EQ(object_data.info, ObjectInfo::FURTHER_THAN_THRESHOLD);
   }
 
-  // farther than goal position.
+  // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] This case used to be "farther than goal position" ->
+  // reject (FURTHER_THAN_GOAL). That gate was removed per explicit user directive (see
+  // docs/research/always-avoid-constraint-removal.md), so this object -- otherwise a normal
+  // within-forward-detection-range object -- is now accepted.
   {
     const auto object_pose = geometry_msgs::build<geometry_msgs::msg::Pose>()
                                .position(create_point(7.0, 1.0, 0.0))
@@ -783,14 +814,15 @@ TEST(TestUtils, isSatisfiedWithCommonCondition)
 
     object_data.envelope_poly = createEnvelopePolygon(object_data, pose, margin);
 
-    EXPECT_FALSE(
+    EXPECT_TRUE(
       filtering_utils::isSatisfiedWithCommonCondition(
         object_data, path, forward_detection_range, 4.0, create_point(0.0, 0.0, 0.0), false,
         parameters));
-    EXPECT_EQ(object_data.info, ObjectInfo::FURTHER_THAN_GOAL);
   }
 
-  // within detection range.
+  // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] This case used to be "too near to goal" -> reject
+  // (TOO_NEAR_TO_GOAL). That gate was removed per explicit user directive (see
+  // docs/research/always-avoid-constraint-removal.md), so this object is now accepted.
   {
     const auto object_pose = geometry_msgs::build<geometry_msgs::msg::Pose>()
                                .position(create_point(4.5, 1.0, 0.0))
@@ -815,11 +847,10 @@ TEST(TestUtils, isSatisfiedWithCommonCondition)
 
     object_data.envelope_poly = createEnvelopePolygon(object_data, pose, margin);
 
-    EXPECT_FALSE(
+    EXPECT_TRUE(
       filtering_utils::isSatisfiedWithCommonCondition(
         object_data, path, forward_detection_range, 6.4, create_point(0.0, 0.0, 0.0), false,
         parameters));
-    EXPECT_EQ(object_data.info, ObjectInfo::TOO_NEAR_TO_GOAL);
   }
 
   // within detection range.
@@ -936,6 +967,76 @@ TEST(TestUtils, isShiftNecessary)
     ObjectData object;
     object.direction = Direction::NONE;
     EXPECT_THROW(isShiftNecessary(isOnRight(object), positive_shift_length), std::logic_error);
+  }
+}
+
+// Live-bug repro for generateAvoidOutline()'s SAME_DIRECTION_SHIFT (info=17) false positive.
+//
+// Root cause: isSameDirectionShift(is_right, shift) is, by construction, the exact logical
+// complement of isShiftNecessary(is_right, shift) for every (is_right, shift) pair except the
+// single degenerate case shift == 0.0 with is_right == false (both are true there). This means
+// is_same_direction_shift can ONLY be true for an object whose (is_on_right_of_true_lane,
+// overhang_dist, avoid_margin) triple would ALSO fail isNoNeedAvoidanceBehavior()'s
+// ENOUGH_LATERAL_DISTANCE check -- using the exact same inputs. Every object reaching
+// generateAvoidOutline() already passed that exact check once in filterTargetObjects().
+//
+// The only way an object reaches generateAvoidOutline() with is_same_direction_shift == true is
+// for avoid_margin to have been re-derived afterward (by updateRoadShoulderDistance(), which runs
+// on every already-accepted target_object every cycle) against a now-stale overhang_dist -- e.g.
+// a second object narrows the usable road-shoulder width, so avoid_margin shrinks from an
+// original value that made the shift "necessary" down to a smaller value for which the object's
+// (unchanged) real overhang distance already provides enough clearance.
+//
+// This test reproduces that exact narrowing with concrete numbers and confirms
+// isShiftNecessary()/isSameDirectionShift() land in the same "already clear, not a wrong-signed
+// shift" combination that shift_line_generator.cpp's generateAvoidOutline() now special-cases
+// (via is_shift_still_necessary) to ObjectInfo::ENOUGH_LATERAL_DISTANCE instead of the old,
+// unconditional ObjectInfo::SAME_DIRECTION_SHIFT -- which callers treat as "absolutely not
+// avoidable" and which can `break` outline generation for every target object behind this one.
+TEST(TestUtils, sameDirectionShiftFalsePositiveAfterMarginNarrowing)
+{
+  ObjectData object;
+  object.direction = Direction::LEFT;  // path-frame side, unused directly here
+  const bool is_on_right_of_true_lane = false;  // object is on the LEFT of the true lane
+  const double overhang_dist = 0.30;            // fixed: object measured 0.30 m left of the path
+
+  // Cycle N: object first accepted into target_objects with a generous avoid_margin (e.g. no
+  // other object yet narrows the road-shoulder). shift = overhang - margin = 0.30 - 0.50 = -0.20
+  // -> necessary (shift toward the right, away from the left-side object), NOT same-direction.
+  {
+    const double avoid_margin_original = 0.50;
+    const double shift = calcShiftLength(is_on_right_of_true_lane, overhang_dist, avoid_margin_original);
+    EXPECT_TRUE(isShiftNecessary(is_on_right_of_true_lane, shift));
+    EXPECT_FALSE(isSameDirectionShift(is_on_right_of_true_lane, shift));
+  }
+
+  // Cycle N+1: updateRoadShoulderDistance() re-derives avoid_margin (e.g. a second object now
+  // clips the drivable road-shoulder on this side), narrowing it to 0.20 m -- still a valid
+  // ("Some") margin, just smaller. overhang_dist (captured once, at filter time) is unchanged.
+  // shift = 0.30 - 0.20 = +0.10 -> the object's real clearance (0.30 m) now already exceeds the
+  // (smaller) required margin: genuinely no longer necessary to shift for this object.
+  {
+    const double avoid_margin_narrowed = 0.20;
+    const double shift = calcShiftLength(is_on_right_of_true_lane, overhang_dist, avoid_margin_narrowed);
+
+    // Old (buggy) classification: isSameDirectionShift() alone says "same direction" (bad) even
+    // though the object is genuinely, comfortably clear.
+    EXPECT_TRUE(isSameDirectionShift(is_on_right_of_true_lane, shift))
+      << "demonstrates the exact false-positive raw signal generateAvoidOutline() used to trust "
+         "unconditionally";
+
+    // isShiftNecessary() -- the same check isNoNeedAvoidanceBehavior() uses -- correctly says this
+    // is the harmless ENOUGH_LATERAL_DISTANCE condition, not a genuine same-direction hazard.
+    EXPECT_FALSE(isShiftNecessary(is_on_right_of_true_lane, shift));
+
+    // The fix's guard: is_same_direction_shift is only trusted when the shift is still necessary.
+    const bool is_shift_still_necessary = isShiftNecessary(is_on_right_of_true_lane, shift);
+    const bool is_same_direction_shift =
+      is_shift_still_necessary && isSameDirectionShift(is_on_right_of_true_lane, shift);
+    EXPECT_FALSE(is_shift_still_necessary);
+    EXPECT_FALSE(is_same_direction_shift)
+      << "after the fix, a stale/narrowed margin must degrade to a harmless "
+         "ENOUGH_LATERAL_DISTANCE skip, not a false SAME_DIRECTION_SHIFT/absolutely-not-avoidable";
   }
 }
 
@@ -2088,6 +2189,12 @@ TEST(TestUtils, ComputeFeasibleShiftProfileMidApproachReversionIsPrevented)
 {
   AlwaysAvoidTestFixture fixture(/*vehicle_width=*/0.5);
 
+  // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] always_avoid_if_geometrically_possible now defaults to
+  // true (see docs/research/always-avoid-constraint-removal.md). This test specifically wants to
+  // isolate "not committed AND global override off" behavior, so force it off explicitly rather
+  // than relying on the struct default.
+  fixture.parameters->always_avoid_if_geometrically_possible = false;
+
   constexpr double desire_shift_length = 1.5;
   const auto avoiding_shift = desire_shift_length;  // current_ego_shift == 0
 
@@ -2158,8 +2265,17 @@ TEST(TestUtils, AlwaysAvoidFlagBypassesLongitudinalGate)
 // wide to fit, regardless of the flag.
 TEST(TestUtils, AlwaysAvoidFlagNeverBypassesLateralRoomCheck)
 {
-  // (a) getAvoidMargin(): narrow-road "not enough room" case from the existing getAvoidMargin
-  // test, replayed with the new flag turned on.
+  // (a) getAvoidMargin(): [ALWAYS-AVOID-DIRECTIVE 2026-09-03] This sub-case used to replay the
+  // "not enough room" case from the getAvoidMargin test at to_road_shoulder_distance = 2.5 and
+  // expect a reject. Per explicit user directive (see
+  // docs/research/always-avoid-constraint-removal.md), getAvoidMargin()'s Step1 gate now uses a
+  // small non-zero floor (kRelaxedHardMarginFloor = 0.03 m) instead of the full
+  // lateral_hard_margin_for_parked_vehicle, so to_road_shoulder_distance = 2.5 is now
+  // geometrically feasible regardless of the always_avoid flag (this gate doesn't even read that
+  // flag -- it never did). Replaced with a genuinely-tight case (to_road_shoulder_distance = 0.5)
+  // to keep verifying the flag truly never bypasses the lateral room check, and that the room
+  // check itself still refuses when there is truly no physical space (the floor is relaxed, not
+  // removed).
   {
     auto parameters = get_parameters();
     parameters->always_avoid_if_geometrically_possible = true;
@@ -2168,7 +2284,7 @@ TEST(TestUtils, AlwaysAvoidFlagNeverBypassesLateralRoomCheck)
     ObjectData object_data;
     object_data.is_parked = true;
     object_data.distance_factor = 1.0;
-    object_data.to_road_shoulder_distance = 2.5;
+    object_data.to_road_shoulder_distance = 0.5;
     object_data.object.classification.emplace_back(
       autoware_perception_msgs::build<ObjectClassification>()
         .label(ObjectClassification::TRUCK)
@@ -2538,5 +2654,89 @@ TEST(TestUtils, applyJointLateralFeasibilityNoOpForNonOverlappingLongitudinalRan
 
   EXPECT_DOUBLE_EQ(objects.at(0).to_road_shoulder_distance, original_distance);
   EXPECT_DOUBLE_EQ(objects.at(1).to_road_shoulder_distance, original_distance);
+}
+
+// [ROBOT-NOT-A-CAR] Regression test: a pedestrian/bicycle object sitting exactly on (or within
+// threshold_distance_object_is_on_center of) the lane centerline used to be unconditionally
+// excluded from avoidance by isSatisfiedWithNonVehicleCondition() (ObjectInfo::
+// TOO_NEAR_TO_CENTERLINE), regardless of how much real lateral room was available. That gate has
+// been removed for this platform (see rationale comment at the call site); confirm a dead-center
+// pedestrian is no longer rejected by it.
+TEST(TestUtils, isSatisfiedWithNonVehicleConditionAllowsDeadCenterPedestrian)
+{
+  constexpr double half_width = 1.75;  // 3.5m-wide lane.
+
+  const auto planner_data = get_planner_data();
+  const auto parameters = get_parameters();
+  parameters->threshold_distance_object_is_on_center = 0.05;  // matches production tuning.
+
+  auto [route_handler, lanelet_obj] = make_straight_lane_route_handler(half_width);
+  route_handler->setRouteLanelets(lanelet::ConstLanelets{lanelet_obj});
+  planner_data->route_handler = route_handler;
+
+  AvoidancePlanningData data;
+  data.current_lanelets = {lanelet_obj};
+
+  // Dead center: to_centerline will be exactly 0.0, i.e. as "too near the centerline" as an
+  // object can possibly be.
+  const auto object_pose = autoware::test_utils::createPose(10.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+
+  ObjectData object_data;
+  object_data.object.classification.emplace_back(
+    autoware_perception_msgs::build<ObjectClassification>()
+      .label(ObjectClassification::PEDESTRIAN)
+      .probability(1.0));
+  object_data.object.kinematics.initial_pose_with_covariance.pose = object_pose;
+  object_data.overhang_lanelet = lanelet_obj;
+  object_data.overhang_points.emplace_back(0.0, object_pose.position);
+
+  EXPECT_TRUE(filtering_utils::isSatisfiedWithNonVehicleCondition(
+    object_data, data, planner_data, parameters));
+  EXPECT_NE(object_data.info, ObjectInfo::TOO_NEAR_TO_CENTERLINE);
+  // to_centerline is still populated (used elsewhere, e.g. debug output) even though it no
+  // longer gates eligibility.
+  EXPECT_NEAR(object_data.to_centerline, 0.0, 1e-6);
+}
+
+// [ROBOT-NOT-A-CAR] Regression test: a vehicle-classified obstacle sitting square in the middle
+// of the ego's own lane (not "is_parked" -- it doesn't hug either edge) used to fall through
+// isObviousAvoidanceTarget() into the ambiguous-vehicle path, which -- even under the most
+// permissive policy -- withholds avoidance for several seconds of stop time before treating it as
+// avoidable. Confirm such an object is now treated as an obvious avoidance target immediately,
+// exactly like a curb-parked vehicle, as long as it actually has room to shift (avoid_margin has
+// a value).
+TEST(TestUtils, isObviousAvoidanceTargetAcceptsCenteredBlockingVehicleImmediately)
+{
+  const auto planner_data = get_planner_data();
+  const auto parameters = get_parameters();
+
+  // isObviousAvoidanceTarget() calls isWithinFreespace(), which dereferences
+  // route_handler->getLaneletMapPtr() -- needs a real (even if empty-of-parking-lots) map set,
+  // unlike the default route_handler from get_planner_data().
+  auto [route_handler, lanelet_obj] = make_straight_lane_route_handler(1.75);
+  planner_data->route_handler = route_handler;
+
+  AvoidancePlanningData data;
+
+  ObjectData object_data;
+  object_data.object.classification.emplace_back(
+    autoware_perception_msgs::build<ObjectClassification>()
+      .label(ObjectClassification::CAR)
+      .probability(1.0));
+  object_data.behavior = ObjectData::Behavior::NONE;
+  object_data.is_within_intersection = false;
+  object_data.is_on_ego_lane = true;
+  object_data.is_parked = false;  // dead-center: fails the classic parked-vehicle classification.
+  object_data.avoid_margin = 0.5;  // genuine lateral room is available.
+
+  EXPECT_TRUE(
+    filtering_utils::isObviousAvoidanceTarget(object_data, data, planner_data, parameters));
+
+  // Sanity check on the old behavior: with no lateral room at all (avoid_margin unset), the
+  // object must NOT be force-accepted -- the real feasibility check is never bypassed.
+  ObjectData infeasible_object_data = object_data;
+  infeasible_object_data.avoid_margin = std::nullopt;
+  EXPECT_FALSE(filtering_utils::isObviousAvoidanceTarget(
+    infeasible_object_data, data, planner_data, parameters));
 }
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
