@@ -3333,4 +3333,32 @@ double calcErrorEclipseLongRadius(const PoseWithCovariance & pose)
 
   return std::sqrt(eigensolver.eigenvalues()(1));
 }
+
+bool shouldRearmHeldShiftLine(
+  const double registered_end_shift_length, const double desired_end_shift_length,
+  const bool has_new_candidate, const double ego_speed, const double ego_speed_threshold,
+  const double clearance_margin)
+{
+  if (!has_new_candidate) {
+    return false;
+  }
+
+  // never re-arm while ego is moving -- re-arming changes the registered shift target and could
+  // otherwise cause a sudden lateral jerk.
+  if (ego_speed >= ego_speed_threshold) {
+    return false;
+  }
+
+  // only re-arm for a same-side shift: this guards against comparing shifts on opposite sides of
+  // the path, where the sign of "more clearance" is meaningless.
+  const auto same_side = registered_end_shift_length * desired_end_shift_length > 0.0;
+  if (!same_side) {
+    return false;
+  }
+
+  // only re-arm to INCREASE clearance, never to decrease it -- decreasing is exactly the
+  // committal this hold branch exists to prevent.
+  return std::abs(desired_end_shift_length) >
+         std::abs(registered_end_shift_length) + clearance_margin;
+}
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance

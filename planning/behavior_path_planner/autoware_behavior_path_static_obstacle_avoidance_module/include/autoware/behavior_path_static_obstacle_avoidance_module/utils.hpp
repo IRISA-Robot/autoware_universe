@@ -349,6 +349,37 @@ void updateStoredObjects(
   ObjectDataArray & stored_objects, const ObjectDataArray & current_objects,
   const rclcpp::Time & now, const std::shared_ptr<AvoidanceParameters> & parameters);
 
+/**
+ * @brief Decide whether a stale registered shift line (held because a fresh candidate was
+ * rejected by isSafePath() while canYieldManeuver() also refused a yield) should be forcibly
+ * re-armed to a freshly-computed, larger shift instead of being held forever.
+ *
+ * Background (2026-09-04 hold-forever deadlock fix): holding a rejected candidate only stops the
+ * module from COMMITTING a new unsafe shift -- it does nothing about a shift line that was
+ * already registered on a previous, then-safe cycle. If that stale value keeps providing less
+ * clearance than what is now genuinely required for the same still-unsafe object, and
+ * canYieldManeuver() keeps refusing (e.g. avoidance is already mid-maneuver), the hold can
+ * deadlock forever at an insufficient value. This function allows the hold to be bypassed and the
+ * larger value re-armed, but ONLY when it is safe to do so (ego near-stationary, so no sudden
+ * lateral jerk) and ONLY to INCREASE clearance on the same side -- never to decrease it.
+ *
+ * @param registered_end_shift_length end shift length of the currently path_shifter_-registered
+ * main shift line.
+ * @param desired_end_shift_length end shift length of the freshly-computed (still rejected as
+ * unsafe) candidate shift line. Pass 0.0 with has_new_candidate=false when there is no candidate.
+ * @param has_new_candidate whether a fresh candidate shift line exists this cycle.
+ * @param ego_speed current ego speed magnitude [m/s].
+ * @param ego_speed_threshold "safely stationary" speed gate [m/s].
+ * @param clearance_margin minimum extra clearance [m] required before treating the candidate as
+ * "more" than the registered value, to avoid re-arming on noise-level differences.
+ * @return true if the hold should be bypassed and the registered shift line re-armed to the
+ * larger, freshly-computed value.
+ */
+bool shouldRearmHeldShiftLine(
+  const double registered_end_shift_length, const double desired_end_shift_length,
+  const bool has_new_candidate, const double ego_speed, const double ego_speed_threshold,
+  const double clearance_margin);
+
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
 
 #endif  // AUTOWARE__BEHAVIOR_PATH_STATIC_OBSTACLE_AVOIDANCE_MODULE__UTILS_HPP_

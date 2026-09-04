@@ -2830,4 +2830,62 @@ TEST(TestUtils, isObviousAvoidanceTargetAcceptsCenteredBlockingVehicleImmediatel
   EXPECT_FALSE(filtering_utils::isObviousAvoidanceTarget(
     infeasible_object_data, data, planner_data, parameters));
 }
+
+// Reproduces the "hold-forever deadlock" scenario (2026-09-04 investigation): a shift line was
+// registered on a previous, then-safe cycle at a value that is now insufficient (the object still
+// requires more clearance), isSafePath() keeps rejecting the fresh candidate, and
+// canYieldManeuver() keeps refusing a yield -- so scene.cpp's "hold" branch would otherwise clear
+// data.safe_shift_line and hold the same insufficient registered value forever. This test
+// exercises the extracted decision function directly (shouldRearmHeldShiftLine), since driving the
+// full StaticObstacleAvoidanceModule scene-module state machine end-to-end is impractical at the
+// unit level.
+TEST(TestUtils, ShouldRearmHeldShiftLineResolvesDeadlockWhenEgoStationary)
+{
+  // Registered on a previous cycle: -0.715 (matches the live-observed plateau value). Freshly
+  // required this cycle: -1.08 (matches the live-observed desire_shift_length). Same side
+  // (both negative / rightward), ego genuinely stationary.
+  constexpr double registered_end_shift_length = -0.715;
+  constexpr double desired_end_shift_length = -1.08;
+  constexpr double ego_speed_threshold = 0.1;
+  constexpr double clearance_margin = 1e-2;
+
+  // Ego stationary: the deadlock must be broken -- re-arm to the larger (more negative) value.
+  EXPECT_TRUE(shouldRearmHeldShiftLine(
+    registered_end_shift_length, desired_end_shift_length, /*has_new_candidate=*/true,
+    /*ego_speed=*/0.0, ego_speed_threshold, clearance_margin))
+    << "must re-arm: registered shift falls short of the freshly-required, still-unsafe "
+       "candidate, and ego is safely stationary -- this is exactly the deadlock condition.";
+
+  // Ego still moving: never re-arm, regardless of how large the shortfall is -- avoids a sudden
+  // lateral jerk while driving.
+  EXPECT_FALSE(shouldRearmHeldShiftLine(
+    registered_end_shift_length, desired_end_shift_length, /*has_new_candidate=*/true,
+    /*ego_speed=*/0.5, ego_speed_threshold, clearance_margin))
+    << "must NOT re-arm while ego is moving, even if the registered shift is insufficient.";
+
+  // No fresh candidate this cycle (e.g. generator produced nothing): nothing to re-arm to.
+  EXPECT_FALSE(shouldRearmHeldShiftLine(
+    registered_end_shift_length, desired_end_shift_length, /*has_new_candidate=*/false,
+    /*ego_speed=*/0.0, ego_speed_threshold, clearance_margin));
+
+  // Opposite-side shift (registered negative, desired positive): never re-arm -- "more clearance"
+  // is meaningless across sides.
+  EXPECT_FALSE(shouldRearmHeldShiftLine(
+    registered_end_shift_length, /*desired_end_shift_length=*/1.08, /*has_new_candidate=*/true,
+    /*ego_speed=*/0.0, ego_speed_threshold, clearance_margin));
+
+  // Candidate does NOT need more clearance than what is already registered (e.g. registered is
+  // already sufficient, or the fresh candidate is smaller): must NOT re-arm -- re-arming here
+  // would DECREASE the registered shift, which is exactly what the original Sept-2 hold fix
+  // exists to prevent.
+  EXPECT_FALSE(shouldRearmHeldShiftLine(
+    /*registered_end_shift_length=*/-1.08, /*desired_end_shift_length=*/-0.715,
+    /*has_new_candidate=*/true, /*ego_speed=*/0.0, ego_speed_threshold, clearance_margin))
+    << "must NOT re-arm to a SMALLER shift -- that would defeat the original hold-branch fix.";
+
+  // Difference within noise-level clearance_margin: must NOT re-arm (avoids chattering).
+  EXPECT_FALSE(shouldRearmHeldShiftLine(
+    /*registered_end_shift_length=*/-0.715, /*desired_end_shift_length=*/-0.716,
+    /*has_new_candidate=*/true, /*ego_speed=*/0.0, ego_speed_threshold, clearance_margin));
+}
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance

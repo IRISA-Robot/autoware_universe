@@ -733,14 +733,70 @@ void StaticObstacleAvoidanceModule::fillEgoStatus(
     // cycle from the live, continuously-updating object.longitudinal, so as ego keeps moving
     // forward the return trigger naturally pushes out and gets adopted once it is genuinely
     // safe, instead of being locked in early.
-    const auto has_registered_shift_line = !path_shifter_.getShiftLines().empty();
+    const auto registered_lines = path_shifter_.getShiftLines();
+    const auto has_registered_shift_line = !registered_lines.empty();
     if (has_registered_shift_line) {
+      // NOTE (2026-09-04, hold-forever deadlock fix): the hold above only refuses to COMMIT a
+      // new, currently-unsafe candidate -- it does nothing about a shift line that was already
+      // registered on a previous (then-safe) cycle. If that stale registered shift keeps
+      // providing LESS clearance than what is now freshly required for this same still-unsafe
+      // object, and canYieldManeuver() keeps saying no (e.g. because avoidance is already
+      // mid-maneuver, per helper_->isShifted()), this branch would otherwise hold the same
+      // insufficient value forever: the module can never validate committing the larger shift
+      // (ego is already too close, a direct consequence of the smaller shift having been let
+      // through earlier), so it deadlocks short of the clearance it itself says is required.
+      //
+      // Fix: if ego is (near-)stationary -- so re-arming cannot cause a sudden lateral jerk --
+      // and the freshly-computed candidate demands strictly more clearance, on the same side,
+      // than what is currently registered, allow the hold to be bypassed and re-arm
+      // path_shifter_ with the larger, correctly-computed shift line instead of refusing forever.
+      // This never lets the hold DECREASE the registered shift (that would defeat the original
+      // Sept-2 fix this block exists for) -- it only ever allows an INCREASE, and only when
+      // ego is safely stopped.
+      constexpr double kRearmEgoSpeedThreshold = 0.1;  // [m/s] "safely stationary" gate
+      constexpr double kRearmClearanceMargin = 1e-2;   // [m] ignore noise-level differences
+
+      const auto registered_end_shift_length =
+        std::max_element(
+          registered_lines.begin(), registered_lines.end(),
+          [](const auto & a, const auto & b) {
+            return std::abs(a.end_shift_length) < std::abs(b.end_shift_length);
+          })
+          ->end_shift_length;
+
+      const auto has_new_candidate = !data.new_shift_line.empty();
+      const auto desired_end_shift_length =
+        has_new_candidate ? helper_->getMainShiftLine(data.new_shift_line).end_shift_length : 0.0;
+      const auto ego_speed = getEgoSpeed();
+
+      const auto should_rearm = utils::static_obstacle_avoidance::shouldRearmHeldShiftLine(
+        registered_end_shift_length, desired_end_shift_length, has_new_candidate, ego_speed,
+        kRearmEgoSpeedThreshold, kRearmClearanceMargin);
+
+      if (should_rearm) {
+        data.yield_required = false;
+        data.safe_shift_line = data.new_shift_line;
+        RCLCPP_WARN_THROTTLE(
+          getLogger(), *clock_, 500,
+          "[HOLD-REARM] registered shift (%.3f) provides less clearance than the freshly "
+          "required candidate (%.3f) for a still-unsafe object, and ego is near-stationary "
+          "(v=%.3f < %.3f) -- re-arming registered shift plan to the larger value instead of "
+          "holding forever.",
+          registered_end_shift_length, desired_end_shift_length, ego_speed,
+          kRearmEgoSpeedThreshold);
+        return;
+      }
+
       data.yield_required = false;
       data.safe_shift_line.clear();
       RCLCPP_WARN_THROTTLE(
         getLogger(), *clock_, 500,
         "unsafe (likely early return-to-lane) and could not transit yield status; "
-        "holding current registered shift plan instead of committing the unsafe candidate.");
+        "holding current registered shift plan instead of committing the unsafe candidate. "
+        "[HOLD-REARM] not applied: registered=%.3f desired=%.3f has_new_candidate=%s "
+        "ego_speed=%.3f",
+        registered_end_shift_length, desired_end_shift_length,
+        (has_new_candidate ? "true" : "false"), ego_speed);
       return;
     }
 
