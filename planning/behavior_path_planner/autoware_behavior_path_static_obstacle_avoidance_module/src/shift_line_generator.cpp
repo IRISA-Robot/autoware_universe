@@ -502,7 +502,90 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
         al_avoid.end_shift_length =
           std::min(feasible_shift_profile.value().first, helper_->getLinearShift(end.position));
       }
+
+      // [ASYM-HYSTERESIS 2026-09-04] Once an object is already approved (there is a real
+      // registered shift at its position to compare against), apply asymmetric hysteresis to the
+      // grow/shrink decision on end_shift_length: growing (more clearance/more urgent) is let
+      // through within shift_hysteresis_in_cycles consecutive cycles (default 1 == immediate --
+      // the safety-critical direction must react fast), while shrinking (less clearance) requires
+      // shift_hysteresis_out_cycles consecutive cycles first (default 5 -- avoids the same
+      // flicker/premature-collapse failure family as REV-F2 / HOLD-REARM /
+      // existsUnclearedAvoidanceObjectAhead, all instances of a shift collapsing or failing to
+      // grow too eagerly on the exit side). A brand-new (not-yet-approved) candidate is not a
+      // grow/shrink decision and is left untouched here. Decision logic lives in
+      // utils::static_obstacle_avoidance::applyAsymmetricShiftHysteresis() so it is directly unit
+      // testable without needing a full generateAvoidOutline() setup.
+      if (is_approved(o)) {
+        const auto registered_shift_length = helper_->getShift(o.getPosition());
+        const auto desired_end_shift_length = al_avoid.end_shift_length;
+        al_avoid.end_shift_length = utils::static_obstacle_avoidance::applyAsymmetricShiftHysteresis(
+          desired_end_shift_length, registered_shift_length,
+          parameters_->shift_hysteresis_clearance_margin, parameters_->shift_hysteresis_in_cycles,
+          parameters_->shift_hysteresis_out_cycles, o.shift_grow_streak, o.shift_shrink_streak);
+
+        static auto logger = rclcpp::get_logger("static_obstacle_avoidance_shift_line_generator");
+        static rclcpp::Clock steady_clock{RCL_ROS_TIME};
+        RCLCPP_WARN_THROTTLE(
+          logger, steady_clock, 500,
+          "[ASYM-HYSTERESIS] id=%s registered=%.3f desired=%.3f -> applied=%.3f "
+          "(grow_streak=%d/%d shrink_streak=%d/%d)",
+          autoware_utils::to_hex_string(o.object.object_id).c_str(), registered_shift_length,
+          desired_end_shift_length, al_avoid.end_shift_length, o.shift_grow_streak,
+          parameters_->shift_hysteresis_in_cycles, o.shift_shrink_streak,
+          parameters_->shift_hysteresis_out_cycles);
+      }
+
       al_avoid.end_longitudinal = to_shift_end;
+
+      // [BUG-A fix 2026-09-04] Rescue close-range candidates that fail is_valid_shift_line purely
+      // because to_shift_end (object.longitudinal - constant_distance) has collapsed to at or
+      // below start_longitudinal as ego closes in on the object. computeFeasibleShiftProfile()
+      // already proved a jerk-feasible shift of this magnitude fits in whatever longitudinal room
+      // remains (that is exactly what feasible_shift_profile.value().second / the
+      // bypass_longitudinal_gates machinery there encodes) -- silently dropping the candidate here
+      // just because "object longitudinal - constant distance" went non-positive throws away
+      // exactly the case that most urgently needs a NEW, larger shift (confirmed live: this is
+      // what starved HOLD-REARM of a new candidate -- has_new_candidate stayed false with
+      // current_ego_shift frozen while desire_shift_length kept growing as the object got closer).
+      // Anchor end_longitudinal to at least start_longitudinal + the same minimum jerk-feasible
+      // transition distance used elsewhere in this function (helper_->getMinAvoidanceDistance) so
+      // a valid, steeper-but-still-kinematically-feasible shift line can still be built. If even
+      // that minimum transition cannot fit before reaching the object, this is genuine kinematic
+      // infeasibility -- leave end_longitudinal alone and let the existing is_valid_shift_line /
+      // INVALID_SHIFT_LINE path reject it, now correctly attributable to "no room at all" rather
+      // than "arithmetic went negative and we silently gave up". Decision logic lives in
+      // utils::static_obstacle_avoidance::rescueCloseRangeShiftLineEnd() so it is directly unit
+      // testable without needing a full generateAvoidOutline() setup.
+      if (al_avoid.end_longitudinal <= al_avoid.start_longitudinal) {
+        const auto min_transition_distance = std::max(
+          helper_->getMinAvoidanceDistance(al_avoid.end_shift_length - current_ego_shift), 1e-2);
+        constexpr double kObjectApproachBuffer = 1e-2;  // [m] stay short of the object itself
+        const auto rescued = utils::static_obstacle_avoidance::rescueCloseRangeShiftLineEnd(
+          al_avoid.start_longitudinal, min_transition_distance, o.longitudinal,
+          kObjectApproachBuffer);
+
+        static auto logger = rclcpp::get_logger("static_obstacle_avoidance_shift_line_generator");
+        static rclcpp::Clock steady_clock{RCL_ROS_TIME};
+
+        if (rescued.has_value()) {
+          RCLCPP_WARN_THROTTLE(
+            logger, steady_clock, 500,
+            "[BUG-A-RESCUE] id=%s close-range candidate rescued: raw_end=%.3f start=%.3f -> "
+            "rescued_end=%.3f (min_transition=%.3f object_longitudinal=%.3f end_shift_length=%.3f)",
+            autoware_utils::to_hex_string(o.object.object_id).c_str(), al_avoid.end_longitudinal,
+            al_avoid.start_longitudinal, rescued.value(), min_transition_distance, o.longitudinal,
+            al_avoid.end_shift_length);
+          al_avoid.end_longitudinal = rescued.value();
+        } else {
+          RCLCPP_WARN_THROTTLE(
+            logger, steady_clock, 500,
+            "[BUG-A-RESCUE] id=%s close-range candidate NOT rescuable: min_transition=%.3f "
+            "but object is at longitudinal=%.3f -- genuine kinematic infeasibility, not "
+            "rescuing.",
+            autoware_utils::to_hex_string(o.object.object_id).c_str(), min_transition_distance,
+            o.longitudinal);
+        }
+      }
 
       // misc
       al_avoid.id = generate_uuid();
@@ -1257,6 +1340,35 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
     [](const auto & o) { return !o.is_avoidable && o.longitudinal > 0.0; });
 
   if (exist_unavoidable_object) {
+    return ret;
+  }
+
+  // [MULTI-OBJ-HOLD fix 2026-09-04] The check above only guards against *unavoidable* objects
+  // still ahead. In a sequential multi-object scenario (object 1 just cleared, object 2 close
+  // behind it along the route), object 2 is perfectly avoidable -- but if its own avoidance
+  // candidate hasn't been generated yet THIS cycle (detection-timing lag, or generation-order
+  // lag inside this same planning cycle), `ret`/shift_lines is empty for it and this function
+  // would otherwise start collapsing object 1's shift back to centerline immediately, putting
+  // ego on a near-collision course with object 2 for the few cycles until object 2's own
+  // avoidance candidate catches up. Root cause: this function only ever consulted the
+  // just-cleared object, never the full current target-object list, before deciding "no longer
+  // need to avoid, return to lane."
+  // Fix: hold the current shift (skip adding the return-to-center shift) as long as ANY
+  // currently-tracked target object -- avoidable or not -- is still ahead of ego. This is a
+  // per-cycle recomputation from live target_objects (not a sticky/latched flag), so once ego
+  // has genuinely passed every currently-detected object in the stretch, the very next cycle
+  // sees no object ahead and the normal return-to-lane proceeds -- this cannot become a new
+  // permanent-stuck state the way a latched hold could.
+  const auto exist_object_still_ahead =
+    utils::static_obstacle_avoidance::existsUnclearedAvoidanceObjectAhead(data.target_objects);
+
+  if (exist_object_still_ahead) {
+    static auto logger = rclcpp::get_logger("static_obstacle_avoidance_shift_line_generator");
+    static rclcpp::Clock steady_clock{RCL_ROS_TIME};
+    RCLCPP_WARN_THROTTLE(
+      logger, steady_clock, 500,
+      "[AVOID-DEBUG] addReturnShiftLine SUPPRESSED (multi-obj-hold): another target object is "
+      "still ahead of ego -- holding current shift instead of collapsing to centerline.");
     return ret;
   }
 

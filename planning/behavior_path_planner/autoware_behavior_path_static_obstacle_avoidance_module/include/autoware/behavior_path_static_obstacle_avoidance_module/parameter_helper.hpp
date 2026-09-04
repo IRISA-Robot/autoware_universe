@@ -291,6 +291,13 @@ AvoidanceParameters getParameter(rclcpp::Node * node)
       throw std::domain_error(
         "ratio_for_return_shift_approval should be within range of 0.0 to 1.0");
     }
+    // [ASYM-HYSTERESIS 2026-09-04] see the doc comment on these fields in data_structs.hpp.
+    p.shift_hysteresis_in_cycles =
+      get_or_declare_parameter<int>(*node, ns + "shift_hysteresis_in_cycles");
+    p.shift_hysteresis_out_cycles =
+      get_or_declare_parameter<int>(*node, ns + "shift_hysteresis_out_cycles");
+    p.shift_hysteresis_clearance_margin =
+      get_or_declare_parameter<double>(*node, ns + "shift_hysteresis_clearance_margin");
   }
 
   // avoidance maneuver (longitudinal)

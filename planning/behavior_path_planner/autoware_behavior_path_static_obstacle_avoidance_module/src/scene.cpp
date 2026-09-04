@@ -118,8 +118,23 @@ bool StaticObstacleAvoidanceModule::isExecutionReady() const
   RCLCPP_DEBUG_STREAM(getLogger(), std::boolalpha << "READY:" << avoid_data_.ready);
   RCLCPP_DEBUG_STREAM(
     getLogger(), std::boolalpha << "NEED APPROVAL:" << avoid_data_.request_operator);
-  return avoid_data_.safe && avoid_data_.comfortable && avoid_data_.valid && avoid_data_.ready &&
-         !avoid_data_.request_operator;
+  const bool ready = avoid_data_.safe && avoid_data_.comfortable && avoid_data_.valid &&
+                      avoid_data_.ready && !avoid_data_.request_operator;
+  // [DIAG] Permanent low-noise diagnostic: this is the exact gate that feeds RTC's "safe" field
+  // and therefore the WAITING_APPROVAL->RUNNING promotion decision (see
+  // scene_module_interface.hpp's existApprovedRequest()/isActivated()). When the module appears
+  // stuck in WAITING_APPROVAL despite a seemingly-good candidate shift, check which of these five
+  // is false -- `safe` in particular is driven by isSafePath()'s RSS check and can be false due to
+  // an unrelated object elsewhere in the scene, not just the avoidance target itself.
+  if (!ready) {
+    RCLCPP_WARN_THROTTLE(
+      getLogger(), *clock_, 1000,
+      "[AVOID-DEBUG] isExecutionReady=false: safe=%d comfortable=%d valid=%d ready=%d "
+      "request_operator=%d",
+      avoid_data_.safe, avoid_data_.comfortable, avoid_data_.valid, avoid_data_.ready,
+      avoid_data_.request_operator);
+  }
+  return ready;
 }
 
 AvoidanceState StaticObstacleAvoidanceModule::getCurrentModuleState(
@@ -457,6 +472,7 @@ void StaticObstacleAvoidanceModule::fillAvoidanceTargetData(ObjectDataArray & ob
   using utils::static_obstacle_avoidance::fillObjectAvoidableByDesiredShiftLength;
   using utils::static_obstacle_avoidance::fillObjectAvoidanceCommitted;
   using utils::static_obstacle_avoidance::fillObjectHardMarginDebounce;
+  using utils::static_obstacle_avoidance::fillObjectShiftHysteresis;
   using utils::static_obstacle_avoidance::fillObjectStoppableJudge;
 
   // Calculate the distance needed to safely decelerate the ego vehicle to a stop line.
@@ -478,6 +494,9 @@ void StaticObstacleAvoidanceModule::fillAvoidanceTargetData(ObjectDataArray & ob
     // [REV-F2 fix 2026-09-03] seed the hard-margin-check debounce streak from last cycle's
     // matching object, before computeFeasibleShiftProfile() reads/updates it this cycle.
     fillObjectHardMarginDebounce(o, avoid_data_.previous_target_objects);
+    // [ASYM-HYSTERESIS 2026-09-04] seed the shift grow/shrink hysteresis streaks from last
+    // cycle's matching object, before generateAvoidOutline() reads/updates them this cycle.
+    fillObjectShiftHysteresis(o, avoid_data_.previous_target_objects);
   });
 }
 

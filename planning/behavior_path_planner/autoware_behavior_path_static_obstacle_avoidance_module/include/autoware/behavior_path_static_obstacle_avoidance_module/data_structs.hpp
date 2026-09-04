@@ -257,6 +257,16 @@ struct AvoidanceParameters
   size_t hysteresis_factor_safe_count;
   double hysteresis_factor_expand_rate{0.0};
 
+  // [ASYM-HYSTERESIS 2026-09-04] Asymmetric hysteresis on an already-approved object's shift
+  // length: growing (more clearance/more urgent) reacts within this many consecutive cycles,
+  // shrinking (less clearance) requires this many consecutive cycles instead -- mirrors the
+  // existing hysteresis_factor_safe_count pattern above (unsafe->safe is instant, safe->unsafe
+  // needs sustained confirmation) but applied to the shift-length grow/shrink decision instead of
+  // the isSafePath() safe/unsafe decision. See ShiftLineGenerator::generateAvoidOutline().
+  int shift_hysteresis_in_cycles{1};
+  int shift_hysteresis_out_cycles{5};
+  double shift_hysteresis_clearance_margin{1e-2};
+
   double collision_check_yaw_diff_threshold{3.1416};
 
   bool consider_front_overhang{true};
@@ -510,6 +520,18 @@ struct ObjectData  // avoidance target
   // is the object treated as genuinely infeasible. Does NOT change the hard-margin threshold
   // itself (kRelaxedHardMarginFloor) -- purely a debounce on acting on the outcome.
   int hard_margin_infeasible_streak{0};
+
+  // [ASYM-HYSTERESIS 2026-09-04] Consecutive-cycle counters for the asymmetric grow/shrink
+  // hysteresis applied to this object's shift length in
+  // ShiftLineGenerator::generateAvoidOutline() once the object is already approved (see
+  // parameters_->shift_hysteresis_in_cycles / shift_hysteresis_out_cycles). Persisted across
+  // cycles by matching object_id against previous_target_objects, same pattern as
+  // hard_margin_infeasible_streak (see fillObjectShiftHysteresis()). grow_streak counts
+  // consecutive cycles the freshly-desired shift asked for MORE clearance than what is currently
+  // registered; shrink_streak counts consecutive cycles it asked for LESS. Only one of the two is
+  // ever incrementing at a time -- both reset to 0 the cycle a grow/shrink is actually applied.
+  int shift_grow_streak{0};
+  int shift_shrink_streak{0};
 
   // is within intersection area
   bool is_within_intersection{false};

@@ -2263,6 +2263,26 @@ void fillObjectHardMarginDebounce(
   object_data.hard_margin_infeasible_streak = same_id_obj->hard_margin_infeasible_streak;
 }
 
+void fillObjectShiftHysteresis(
+  ObjectData & object_data, const ObjectDataArray & previous_target_objects)
+{
+  // [ASYM-HYSTERESIS 2026-09-04] see the doc comment on these fields in data_structs.hpp / the
+  // sibling fillObjectHardMarginDebounce() above (same carry-forward pattern).
+  const auto id = object_data.object.object_id;
+  const auto same_id_obj = std::find_if(
+    previous_target_objects.begin(), previous_target_objects.end(),
+    [&id](const auto & o) { return o.object.object_id == id; });
+
+  if (same_id_obj == previous_target_objects.end()) {
+    object_data.shift_grow_streak = 0;
+    object_data.shift_shrink_streak = 0;
+    return;
+  }
+
+  object_data.shift_grow_streak = same_id_obj->shift_grow_streak;
+  object_data.shift_shrink_streak = same_id_obj->shift_shrink_streak;
+}
+
 void compensateLostTargetObjects(
   AvoidancePlanningData & data, const ObjectDataArray & stored_objects,
   const std::shared_ptr<const PlannerData> & planner_data)
@@ -3360,5 +3380,65 @@ bool shouldRearmHeldShiftLine(
   // committal this hold branch exists to prevent.
   return std::abs(desired_end_shift_length) >
          std::abs(registered_end_shift_length) + clearance_margin;
+}
+
+std::optional<double> rescueCloseRangeShiftLineEnd(
+  const double start_longitudinal, const double min_transition_distance,
+  const double object_longitudinal, const double approach_buffer)
+{
+  const auto rescued_end_longitudinal =
+    start_longitudinal + std::max(min_transition_distance, 1e-2);
+  const auto latest_feasible_end = object_longitudinal - approach_buffer;
+
+  if (rescued_end_longitudinal <= latest_feasible_end) {
+    return rescued_end_longitudinal;
+  }
+
+  return std::nullopt;
+}
+
+double applyAsymmetricShiftHysteresis(
+  const double desired_end_shift_length, const double registered_shift_length,
+  const double clearance_margin, const int hysteresis_in_cycles, const int hysteresis_out_cycles,
+  int & grow_streak, int & shrink_streak)
+{
+  const auto is_growing =
+    std::abs(desired_end_shift_length) > std::abs(registered_shift_length) + clearance_margin;
+  const auto is_shrinking =
+    std::abs(desired_end_shift_length) < std::abs(registered_shift_length) - clearance_margin;
+
+  if (is_growing) {
+    shrink_streak = 0;
+    grow_streak += 1;
+    return grow_streak < hysteresis_in_cycles ? registered_shift_length : desired_end_shift_length;
+  }
+
+  if (is_shrinking) {
+    grow_streak = 0;
+    shrink_streak += 1;
+    return shrink_streak < hysteresis_out_cycles ? registered_shift_length
+                                                  : desired_end_shift_length;
+  }
+
+  grow_streak = 0;
+  shrink_streak = 0;
+  return desired_end_shift_length;
+}
+
+// [MULTI-OBJ-HOLD fix 2026-09-04, RECONSTRUCTED 2026-09-04] This implementation was lost to an
+// accidental `git checkout -- src/utils.cpp` during a later same-day investigation session and
+// has been reconstructed from the surviving declaration + doc comment in utils.hpp and the
+// surviving call site in shift_line_generator.cpp's addReturnShiftLine() (both of which fully
+// specify the intended semantics: true if ANY currently-tracked target object -- avoidable or
+// not -- is still ahead of ego, using the same `longitudinal > 0.0` convention already used by
+// the neighboring `exist_unavoidable_object` check in shift_line_generator.cpp). The
+// corresponding unit test (TestUtils.ExistsUnclearedAvoidanceObjectAheadHoldsUntilAllObjectsPassed)
+// was also lost and has been reconstructed in test/test_utils.cpp. Please review this
+// reconstruction against your own memory of the original before relying on it further.
+bool existsUnclearedAvoidanceObjectAhead(const ObjectDataArray & target_objects)
+{
+  return std::any_of(
+    target_objects.begin(), target_objects.end(),
+    [](const auto & o) { return o.longitudinal > 0.0; });
 }
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance

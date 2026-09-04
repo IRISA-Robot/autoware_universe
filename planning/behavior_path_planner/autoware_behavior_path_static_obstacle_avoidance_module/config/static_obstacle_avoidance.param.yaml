@@ -247,6 +247,13 @@
           # this parameter is added to allow waiting for the return of shift approval until the occlusion behind the avoid target is clear.
           # this feature can be disabled by setting this parameter to 0.0.
           ratio_for_return_shift_approval: 0.5          # [-]
+          # [ASYM-HYSTERESIS] asymmetric hysteresis on an already-approved object's shift length:
+          # growing (more clearance needed, more urgent) reacts within this many consecutive
+          # cycles; shrinking (less clearance needed) requires this many consecutive cycles
+          # instead, to avoid flicker-driven premature collapse of an already-committed shift.
+          shift_hysteresis_in_cycles: 1                 # [-] cycles required before growing a shift
+          shift_hysteresis_out_cycles: 5                # [-] cycles required before shrinking a shift
+          shift_hysteresis_clearance_margin: 0.01       # [m] ignore noise-level differences
         # avoidance distance parameters
         longitudinal:
           min_prepare_time: 1.0                         # [s]

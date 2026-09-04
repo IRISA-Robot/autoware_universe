@@ -258,6 +258,18 @@ void fillObjectAvoidanceCommitted(
 void fillObjectHardMarginDebounce(
   ObjectData & object_data, const ObjectDataArray & previous_target_objects);
 
+/**
+ * @brief [ASYM-HYSTERESIS 2026-09-04] carry forward object_data.shift_grow_streak /
+ * shift_shrink_streak from the previous cycle's matching object (by object_id), defaulting both to
+ * 0 if not found. Seeds the counters that ShiftLineGenerator::generateAvoidOutline() increments/
+ * resets when deciding whether to grow or shrink an already-approved object's shift length (see
+ * AvoidanceParameters::shift_hysteresis_in_cycles / shift_hysteresis_out_cycles).
+ * @param object_data current-cycle object data.
+ * @param previous_target_objects previous cycle's target object list.
+ */
+void fillObjectShiftHysteresis(
+  ObjectData & object_data, const ObjectDataArray & previous_target_objects);
+
 void updateClipObject(ObjectDataArray & clip_objects, AvoidancePlanningData & data);
 
 /**
@@ -379,6 +391,86 @@ bool shouldRearmHeldShiftLine(
   const double registered_end_shift_length, const double desired_end_shift_length,
   const bool has_new_candidate, const double ego_speed, const double ego_speed_threshold,
   const double clearance_margin);
+
+/**
+ * @brief [BUG-A fix 2026-09-04] Decide whether a close-range avoid shift-line candidate whose raw
+ * end_longitudinal has collapsed to at or below start_longitudinal (object very close --
+ * "object.longitudinal - constant_distance" going non-positive) can be rescued, instead of being
+ * silently treated as geometrically invalid and dropped.
+ *
+ * Background: ShiftLineGenerator::generateAvoidOutline() used to build end_longitudinal as a raw
+ * "object longitudinal - constant distance" arithmetic result with no floor. As ego closes in on
+ * an object, this naturally goes toward zero and then negative, at which point
+ * start_longitudinal < end_longitudinal no longer holds and the whole candidate is discarded for
+ * any not-yet-approved object -- exactly the case that most urgently needs a NEW, larger shift.
+ * computeFeasibleShiftProfile() already proves a jerk-feasible shift of this magnitude fits in
+ * whatever longitudinal room remains; this function re-anchors end_longitudinal to at least
+ * start_longitudinal + min_transition_distance so that proof is actually used to build a valid
+ * (steeper) shift line, rather than being discarded by degenerate arithmetic.
+ *
+ * @param start_longitudinal the already-valid (> 0) start point of the shift line.
+ * @param min_transition_distance minimum jerk-feasible longitudinal transition distance for this
+ * shift's magnitude (see AvoidanceHelper::getMinAvoidanceDistance()).
+ * @param object_longitudinal the object's longitudinal distance from ego.
+ * @param approach_buffer small buffer [m] to keep the transition from finishing at/after the
+ * object itself.
+ * @return the rescued end_longitudinal if the minimum transition still fits before reaching the
+ * object; std::nullopt if even the minimum transition cannot fit -- a genuine kinematic
+ * infeasibility, not an arithmetic accident, and the caller should treat this as a real rejection.
+ */
+std::optional<double> rescueCloseRangeShiftLineEnd(
+  const double start_longitudinal, const double min_transition_distance,
+  const double object_longitudinal, const double approach_buffer);
+
+/**
+ * @brief [ASYM-HYSTERESIS 2026-09-04] Apply asymmetric hysteresis to the decision of whether to
+ * grow or shrink an already-approved object's shift length: growing (more clearance/more urgent)
+ * is let through within `hysteresis_in_cycles` consecutive cycles (default configuration is 1 ==
+ * immediate, since this is the safety-critical direction), while shrinking (less clearance)
+ * requires `hysteresis_out_cycles` consecutive cycles first, to avoid flicker-driven premature
+ * collapse of an already-committed shift (the same failure family as REV-F2 / HOLD-REARM /
+ * existsUnclearedAvoidanceObjectAhead).
+ *
+ * @param desired_end_shift_length freshly-computed end shift length for this cycle.
+ * @param registered_shift_length shift length currently registered at the object's position.
+ * @param clearance_margin [m] ignore noise-level differences between desired and registered.
+ * @param hysteresis_in_cycles consecutive cycles required before a grow is let through.
+ * @param hysteresis_out_cycles consecutive cycles required before a shrink is let through.
+ * @param grow_streak in/out: consecutive-grow-cycle counter (persisted by the caller across
+ * cycles). Reset to 0 whenever the outcome is not a grow.
+ * @param shrink_streak in/out: consecutive-shrink-cycle counter (persisted by the caller across
+ * cycles). Reset to 0 whenever the outcome is not a shrink.
+ * @return the shift length to actually use this cycle: either desired_end_shift_length (grow/shrink
+ * let through, or no change) or registered_shift_length (grow/shrink held back by hysteresis).
+ */
+double applyAsymmetricShiftHysteresis(
+  const double desired_end_shift_length, const double registered_shift_length,
+  const double clearance_margin, const int hysteresis_in_cycles, const int hysteresis_out_cycles,
+  int & grow_streak, int & shrink_streak);
+
+/**
+ * @brief [MULTI-OBJ-HOLD fix 2026-09-04] Decide whether the return-to-centerline shift must be
+ * suppressed because a sequential-avoidance target object is still ahead of ego.
+ *
+ * ROOT CAUSE this guards against: addReturnShiftLine() previously only checked for *unavoidable*
+ * objects still ahead before adding a return-to-center shift. In a sequential multi-object
+ * scenario (object 1 just cleared, object 2 close behind it along the route), object 2 is
+ * perfectly avoidable -- but if its own avoidance candidate hasn't been generated yet THIS
+ * cycle (detection-timing lag, or generation-order lag inside the same planning cycle), the
+ * candidate shift-line list is empty for it and the return shift would start collapsing object
+ * 1's shift back to centerline immediately, putting ego on a near-collision course with object 2
+ * for the few cycles until object 2's own avoidance candidate catches up.
+ *
+ * This is a per-cycle recomputation from the live target_objects list (NOT a sticky/latched
+ * flag): once ego has genuinely passed every currently-detected object in the stretch, the very
+ * next cycle sees no object ahead and the normal return-to-lane proceeds. This cannot become a
+ * new permanent-stuck state the way a latched hold could.
+ *
+ * @param target_objects the module's current full list of avoidance target objects (avoidable or
+ * not), each with `longitudinal` = Frenet longitudinal distance from ego (positive = ahead).
+ * @return true if at least one target object is still ahead of ego (return shift must be held).
+ */
+bool existsUnclearedAvoidanceObjectAhead(const ObjectDataArray & target_objects);
 
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
 

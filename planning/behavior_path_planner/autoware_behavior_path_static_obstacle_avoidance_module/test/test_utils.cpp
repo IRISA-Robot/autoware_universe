@@ -2888,4 +2888,235 @@ TEST(TestUtils, ShouldRearmHeldShiftLineResolvesDeadlockWhenEgoStationary)
     /*registered_end_shift_length=*/-0.715, /*desired_end_shift_length=*/-0.716,
     /*has_new_candidate=*/true, /*ego_speed=*/0.0, ego_speed_threshold, clearance_margin));
 }
+
+// [MULTI-OBJ-HOLD fix 2026-09-04, RECONSTRUCTED 2026-09-04] Lost to an accidental
+// `git checkout -- test/test_utils.cpp` during a later same-day investigation session;
+// reconstructed from the surviving function doc comment in utils.hpp and the surviving call
+// site in shift_line_generator.cpp. Please review against your own memory of the original.
+TEST(TestUtils, ExistsUnclearedAvoidanceObjectAheadHoldsUntilAllObjectsPassed)
+{
+  const auto make_object = [](const double longitudinal, const bool is_avoidable) {
+    ObjectData object_data{};
+    object_data.longitudinal = longitudinal;
+    object_data.is_avoidable = is_avoidable;
+    return object_data;
+  };
+
+  // No target objects at all: must NOT hold.
+  {
+    ObjectDataArray target_objects{};
+    EXPECT_FALSE(existsUnclearedAvoidanceObjectAhead(target_objects));
+  }
+
+  // Single object, still ahead and avoidable: must hold.
+  {
+    ObjectDataArray target_objects{make_object(/*longitudinal=*/1.5, /*is_avoidable=*/true)};
+    EXPECT_TRUE(existsUnclearedAvoidanceObjectAhead(target_objects));
+  }
+
+  // Single object, already behind ego (cleared): must NOT hold.
+  {
+    ObjectDataArray target_objects{make_object(/*longitudinal=*/-1.2, /*is_avoidable=*/true)};
+    EXPECT_FALSE(existsUnclearedAvoidanceObjectAhead(target_objects));
+  }
+
+  // Object 1 already cleared (behind), object 2 still ahead: must hold on object 2 alone.
+  {
+    ObjectDataArray target_objects{
+      make_object(/*longitudinal=*/-1.2, /*is_avoidable=*/true),
+      make_object(/*longitudinal=*/2.0, /*is_avoidable=*/true)};
+    EXPECT_TRUE(existsUnclearedAvoidanceObjectAhead(target_objects));
+  }
+
+  // Object 2 still ahead but marked unavoidable: still must hold (this function does not
+  // distinguish avoidable/unavoidable -- any object ahead, avoidable or not, blocks the return
+  // shift; the pre-existing exist_unavoidable_object check in addReturnShiftLine covers the
+  // unavoidable case separately and returns even earlier).
+  {
+    ObjectDataArray target_objects{
+      make_object(/*longitudinal=*/-1.2, /*is_avoidable=*/true),
+      make_object(/*longitudinal=*/2.0, /*is_avoidable=*/false)};
+    EXPECT_TRUE(existsUnclearedAvoidanceObjectAhead(target_objects));
+  }
+
+  // All objects behind ego: must NOT hold -- normal return-to-lane may proceed.
+  {
+    ObjectDataArray target_objects{
+      make_object(/*longitudinal=*/-1.2, /*is_avoidable=*/true),
+      make_object(/*longitudinal=*/-0.3, /*is_avoidable=*/false)};
+    EXPECT_FALSE(existsUnclearedAvoidanceObjectAhead(target_objects));
+  }
+}
+
+// [BUG-A fix 2026-09-04] Direct regression test for the close-range candidate-drop bug: with the
+// object very close (live-observed longitudinal ~= 0.22 m) and a small floor-clamped
+// start_longitudinal, the raw "object longitudinal - constant_distance" end point collapses to at
+// or below start_longitudinal. rescueCloseRangeShiftLineEnd() must anchor end_longitudinal to at
+// least start_longitudinal + min_transition_distance instead of the candidate being silently
+// dropped, as long as that still fits before reaching the object.
+TEST(TestUtils, RescueCloseRangeShiftLineEndRescuesGenuineCloseRangeCandidate)
+{
+  constexpr double start_longitudinal = 0.05;       // floor-clamped start (nearest_avoid_distance)
+  constexpr double min_transition_distance = 0.15;  // jerk-feasible minimum for this shift
+  constexpr double object_longitudinal = 0.22;      // live-observed close-range value
+  constexpr double approach_buffer = 1e-2;
+
+  const auto result = rescueCloseRangeShiftLineEnd(
+    start_longitudinal, min_transition_distance, object_longitudinal, approach_buffer);
+
+  ASSERT_TRUE(result.has_value())
+    << "a close-range candidate with enough room for the minimum jerk-feasible transition must "
+       "be rescued instead of silently dropped.";
+  EXPECT_DOUBLE_EQ(result.value(), start_longitudinal + min_transition_distance);
+  EXPECT_GT(result.value(), start_longitudinal)
+    << "rescued end_longitudinal must satisfy is_valid_shift_line's start < end requirement.";
+  EXPECT_LE(result.value(), object_longitudinal - approach_buffer);
+}
+
+// Boundary case: the rescued end lands exactly at the latest feasible point (object_longitudinal -
+// approach_buffer) -- must still be treated as rescuable (inclusive bound), not infeasible.
+TEST(TestUtils, RescueCloseRangeShiftLineEndBoundaryIsInclusive)
+{
+  constexpr double start_longitudinal = 0.05;
+  constexpr double min_transition_distance = 0.16;
+  constexpr double approach_buffer = 1e-2;
+  // object_longitudinal chosen so rescued_end == object_longitudinal - approach_buffer exactly.
+  constexpr double object_longitudinal =
+    start_longitudinal + min_transition_distance + approach_buffer;
+
+  const auto result = rescueCloseRangeShiftLineEnd(
+    start_longitudinal, min_transition_distance, object_longitudinal, approach_buffer);
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_DOUBLE_EQ(result.value(), object_longitudinal - approach_buffer);
+}
+
+// [BUG-A fix 2026-09-04] Genuine kinematic infeasibility: the object is so close that even the
+// minimum jerk-feasible transition distance cannot fit before reaching it. This must correctly
+// report infeasibility (nullopt) rather than producing an unsafe/aggressive shift line that runs
+// past the object.
+TEST(TestUtils, RescueCloseRangeShiftLineEndReportsGenuineInfeasibility)
+{
+  constexpr double start_longitudinal = 0.05;
+  constexpr double min_transition_distance = 0.5;  // large shift needs a long transition
+  constexpr double object_longitudinal = 0.22;      // not enough room for 0.5 m of transition
+  constexpr double approach_buffer = 1e-2;
+
+  const auto result = rescueCloseRangeShiftLineEnd(
+    start_longitudinal, min_transition_distance, object_longitudinal, approach_buffer);
+
+  EXPECT_FALSE(result.has_value())
+    << "must NOT rescue when even the minimum jerk-feasible transition cannot fit before the "
+       "object -- this is a real kinematic infeasibility, not an arithmetic accident.";
+}
+
+// [ASYM-HYSTERESIS 2026-09-04] Growing an already-approved shift (more clearance/more urgent)
+// must be let through immediately when hysteresis_in_cycles == 1 (the default configuration) --
+// this is the safety-critical direction and must react fast, matching the live bug scenario where
+// desire_shift_length grew from -0.855 to -0.935 while the committed shift stayed frozen.
+TEST(TestUtils, ApplyAsymmetricShiftHysteresisGrowsImmediatelyByDefault)
+{
+  int grow_streak = 0;
+  int shrink_streak = 0;
+  const auto applied = applyAsymmetricShiftHysteresis(
+    /*desired_end_shift_length=*/-0.935, /*registered_shift_length=*/-0.855,
+    /*clearance_margin=*/1e-2, /*hysteresis_in_cycles=*/1, /*hysteresis_out_cycles=*/5,
+    grow_streak, shrink_streak);
+
+  EXPECT_DOUBLE_EQ(applied, -0.935) << "growth must be applied on the very first cycle.";
+  EXPECT_EQ(grow_streak, 1);
+  EXPECT_EQ(shrink_streak, 0);
+}
+
+// A larger hysteresis_in_cycles must hold the registered value for that many consecutive growing
+// cycles before letting the grow through -- confirms the "in" side is genuinely configurable, not
+// hardcoded to immediate.
+TEST(TestUtils, ApplyAsymmetricShiftHysteresisRespectsCustomGrowCycles)
+{
+  int grow_streak = 0;
+  int shrink_streak = 0;
+  constexpr double registered = -0.855;
+  constexpr double desired = -0.935;
+
+  // Cycles 1 and 2: still held at the registered value.
+  for (int cycle = 1; cycle <= 2; ++cycle) {
+    const auto applied = applyAsymmetricShiftHysteresis(
+      desired, registered, /*clearance_margin=*/1e-2, /*hysteresis_in_cycles=*/3,
+      /*hysteresis_out_cycles=*/5, grow_streak, shrink_streak);
+    EXPECT_DOUBLE_EQ(applied, registered) << "cycle " << cycle;
+    EXPECT_EQ(grow_streak, cycle);
+  }
+
+  // Cycle 3: streak reaches hysteresis_in_cycles -- grow is finally let through.
+  const auto applied = applyAsymmetricShiftHysteresis(
+    desired, registered, /*clearance_margin=*/1e-2, /*hysteresis_in_cycles=*/3,
+    /*hysteresis_out_cycles=*/5, grow_streak, shrink_streak);
+  EXPECT_DOUBLE_EQ(applied, desired);
+  EXPECT_EQ(grow_streak, 3);
+}
+
+// [ASYM-HYSTERESIS 2026-09-04] Shrinking must be held for hysteresis_out_cycles consecutive
+// cycles before being let through -- the "exit" direction that must be slow, to avoid the same
+// flicker/premature-collapse failure family as REV-F2 / HOLD-REARM /
+// existsUnclearedAvoidanceObjectAhead.
+TEST(TestUtils, ApplyAsymmetricShiftHysteresisDelaysShrinkByOutCycles)
+{
+  int grow_streak = 0;
+  int shrink_streak = 0;
+  constexpr double registered = -1.08;
+  constexpr double desired = -0.715;  // less clearance than registered -> a shrink
+  constexpr int hysteresis_out_cycles = 5;
+
+  for (int cycle = 1; cycle < hysteresis_out_cycles; ++cycle) {
+    const auto applied = applyAsymmetricShiftHysteresis(
+      desired, registered, /*clearance_margin=*/1e-2, /*hysteresis_in_cycles=*/1,
+      hysteresis_out_cycles, grow_streak, shrink_streak);
+    EXPECT_DOUBLE_EQ(applied, registered)
+      << "shrink must be held at the registered value until the debounce is satisfied, cycle "
+      << cycle;
+    EXPECT_EQ(shrink_streak, cycle);
+    EXPECT_EQ(grow_streak, 0);
+  }
+
+  // Final cycle: debounce satisfied, shrink is let through.
+  const auto applied = applyAsymmetricShiftHysteresis(
+    desired, registered, /*clearance_margin=*/1e-2, /*hysteresis_in_cycles=*/1,
+    hysteresis_out_cycles, grow_streak, shrink_streak);
+  EXPECT_DOUBLE_EQ(applied, desired);
+  EXPECT_EQ(shrink_streak, hysteresis_out_cycles);
+}
+
+// A grow interrupting a shrink streak (or vice versa) must reset the opposite counter, and a
+// within-margin ("no real change") outcome must reset both -- confirms the streaks are not a
+// one-way ratchet and correctly track only the currently-active direction.
+TEST(TestUtils, ApplyAsymmetricShiftHysteresisResetsOppositeStreakOnDirectionChange)
+{
+  int grow_streak = 0;
+  int shrink_streak = 0;
+
+  // Two shrink cycles build up shrink_streak.
+  applyAsymmetricShiftHysteresis(
+    -0.715, -1.08, 1e-2, /*hysteresis_in_cycles=*/1, /*hysteresis_out_cycles=*/10, grow_streak,
+    shrink_streak);
+  applyAsymmetricShiftHysteresis(
+    -0.715, -1.08, 1e-2, /*hysteresis_in_cycles=*/1, /*hysteresis_out_cycles=*/10, grow_streak,
+    shrink_streak);
+  ASSERT_EQ(shrink_streak, 2);
+
+  // Now a growing cycle: shrink_streak must reset to 0, grow_streak starts counting.
+  const auto grow_applied = applyAsymmetricShiftHysteresis(
+    -1.2, -1.08, 1e-2, /*hysteresis_in_cycles=*/1, /*hysteresis_out_cycles=*/10, grow_streak,
+    shrink_streak);
+  EXPECT_DOUBLE_EQ(grow_applied, -1.2);
+  EXPECT_EQ(grow_streak, 1);
+  EXPECT_EQ(shrink_streak, 0);
+
+  // A within-margin ("no real change") outcome resets both streaks.
+  const auto noop_applied = applyAsymmetricShiftHysteresis(
+    -1.081, -1.08, 1e-2, /*hysteresis_in_cycles=*/1, /*hysteresis_out_cycles=*/10, grow_streak,
+    shrink_streak);
+  EXPECT_DOUBLE_EQ(noop_applied, -1.081);
+  EXPECT_EQ(grow_streak, 0);
+  EXPECT_EQ(shrink_streak, 0);
+}
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
