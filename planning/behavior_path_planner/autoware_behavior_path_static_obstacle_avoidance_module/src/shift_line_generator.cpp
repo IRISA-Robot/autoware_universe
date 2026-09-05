@@ -560,9 +560,14 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
         const auto min_transition_distance = std::max(
           helper_->getMinAvoidanceDistance(al_avoid.end_shift_length - current_ego_shift), 1e-2);
         constexpr double kObjectApproachBuffer = 1e-2;  // [m] stay short of the object itself
+        // [index-gap fix 2026-09-04] Pass data.arclength_from_ego -- the SAME arclength array
+        // used to derive al_avoid.start_idx above -- plus path_front_to_ego (the same offset used
+        // above to convert al_avoid.start_longitudinal into that array's path-front-relative
+        // frame), so the rescue can replicate PathShifter::generate()'s idx_gap > 1 requirement
+        // exactly, not just the looser is_valid_shift_line() start < end check.
         const auto rescued = utils::static_obstacle_avoidance::rescueCloseRangeShiftLineEnd(
           al_avoid.start_longitudinal, min_transition_distance, o.longitudinal,
-          kObjectApproachBuffer);
+          kObjectApproachBuffer, data.arclength_from_ego, path_front_to_ego);
 
         static auto logger = rclcpp::get_logger("static_obstacle_avoidance_shift_line_generator");
         static rclcpp::Clock steady_clock{RCL_ROS_TIME};
@@ -849,6 +854,72 @@ void ShiftLineGenerator::generateTotalShiftLine(
   sl.shift_line_history.push_back(sl.shift_line);
 }
 
+// [MERGE-INDEX-FIX 2026-09-04] Root cause of a THIRD, independent "shift start point and end point
+// can't be adjoining" source, distinct from both BUG-A-RESCUE (close-range rescue path) and
+// FILL-GAP-INDEX-FIX (gap-fill connector construction): extractShiftLinesFromLine() builds AvoidLine
+// segment boundaries purely from gradient-change detection on the blended shift-length profile
+// (setStartData/setEndData at consecutive index `i`), with NO index-gap validation at all. Two
+// gradient-change points detected close together in index (e.g. right after a hysteresis-driven
+// nudge to the desired shift) can therefore produce a segment whose start_idx/end_idx collapse to
+// PathShifter::generate()'s idx_gap<=1 rejection threshold, exactly like the other two sources, but
+// via the MAIN merge pipeline used by the vast majority of ordinary avoid-line generation (not an
+// edge case). Confirmed live: "shift start point and end point can't be adjoining" fired with
+// neither [BUG-A-RESCUE] nor [FILL-GAP-INDEX-FIX] logged nearby, right after several
+// ASYM-HYSTERESIS cycles.
+//
+// Fix: reuse the already-shared, already-tested evaluateFillGapShiftLine() (see
+// FILL-GAP-INDEX-FIX) to check each candidate segment's index gap at the moment it would be
+// finalized. Two distinct outcomes, matching the established extend-if-room /
+// drop-cleanly-otherwise policy:
+//  - Mid-loop (there is more path ahead): EXTEND. Simply do not finalize the too-close boundary and
+//    keep accumulating -- `al`'s start point is left untouched, so the segment naturally grows
+//    until either a later gradient-change point gives it enough index margin, or the path ends.
+//    This is lossless: it does not silently drop a detected transition, it just merges it into the
+//    next segment, which is a narrower/safer intervention than dropping given this is the MAIN
+//    pipeline.
+//  - At the final closing boundary (path end, no more room to extend into): DROP, exactly like
+//    FILL-GAP-INDEX-FIX's policy, logging whether the dropped segment was flat (lossless) or not
+//    (a genuine small transition lost, but strictly safer than handing PathShifter a doomed
+//    candidate that fails generate() for the ENTIRE shift_lines_ list).
+namespace
+{
+void logMergeIndexFixExtend(const AvoidLine & al, const size_t rejected_end_idx)
+{
+  static auto logger = rclcpp::get_logger("static_obstacle_avoidance_shift_line_generator");
+  static rclcpp::Clock steady_clock{RCL_ROS_TIME};
+  RCLCPP_WARN_THROTTLE(
+    logger, steady_clock, 1000,
+    "[MERGE-INDEX-FIX] extending in-progress merge segment past a too-close gradient-change point "
+    "(start_idx=%zu candidate_end_idx=%zu) -- would have failed PathShifter's index-gap check; "
+    "deferring the boundary to the next gradient-change point instead of finalizing a doomed "
+    "segment.",
+    al.start_idx, rejected_end_idx);
+}
+
+void logMergeIndexFixDropAtEnd(const AvoidLine & al, bool is_flat)
+{
+  static auto logger = rclcpp::get_logger("static_obstacle_avoidance_shift_line_generator");
+  static rclcpp::Clock steady_clock{RCL_ROS_TIME};
+  if (is_flat) {
+    RCLCPP_WARN_THROTTLE(
+      logger, steady_clock, 1000,
+      "[MERGE-INDEX-FIX] dropping FLAT final merge segment (start_idx=%zu end_idx=%zu "
+      "shift_length=%.3f) at path end -- would have failed PathShifter's index-gap check; dropping "
+      "is lossless since PathShifter carries the prior shift value forward through any uncovered "
+      "stretch.",
+      al.start_idx, al.end_idx, al.end_shift_length);
+  } else {
+    RCLCPP_WARN_THROTTLE(
+      logger, steady_clock, 1000,
+      "[MERGE-INDEX-FIX] dropping NON-FLAT final merge segment (start_idx=%zu end_idx=%zu "
+      "start_shift=%.3f end_shift=%.3f) at path end -- genuine shift-length transition lost because "
+      "there was no more path to extend into. Still strictly safer than handing PathShifter a "
+      "doomed candidate that would fail generate() for the ENTIRE shift_lines_ list.",
+      al.start_idx, al.end_idx, al.start_shift_length, al.end_shift_length);
+  }
+}
+}  // namespace
+
 AvoidLineArray ShiftLineGenerator::extractShiftLinesFromLine(
   const AvoidancePlanningData & data, ShiftLineData & shift_line_data) const
 {
@@ -921,6 +992,16 @@ AvoidLineArray ShiftLineGenerator::extractShiftLinesFromLine(
       found_first_start = true;
     } else {
       setEndData(al, shift, p, i, arcs.at(i));
+
+      // [MERGE-INDEX-FIX] Reject/extend candidates that would fail PathShifter::generate()'s
+      // index-gap check before they are finalized. There is still more path ahead here, so the
+      // safe move is to EXTEND (skip finalizing this boundary) rather than drop.
+      const auto decision = evaluateFillGapShiftLine(al);
+      if (!decision.keep) {
+        logMergeIndexFixExtend(al, i);
+        continue;  // keep accumulating; al.start_* stays untouched until a safe boundary is found.
+      }
+
       al.id = generate_uuid();
       merged_avoid_lines.push_back(al);
       setStartData(al, 0.0, p, i, arcs.at(i));  // start length is overwritten later.
@@ -931,8 +1012,17 @@ AvoidLineArray ShiftLineGenerator::extractShiftLinesFromLine(
     const auto & p = path.points.at(N - 1).point.pose;
     const auto shift = sl.shift_line.at(N - 1);
     setEndData(al, shift, p, N - 1, arcs.at(N - 1));
-    al.id = generate_uuid();
-    merged_avoid_lines.push_back(al);
+
+    // [MERGE-INDEX-FIX] No more path to extend into here -- if the index gap is still unsafe, drop
+    // this final segment cleanly (logging whether it was lossless-flat or a genuine lost
+    // transition) rather than handing PathShifter a doomed candidate.
+    const auto decision = evaluateFillGapShiftLine(al);
+    if (decision.keep) {
+      al.id = generate_uuid();
+      merged_avoid_lines.push_back(al);
+    } else {
+      logMergeIndexFixDropAtEnd(al, decision.is_flat);
+    }
   }
 
   return merged_avoid_lines;
@@ -1017,6 +1107,51 @@ AvoidOutlines ShiftLineGenerator::applyMergeProcess(
   return ret;
 }
 
+namespace
+{
+// [FILL-GAP-INDEX-FIX 2026-09-04] Push `new_line` onto `middle_lines`/`debug_lines` only if it is
+// index-gap-safe (or genuinely needs to be kept as-is because dropping it would lose a real
+// transition and there is no room to fix it -- see evaluateFillGapShiftLine()'s doc comment for
+// the full rationale). Confirmed live as an independent second source of PathShifter::generate()'s
+// "shift start point and end point can't be adjoining" failure, distinct from Bug A's close-range
+// rescue: a fresh, far object (longitudinal=8.22 m, current_ego_shift=0.0, no rescue involved)
+// whose avoid-to-return connector line collapsed to idx_gap<=1 because its front+rear longitudinal
+// margins were small relative to the resampled path's point spacing. Because
+// PathShifter::generate() rejects its ENTIRE shift_lines_ list the moment any single line fails
+// this check, that one small (and provably redundant, since it is flat) connector froze the WHOLE
+// avoidance maneuver on the previous spline path every cycle.
+void pushIndexGapSafeFillLine(
+  const AvoidLine & new_line, AvoidLineArray & middle_lines, AvoidLineArray & debug_lines)
+{
+  const auto decision = utils::static_obstacle_avoidance::evaluateFillGapShiftLine(new_line);
+  if (decision.keep) {
+    middle_lines.push_back(new_line);
+    debug_lines.push_back(new_line);
+    return;
+  }
+
+  static auto logger = rclcpp::get_logger("static_obstacle_avoidance_shift_line_generator");
+  static rclcpp::Clock steady_clock{RCL_ROS_TIME};
+  if (decision.is_flat) {
+    RCLCPP_WARN_THROTTLE(
+      logger, steady_clock, 1000,
+      "[FILL-GAP-INDEX-FIX] dropping flat gap-fill connector (start_idx=%zu end_idx=%zu "
+      "shift_length=%.3f) -- would have failed PathShifter's index-gap check and frozen the whole "
+      "avoidance path; dropping is lossless since PathShifter carries the prior shift value "
+      "forward through any uncovered stretch.",
+      new_line.start_idx, new_line.end_idx, new_line.end_shift_length);
+  } else {
+    RCLCPP_WARN_THROTTLE(
+      logger, steady_clock, 1000,
+      "[FILL-GAP-INDEX-FIX] dropping NON-FLAT gap-fill connector (start_idx=%zu end_idx=%zu "
+      "start_shift=%.3f end_shift=%.3f) -- genuine shift-length transition lost because there was "
+      "no room to make it index-gap-safe. Still strictly safer than handing PathShifter a doomed "
+      "candidate that would fail generate() for the ENTIRE shift_lines_ list.",
+      new_line.start_idx, new_line.end_idx, new_line.start_shift_length, new_line.end_shift_length);
+  }
+}
+}  // namespace
+
 AvoidOutlines ShiftLineGenerator::applyFillGapProcess(
   const AvoidOutlines & outlines, const AvoidancePlanningData & data, DebugData & debug) const
 {
@@ -1024,20 +1159,28 @@ AvoidOutlines ShiftLineGenerator::applyFillGapProcess(
 
   for (auto & outline : ret) {
     if (outline.middle_lines.empty()) {
-      const auto new_line =
-        outline.return_line.has_value()
-          ? fill(outline.avoid_line, outline.return_line.value(), generate_uuid())
-          : outline.avoid_line;
-      outline.middle_lines.push_back(new_line);
-      debug.step1_filled_shift_line.push_back(new_line);
+      if (outline.return_line.has_value()) {
+        const auto new_line = fill(outline.avoid_line, outline.return_line.value(), generate_uuid());
+        pushIndexGapSafeFillLine(new_line, outline.middle_lines, debug.step1_filled_shift_line);
+      } else {
+        outline.middle_lines.push_back(outline.avoid_line);
+        debug.step1_filled_shift_line.push_back(outline.avoid_line);
+      }
+    }
+
+    // The index-gap-safe push above may have left middle_lines empty (a dropped connector with
+    // no fallback to keep) -- fall back to the avoid_line itself so the rest of this function
+    // (which assumes middle_lines is non-empty) still has something valid to work with.
+    if (outline.middle_lines.empty()) {
+      outline.middle_lines.push_back(outline.avoid_line);
+      debug.step1_filled_shift_line.push_back(outline.avoid_line);
     }
 
     helper_->alignShiftLinesOrder(outline.middle_lines, false);
 
     if (outline.avoid_line.end_longitudinal < outline.middle_lines.front().start_longitudinal) {
       const auto new_line = fill(outline.avoid_line, outline.middle_lines.front(), generate_uuid());
-      outline.middle_lines.push_back(new_line);
-      debug.step1_filled_shift_line.push_back(new_line);
+      pushIndexGapSafeFillLine(new_line, outline.middle_lines, debug.step1_filled_shift_line);
     }
 
     helper_->alignShiftLinesOrder(outline.middle_lines, false);
@@ -1047,8 +1190,7 @@ AvoidOutlines ShiftLineGenerator::applyFillGapProcess(
       outline.middle_lines.back().end_longitudinal < outline.return_line->start_longitudinal) {
       const auto new_line =
         fill(outline.middle_lines.back(), outline.return_line.value(), generate_uuid());
-      outline.middle_lines.push_back(new_line);
-      debug.step1_filled_shift_line.push_back(new_line);
+      pushIndexGapSafeFillLine(new_line, outline.middle_lines, debug.step1_filled_shift_line);
     }
 
     helper_->alignShiftLinesOrder(outline.middle_lines, false);
@@ -1082,8 +1224,7 @@ AvoidLineArray ShiftLineGenerator::applyFillGapProcess(
       0.0);
 
     const auto new_line = fill(ego_line, sorted.front(), generate_uuid());
-    ret.push_back(new_line);
-    debug.step1_front_shift_line.push_back(new_line);
+    pushIndexGapSafeFillLine(new_line, ret, debug.step1_front_shift_line);
   }
 
   helper_->alignShiftLinesOrder(sorted, false);
@@ -1095,8 +1236,7 @@ AvoidLineArray ShiftLineGenerator::applyFillGapProcess(
     }
 
     const auto new_line = fill(sorted.at(i), sorted.at(i + 1), generate_uuid());
-    ret.push_back(new_line);
-    debug.step1_front_shift_line.push_back(new_line);
+    pushIndexGapSafeFillLine(new_line, ret, debug.step1_front_shift_line);
   }
 
   helper_->alignShiftLinesOrder(ret, false);

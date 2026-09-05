@@ -126,6 +126,19 @@ AvoidanceParameters getParameter(rclcpp::Node * node)
       get_or_declare_parameter<double>(*node, ns + "unstable_classification_time");
   }
 
+  // [OBSTACLE-CLUSTER 2026-09-04] preprocessing clustering stage (see
+  // utils::static_obstacle_avoidance::clusterNearbyObjects()).
+  {
+    const std::string ns = "avoidance.target_filtering.obstacle_clustering.";
+    p.enable_obstacle_clustering = get_or_declare_parameter<bool>(*node, ns + "enable");
+    p.obstacle_cluster_max_neighbor_distance =
+      get_or_declare_parameter<double>(*node, ns + "max_neighbor_distance");
+    p.obstacle_cluster_merge_in_cycles =
+      get_or_declare_parameter<int>(*node, ns + "merge_in_cycles");
+    p.obstacle_cluster_split_out_cycles =
+      get_or_declare_parameter<int>(*node, ns + "split_out_cycles");
+  }
+
   {
     const std::string ns = "avoidance.target_filtering.parked_vehicle.";
     p.threshold_distance_object_is_on_center =

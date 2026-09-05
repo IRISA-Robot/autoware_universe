@@ -327,6 +327,37 @@ struct AvoidanceParameters
 
   double unstable_classification_time{0.0};
 
+  // [OBSTACLE-CLUSTER 2026-09-04] Preprocessing stage run BEFORE per-object filtering
+  // (filterTargetObjects()/generateAvoidOutline()/etc.): obstacles that sit close together (in
+  // PATH-FRAME distance -- arc-length + lateral offset against the resampled reference path, not
+  // raw map-frame Euclidean distance, per the REV-F1 lesson) are merged transitively (union-find,
+  // NOT literal k-nearest-neighbor search) into a single synthetic UNKNOWN-classified, always-
+  // static obstacle whose footprint is the convex hull of the members' footprints. That merged
+  // object is then fed into the completely unchanged downstream per-object avoidance pipeline. See
+  // utils::static_obstacle_avoidance::clusterNearbyObjects().
+  //
+  // SAFETY-RELEVANT BEHAVIOR CHANGE: a moving object clustered together with a nearby static one
+  // is deliberately no longer excluded via the ObjectInfo::MOVING_OBJECT path the way an
+  // individually-processed moving object would be -- the merged representation is always treated
+  // as stationary/avoidable (twist zeroed on the synthetic object), by explicit user design.
+  bool enable_obstacle_clustering{false};
+
+  // [m] maximum path-frame distance (hypot of arc-length delta and lateral-offset delta) between
+  // two objects for them to be merged into the same cluster.
+  double obstacle_cluster_max_neighbor_distance{0.0};
+
+  // [OBSTACLE-CLUSTER 2026-09-04] Asymmetric hysteresis on cluster membership, mirroring
+  // AvoidanceParameters::shift_hysteresis_in_cycles / shift_hysteresis_out_cycles: a newly-close
+  // pair of objects merges within this many consecutive cycles (default 1 == immediate merge --
+  // erring toward the conservative/bigger-obstacle side is safe), while an already-merged pair is
+  // only split back apart after this many consecutive cycles of being farther than the threshold
+  // apart -- this prevents cluster membership flicker for objects oscillating right at the
+  // threshold boundary. Persisted state lives in
+  // StaticObstacleAvoidanceModule::object_cluster_edge_states_ (scene-instance member, same
+  // pattern as unknown_type_object_first_seen_time_map_).
+  int obstacle_cluster_merge_in_cycles{1};
+  int obstacle_cluster_split_out_cycles{5};
+
   // The avoidance path generation is performed when the shift distance of the
   // avoidance points is greater than this threshold.
   // In multiple targets case: if there are multiple vehicles in a row to be avoided, no new
@@ -583,6 +614,26 @@ struct ObjectData  // avoidance target
   std::optional<std::pair<Point, Point>> narrowest_place{std::nullopt};
 };
 using ObjectDataArray = std::vector<ObjectData>;
+
+// [OBSTACLE-CLUSTER 2026-09-04] Persistent per-EDGE (pair of object ids) hysteresis state for
+// utils::static_obstacle_avoidance::clusterNearbyObjects(). Keyed by a canonical
+// "<smaller_hex_id>_<larger_hex_id>" string built from the two objects' object_id hex strings.
+// Lives as a scene-instance member (StaticObstacleAvoidanceModule::object_cluster_edge_states_),
+// matching the same "manager-owned persistent state across module instance lifetime" pattern as
+// ObjectData::hard_margin_infeasible_streak / shift_grow_streak / shift_shrink_streak and
+// unknown_type_object_first_seen_time_map_ -- this module instance persists across planning
+// cycles, so a plain mutable member is sufficient; no manager-level storage is needed.
+struct ObjectClusterEdgeState
+{
+  // consecutive cycles this pair has been observed within obstacle_cluster_max_neighbor_distance.
+  int merge_streak{0};
+  // consecutive cycles this pair has been observed farther than
+  // obstacle_cluster_max_neighbor_distance while the edge was active.
+  int split_streak{0};
+  // whether this pair currently counts as "merged" for union-find purposes.
+  bool active{false};
+};
+using ObjectClusterEdgeStateMap = std::unordered_map<std::string, ObjectClusterEdgeState>;
 
 /*
  * Shift point with additional info for avoidance planning

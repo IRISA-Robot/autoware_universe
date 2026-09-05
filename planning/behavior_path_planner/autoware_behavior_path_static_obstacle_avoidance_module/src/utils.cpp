@@ -28,6 +28,7 @@
 #include <autoware_utils_uuid/uuid_helper.hpp>
 
 #include <boost/geometry/algorithms/buffer.hpp>
+#include <boost/geometry/algorithms/centroid.hpp>
 #include <boost/geometry/algorithms/convex_hull.hpp>
 #include <boost/geometry/algorithms/correct.hpp>
 #include <boost/geometry/algorithms/disjoint.hpp>
@@ -43,9 +44,11 @@
 #include <algorithm>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1237,6 +1240,14 @@ bool isNoNeedAvoidanceBehavior(
   ObjectData & object, const std::shared_ptr<AvoidanceParameters> & parameters)
 {
   if (!object.avoid_margin.has_value()) {
+    // [NO-NEED-AVOID-DEBUG] Nothing to check yet -- getAvoidMargin() already returned nullopt
+    // (e.g. narrow_lane tag, or INSUFFICIENT_DRIVABLE_SPACE upstream). Not a drop by this
+    // function itself, so keep this WARN separate from the drop-path logs below.
+    RCLCPP_WARN_THROTTLE(
+      rclcpp::get_logger(logger_namespace), *avoid_debug_clock(), 500,
+      "[NO-NEED-AVOID-DEBUG] id=%s avoid_margin=UNSET(nullopt) -> not dropped here, "
+      "returning false (no-need-avoidance check skipped)",
+      autoware_utils::to_hex_string(object.object.object_id).c_str());
     return false;
   }
 
@@ -1255,12 +1266,34 @@ bool isNoNeedAvoidanceBehavior(
   const auto shift_length = calcShiftLength(
     object.is_on_right_of_true_lane, object.overhang_points.front().first,
     object.avoid_margin.value());
-  if (!isShiftNecessary(object.is_on_right_of_true_lane, shift_length)) {
+
+  const auto enough_lateral_distance = !isShiftNecessary(object.is_on_right_of_true_lane, shift_length);
+  const auto below_execution_threshold =
+    !enough_lateral_distance && std::abs(shift_length) < parameters->lateral_execution_threshold;
+
+  // [NO-NEED-AVOID-DEBUG] Log every evaluation of this gate (not just the drop path) so the
+  // accept case is visible too, closing the observability gap that made the "pedestrian to the
+  // right never gets avoided" investigation slow: this function used to drop objects with zero
+  // logging, unlike the vehicle branch and isSatisfiedWithCommonCondition()'s REJECT logs.
+  RCLCPP_WARN_THROTTLE(
+    rclcpp::get_logger(logger_namespace), *avoid_debug_clock(), 500,
+    "[NO-NEED-AVOID-DEBUG] id=%s is_on_right_of_true_lane=%s overhang_dist=%.3f "
+    "avoid_margin=%.3f shift_length=%.3f lateral_execution_threshold=%.3f "
+    "to_road_shoulder_distance=%.3f result=%s",
+    autoware_utils::to_hex_string(object.object.object_id).c_str(),
+    object.is_on_right_of_true_lane ? "true" : "false", object.overhang_points.front().first,
+    object.avoid_margin.value(), shift_length, parameters->lateral_execution_threshold,
+    object.to_road_shoulder_distance,
+    enough_lateral_distance
+      ? "DROP(ENOUGH_LATERAL_DISTANCE)"
+      : (below_execution_threshold ? "DROP(LESS_THAN_EXECUTION_THRESHOLD)" : "PASS"));
+
+  if (enough_lateral_distance) {
     object.info = ObjectInfo::ENOUGH_LATERAL_DISTANCE;
     return true;
   }
 
-  if (std::abs(shift_length) < parameters->lateral_execution_threshold) {
+  if (below_execution_threshold) {
     object.info = ObjectInfo::LESS_THAN_EXECUTION_THRESHOLD;
     return true;
   }
@@ -2633,9 +2666,29 @@ void filterTargetObjects(
       o.is_parked = false;
       o.avoid_margin = filtering_utils::getAvoidMargin(o, planner_data, parameters);
 
-      if (filtering_utils::isNoNeedAvoidanceBehavior(o, parameters)) {
-        data.other_objects.push_back(o);
-        continue;
+      // [ALWAYS-AVOID-DIRECTIVE 2026-09-04] isNoNeedAvoidanceBehavior() is a "not worth
+      // bothering" shortcut -- it drops pedestrian/bicycle targets that are either already
+      // ENOUGH_LATERAL_DISTANCE away from the true-lane-relative overhang, or whose computed
+      // shift_length falls under lateral_execution_threshold. Per explicit user directive this
+      // is bypassed entirely for pedestrian/bicycle: this project prioritizes ALWAYS attempting
+      // avoidance over silently skipping "not worth it" cases, same reasoning as the
+      // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] change to isSatisfiedWithNonVehicleCondition() (see
+      // docs/research/always-avoid-constraint-removal.md, 2026-09-04 section, for the write-up).
+      // NOTE: this does NOT bypass any actual safety/geometric feasibility gate -- getAvoidMargin()
+      // above can still return nullopt (e.g. narrow_lane tag / INSUFFICIENT_DRIVABLE_SPACE), and
+      // isSatisfiedWithNonVehicleCondition() below still runs unchanged. We still call
+      // isNoNeedAvoidanceBehavior() (ignoring its bool result) purely to get its
+      // [NO-NEED-AVOID-DEBUG] logging and object.info bookkeeping for observability; we then
+      // reset object.info immediately after so a bypassed "would-have-dropped" reason is never
+      // mistaken for this object's real outcome by debug.cpp's downstream info-based tallies.
+      const auto would_have_dropped = filtering_utils::isNoNeedAvoidanceBehavior(o, parameters);
+      if (would_have_dropped) {
+        RCLCPP_WARN_THROTTLE(
+          rclcpp::get_logger(logger_namespace), *avoid_debug_clock(), 500,
+          "[NO-NEED-AVOID-DEBUG] id=%s BYPASSED (pedestrian/bicycle always-avoid directive) -- "
+          "would have dropped with info=%d, forcing PASS instead",
+          autoware_utils::to_hex_string(o.object.object_id).c_str(), static_cast<int>(o.info));
+        o.info = ObjectInfo::NONE;
       }
 
       if (!filtering_utils::isSatisfiedWithNonVehicleCondition(o, data, planner_data, parameters)) {
@@ -3382,19 +3435,81 @@ bool shouldRearmHeldShiftLine(
          std::abs(registered_end_shift_length) + clearance_margin;
 }
 
+std::optional<double> computeIndexGapSafeEndLongitudinal(
+  const double start_longitudinal, const std::vector<double> & path_arclength_arr,
+  const double ego_offset_along_path)
+{
+  if (path_arclength_arr.empty()) {
+    return start_longitudinal;
+  }
+
+  // path_arclength_arr is path-front-relative; start_longitudinal is ego-relative -- convert via
+  // ego_offset_along_path before indexing, and convert back before returning.
+  const auto start_idx =
+    findPathIndexFromArclength(path_arclength_arr, start_longitudinal + ego_offset_along_path);
+
+  // Need end_idx >= start_idx + 2. findPathIndexFromArclength(arr, target) returns the first
+  // index i with arr[i] > target, so setting target to arr[start_idx + 1] exactly yields
+  // end_idx == start_idx + 2 (the minimum extension that satisfies idx_gap > 1).
+  if (start_idx + 1 >= path_arclength_arr.size()) {
+    // Reference path doesn't even have 2 more points ahead of start: there is no way to satisfy
+    // the index-gap requirement at all -- genuine infeasibility, not an arithmetic accident.
+    return std::nullopt;
+  }
+
+  return path_arclength_arr.at(start_idx + 1) - ego_offset_along_path;
+}
+
 std::optional<double> rescueCloseRangeShiftLineEnd(
   const double start_longitudinal, const double min_transition_distance,
-  const double object_longitudinal, const double approach_buffer)
+  const double object_longitudinal, const double approach_buffer,
+  const std::vector<double> & path_arclength_arr, const double ego_offset_along_path)
 {
-  const auto rescued_end_longitudinal =
+  const auto naive_rescued_end_longitudinal =
     start_longitudinal + std::max(min_transition_distance, 1e-2);
   const auto latest_feasible_end = object_longitudinal - approach_buffer;
+
+  // [index-gap fix 2026-09-04] The naive rescue above only satisfies is_valid_shift_line()'s loose
+  // `start < end` check. PathShifter::generate() separately requires the shift line's start/end
+  // to snap to reference-path point indices that are at least 2 apart
+  // (`end_idx - start_idx > 1`), or it rejects the shift line outright with "shift start point and
+  // end point can't be adjoining". Replicate that requirement here using the SAME arclength array
+  // PathShifter::generate() will snap against (path_arclength_arr, e.g.
+  // AvoidancePlanningData::arclength_from_ego), so the rescue never hands back a window that is
+  // valid per is_valid_shift_line() but still unusable by PathShifter::generate(). (Shared with
+  // evaluateFillGapShiftLine()'s index-gap check via computeIndexGapSafeEndLongitudinal() --
+  // see FILL-GAP-INDEX-FIX for the sibling failure this doesn't cover.)
+  const auto min_idx_safe_end_longitudinal =
+    computeIndexGapSafeEndLongitudinal(start_longitudinal, path_arclength_arr, ego_offset_along_path);
+  if (!min_idx_safe_end_longitudinal.has_value()) {
+    return std::nullopt;
+  }
+
+  const auto rescued_end_longitudinal =
+    std::max(naive_rescued_end_longitudinal, min_idx_safe_end_longitudinal.value());
 
   if (rescued_end_longitudinal <= latest_feasible_end) {
     return rescued_end_longitudinal;
   }
 
   return std::nullopt;
+}
+
+FillGapLineDecision evaluateFillGapShiftLine(
+  const AvoidLine & line, const double flat_shift_length_tolerance)
+{
+  // Mirrors PathShifter::generate()'s own check exactly: it operates on already-resolved
+  // start_idx/end_idx (which is exactly what `fill()`'s constructed connector line carries --
+  // copied directly from the two lines being bridged), so no arclength/frame conversion is needed
+  // here at all, unlike rescueCloseRangeShiftLineEnd() (which has to work from raw longitudinal
+  // values before any index has been resolved).
+  if (line.end_idx > line.start_idx && line.end_idx - line.start_idx > 1) {
+    return FillGapLineDecision{/*keep=*/true, /*is_flat=*/true};
+  }
+
+  const auto is_flat =
+    std::abs(line.end_shift_length - line.start_shift_length) < flat_shift_length_tolerance;
+  return FillGapLineDecision{/*keep=*/false, is_flat};
 }
 
 double applyAsymmetricShiftHysteresis(
@@ -3440,5 +3555,249 @@ bool existsUnclearedAvoidanceObjectAhead(const ObjectDataArray & target_objects)
   return std::any_of(
     target_objects.begin(), target_objects.end(),
     [](const auto & o) { return o.longitudinal > 0.0; });
+}
+
+// ---------------------------------------------------------------------------------------------
+// [OBSTACLE-CLUSTER 2026-09-04] Preprocessing clustering stage. See doc comments in utils.hpp /
+// AvoidanceParameters (data_structs.hpp) for the full design rationale. Summary: merge spatially
+// close (path-frame distance) obstacles into one synthetic UNKNOWN/always-static obstacle with a
+// convex-hull footprint BEFORE they enter the existing, completely unchanged per-object pipeline
+// (filterTargetObjects()/generateAvoidOutline()/etc.).
+// ---------------------------------------------------------------------------------------------
+
+std::vector<std::vector<size_t>> unionFindGroups(
+  const size_t n, const std::vector<std::pair<size_t, size_t>> & edges)
+{
+  std::vector<size_t> parent(n);
+  std::iota(parent.begin(), parent.end(), 0);
+
+  const auto find = [&](size_t x) {
+    while (parent[x] != x) {
+      parent[x] = parent[parent[x]];  // path halving
+      x = parent[x];
+    }
+    return x;
+  };
+
+  for (const auto & [a, b] : edges) {
+    if (a >= n || b >= n) {
+      continue;
+    }
+    const auto ra = find(a);
+    const auto rb = find(b);
+    if (ra != rb) {
+      parent[std::max(ra, rb)] = std::min(ra, rb);
+    }
+  }
+
+  std::unordered_map<size_t, std::vector<size_t>> groups_by_root;
+  for (size_t i = 0; i < n; ++i) {
+    groups_by_root[find(i)].push_back(i);
+  }
+
+  std::vector<std::vector<size_t>> groups;
+  groups.reserve(groups_by_root.size());
+  for (auto & [root, members] : groups_by_root) {
+    (void)root;
+    std::sort(members.begin(), members.end());
+    groups.push_back(std::move(members));
+  }
+  std::sort(groups.begin(), groups.end(), [](const auto & a, const auto & b) {
+    return a.front() < b.front();
+  });
+
+  return groups;
+}
+
+double calcPathFrameDistance(
+  const PathWithLaneId & path, const Point & ego_pos, const Point & p1, const Point & p2)
+{
+  const auto s1 = autoware::motion_utils::calcSignedArcLength(path.points, ego_pos, p1);
+  const auto s2 = autoware::motion_utils::calcSignedArcLength(path.points, ego_pos, p2);
+  const auto d1 = calc_lateral_distance(path, p1);
+  const auto d2 = calc_lateral_distance(path, p2);
+  return std::hypot(s1 - s2, d1 - d2);
+}
+
+Polygon2d calcClusterConvexHull(const std::vector<PredictedObject> & members)
+{
+  Polygon2d points{};
+  for (const auto & member : members) {
+    const auto member_polygon = autoware_utils::to_polygon2d(member);
+    for (const auto & p : member_polygon.outer()) {
+      points.outer().push_back(p);
+    }
+  }
+
+  Polygon2d hull_polygon{};
+  boost::geometry::convex_hull(points, hull_polygon);
+  boost::geometry::correct(hull_polygon);
+  return hull_polygon;
+}
+
+PredictedObject buildMergedClusterObject(const std::vector<PredictedObject> & members)
+{
+  PredictedObject merged{};
+
+  // Deterministic object_id derived from the sorted hex ids of every member: the same underlying
+  // member set always yields the same merged object_id across cycles, which is what lets
+  // downstream per-object persisted state (is_avoidance_committed, hard_margin_infeasible_streak,
+  // shift_grow_streak/shift_shrink_streak, stopped_objects_/stored_objects_ id-matching, etc.)
+  // accumulate continuity for the merged blob exactly like any ordinary tracked object.
+  std::vector<std::string> member_ids;
+  member_ids.reserve(members.size());
+  for (const auto & member : members) {
+    member_ids.push_back(autoware_utils::to_hex_string(member.object_id));
+  }
+  std::sort(member_ids.begin(), member_ids.end());
+
+  std::string concat;
+  for (const auto & id : member_ids) {
+    concat += id;
+  }
+
+  const std::hash<std::string> hasher{};
+  const std::array<size_t, 4> hash_parts{
+    hasher(concat), hasher(concat + "#cluster-salt-1"), hasher("cluster-salt-2#" + concat),
+    hasher(concat + concat)};
+
+  for (size_t i = 0; i < merged.object_id.uuid.size(); ++i) {
+    const auto & part = hash_parts[i % hash_parts.size()];
+    const auto shift = (i / hash_parts.size()) * 8;
+    merged.object_id.uuid[i] = static_cast<uint8_t>((part >> shift) & 0xFFU);
+  }
+
+  merged.existence_probability = 1.0F;
+  ObjectClassification classification{};
+  classification.label = ObjectClassification::UNKNOWN;
+  classification.probability = 1.0F;
+  merged.classification.push_back(classification);
+
+  const auto hull = calcClusterConvexHull(members);
+
+  Point2d centroid_2d{};
+  boost::geometry::centroid(hull, centroid_2d);
+
+  merged.kinematics.initial_pose_with_covariance.pose.position.x = centroid_2d.x();
+  merged.kinematics.initial_pose_with_covariance.pose.position.y = centroid_2d.y();
+  merged.kinematics.initial_pose_with_covariance.pose.position.z =
+    members.front().kinematics.initial_pose_with_covariance.pose.position.z;
+  merged.kinematics.initial_pose_with_covariance.pose.orientation =
+    create_quaternion_from_rpy(0.0, 0.0, 0.0);
+
+  // [SAFETY-RELEVANT] always static, regardless of any member's own velocity -- explicit user
+  // design decision. See AvoidanceParameters::enable_obstacle_clustering doc comment (data_structs.hpp):
+  // a moving object clustered with a nearby static one is deliberately no longer excluded via the
+  // ObjectInfo::MOVING_OBJECT path the way it would be if processed individually.
+  merged.kinematics.initial_twist_with_covariance.twist = geometry_msgs::msg::Twist{};
+
+  merged.shape.type = Shape::POLYGON;
+  for (const auto & p : hull.outer()) {
+    geometry_msgs::msg::Point32 rel;
+    rel.x = static_cast<float>(p.x() - centroid_2d.x());
+    rel.y = static_cast<float>(p.y() - centroid_2d.y());
+    rel.z = 0.0F;
+    merged.shape.footprint.points.push_back(rel);
+  }
+
+  return merged;
+}
+
+std::vector<PredictedObject> clusterNearbyObjects(
+  const std::vector<PredictedObject> & objects, const PathWithLaneId & reference_path,
+  const Point & ego_position, const std::shared_ptr<AvoidanceParameters> & parameters,
+  ObjectClusterEdgeStateMap & edge_states)
+{
+  if (
+    !parameters->enable_obstacle_clustering || objects.size() < 2 ||
+    reference_path.points.empty()) {
+    return objects;
+  }
+
+  const auto n = objects.size();
+  const auto threshold = parameters->obstacle_cluster_max_neighbor_distance;
+  const auto merge_in_cycles = std::max(1, parameters->obstacle_cluster_merge_in_cycles);
+  const auto split_out_cycles = std::max(1, parameters->obstacle_cluster_split_out_cycles);
+
+  std::vector<std::string> ids(n);
+  for (size_t i = 0; i < n; ++i) {
+    ids[i] = autoware_utils::to_hex_string(objects[i].object_id);
+  }
+
+  const auto make_edge_key = [](const std::string & a, const std::string & b) {
+    return a < b ? a + "_" + b : b + "_" + a;
+  };
+
+  std::unordered_set<std::string> observed_ids(ids.begin(), ids.end());
+  std::vector<std::pair<size_t, size_t>> active_edges;
+
+  for (size_t i = 0; i < n; ++i) {
+    for (size_t j = i + 1; j < n; ++j) {
+      auto & state = edge_states[make_edge_key(ids[i], ids[j])];
+
+      const auto distance = calcPathFrameDistance(
+        reference_path, ego_position,
+        objects[i].kinematics.initial_pose_with_covariance.pose.position,
+        objects[j].kinematics.initial_pose_with_covariance.pose.position);
+
+      if (distance < threshold) {
+        state.split_streak = 0;
+        state.merge_streak += 1;
+        if (state.active || state.merge_streak >= merge_in_cycles) {
+          state.active = true;
+        }
+      } else {
+        state.merge_streak = 0;
+        if (state.active) {
+          state.split_streak += 1;
+          if (state.split_streak >= split_out_cycles) {
+            state.active = false;
+            state.split_streak = 0;
+          }
+        }
+      }
+
+      if (state.active) {
+        active_edges.emplace_back(i, j);
+      }
+    }
+  }
+
+  // Prune stale edge-state entries for object ids no longer observed, so the map doesn't grow
+  // unbounded over a long run as objects appear/disappear.
+  for (auto it = edge_states.begin(); it != edge_states.end();) {
+    const auto & key = it->first;
+    const auto sep = key.find('_');
+    const auto is_stale = sep == std::string::npos ||
+                           observed_ids.count(key.substr(0, sep)) == 0 ||
+                           observed_ids.count(key.substr(sep + 1)) == 0;
+    it = is_stale ? edge_states.erase(it) : std::next(it);
+  }
+
+  const auto groups = unionFindGroups(n, active_edges);
+
+  std::vector<PredictedObject> result;
+  result.reserve(n);
+  std::vector<PredictedObject> merged_objects;
+
+  for (const auto & group : groups) {
+    if (group.size() == 1) {
+      result.push_back(objects[group.front()]);
+      continue;
+    }
+
+    std::vector<PredictedObject> members;
+    members.reserve(group.size());
+    for (const auto idx : group) {
+      members.push_back(objects[idx]);
+    }
+    merged_objects.push_back(buildMergedClusterObject(members));
+  }
+
+  for (auto & merged : merged_objects) {
+    result.push_back(std::move(merged));
+  }
+
+  return result;
 }
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance

@@ -146,13 +146,31 @@
 
         unstable_classification_time: 2.0                # [s] If the object is classified as UNKNOWN type for less than unstable_classification_time seconds, it is probably not an unknown type.
 
+        # [OBSTACLE-CLUSTER 2026-09-04] preprocessing stage run BEFORE per-object filtering: merge
+        # obstacles that sit close together (path-frame distance: arc-length + lateral offset, NOT
+        # raw map-frame Euclidean distance) into one synthetic UNKNOWN-classified, always-static
+        # obstacle whose footprint is the convex hull of the members' footprints. That merged
+        # object then flows through the completely unchanged downstream per-object avoidance
+        # pipeline.
+        # SAFETY NOTE: a moving object clustered with a nearby static one is deliberately no longer
+        # excluded via the "moving object" filter the way it would be if processed individually --
+        # the merged representation is always treated as stationary/avoidable.
+        obstacle_clustering:
+          enable: true                                   # [-] enabled 2026-09-04 for live testing
+          max_neighbor_distance: 2.0                      # [m] path-frame distance threshold to merge two objects
+          merge_in_cycles: 1                              # [-] consecutive cycles required before merging (fast merge)
+          split_out_cycles: 5                             # [-] consecutive cycles required before splitting back apart (slow split)
+
         # params for avoidance of vehicle type objects that are ambiguous as to whether they are parked.
         avoidance_for_ambiguous_vehicle:
           # policy for ego behavior for ambiguous vehicle.
           # "auto"   : generate candidate path. if RTC is running as AUTO mode, the ego avoids it automatically.
           # "manual" : generate candidate path and wait operator approval even if RTC is running as AUTO mode.
           # "ignore" : never avoid it.
-          policy: "manual"                                # [-]
+          # 2026-09-04: changed "manual" -> "auto". Fully-autonomous deployment (no human operator
+          # in the loop / no one to service an RTC manual-approval request), so the manual-approval
+          # gate for ambiguous-vehicle avoidance is loosened to auto per explicit user directive.
+          policy: "auto"                                  # [-]
           condition:
             th_stopped_time: 3.0                        # [s]
             th_moving_distance: 1.0                     # [m]
@@ -246,7 +264,12 @@
           # approve the next shift line after reaching this percentage of the current shift line length.
           # this parameter is added to allow waiting for the return of shift approval until the occlusion behind the avoid target is clear.
           # this feature can be disabled by setting this parameter to 0.0.
-          ratio_for_return_shift_approval: 0.5          # [-]
+          # 2026-09-04: changed 0.5 -> 0.1. Fully-autonomous deployment, no human operator in the
+          # loop to arbitrate oscillation; this anti-oscillation interlock (wait until ego has
+          # traversed most of the current shift before approving a return/direction change) is
+          # loosened so return-shift approval no longer waits for most of the current shift to
+          # complete. Valid range 0.0-1.0 per this param's own doc; 0.1 stays inside range.
+          ratio_for_return_shift_approval: 0.1          # [-]
           # [ASYM-HYSTERESIS] asymmetric hysteresis on an already-approved object's shift length:
           # growing (more clearance needed, more urgent) reacts within this many consecutive
           # cycles; shrinking (less clearance needed) requires this many consecutive cycles
@@ -342,7 +365,13 @@
           min_jerk_values:
             avoid: [0.2, 0.2, 0.2]                      # [m/sss]
             return: [0.2, 0.2, 0.2]                     # [m/sss]
-          max_jerk_values: [1.0, 1.0, 1.0]              # [m/sss]
+          # 2026-09-04: changed [1.0,1.0,1.0] -> [2.5,2.5,2.5] (2.5x). Fully-autonomous deployment,
+          # no human operator to feel/react to jerk-comfort, and this is a low-speed ~0.5m-wide
+          # indoor robot, so the comfort-tuned jerk cap is loosened. NOTE: this same param is ALSO
+          # read by isFeasible()/insertReturnDeadLine() in scene.cpp (an unrelated gate, not
+          # touched by this task) -- loosening it here also loosens that gate's dead-line-insertion
+          # timing as a side effect. Expected/acceptable, documented here for future reference.
+          max_jerk_values: [2.5, 2.5, 2.5]              # [m/sss]
 
         # longitudinal constraints
         longitudinal:

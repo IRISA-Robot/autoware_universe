@@ -439,8 +439,21 @@ void StaticObstacleAvoidanceModule::fillAvoidanceTargetObjects(
     data.other_objects.push_back(other_object);
   }
 
+  // [OBSTACLE-CLUSTER 2026-09-04] Preprocessing step, run BEFORE per-object processing
+  // (createObjectData()/filterTargetObjects()/generateAvoidOutline()/etc., all of which remain
+  // completely unchanged): merge obstacles that sit close together (in path-frame distance) into
+  // one synthetic UNKNOWN-classified, always-static obstacle whose footprint is the convex hull of
+  // the members' footprints (see utils::static_obstacle_avoidance::clusterNearbyObjects() for the
+  // full design rationale, including the deliberate "moving object clustered with a static one is
+  // now treated as static/avoidable" safety-relevant behavior change). Objects with no close
+  // neighbor pass through completely unchanged, so this is a strict no-op when
+  // enable_obstacle_clustering is false or nothing is close enough to merge.
+  const auto clustered_objects = utils::static_obstacle_avoidance::clusterNearbyObjects(
+    object_within_target_lane.objects, data.reference_path, getEgoPosition(), parameters_,
+    object_cluster_edge_states_);
+
   ObjectDataArray objects;
-  for (const auto & object : object_within_target_lane.objects) {
+  for (const auto & object : clustered_objects) {
     objects.push_back(createObjectData(data, object));
   }
 
@@ -1326,6 +1339,24 @@ BehaviorModuleOutput StaticObstacleAvoidanceModule::plan()
     helper_->setPreviousSplineShiftPath(spline_shift_path);
     helper_->setPreviousReferencePath(path_shifter_.getReferencePath());
   } else {
+    // [FALLBACK-VISIBILITY 2026-09-04] PathShifter::generate() can fail silently from this
+    // module's point of view (e.g. a registered shift line whose start/end longitudinal window is
+    // valid per is_valid_shift_line() but still snaps to adjacent/adjoining reference-path point
+    // indices -- idx_gap <= 1, see path_shifter.cpp's "shift start point and end point can't be
+    // adjoining" check). When that happens we silently keep publishing the last successfully
+    // generated spline path below, with no error surfaced anywhere upstream (RTC still reports
+    // RUNNING/safe, isExecutionReady() still reports true) -- the module looks fully healthy while
+    // the actual committed shift silently freezes. Log this loudly (throttled) so this failure
+    // mode is immediately visible instead of requiring another multi-hour investigation. This does
+    // NOT change the fallback behavior itself -- only makes it observable.
+    RCLCPP_WARN_THROTTLE(
+      getLogger(), *clock_, 1000,
+      "[FALLBACK-VISIBILITY] PathShifter::generate() failed this cycle "
+      "(spline_ok=%d, linear_ok=%d) -- falling back to the previous spline shift path. The "
+      "published trajectory will NOT reflect the newly registered shift line(s) this cycle. See "
+      "path_shifter.cpp WARN logs above (e.g. \"can't be adjoining\") for the specific rejection "
+      "reason.",
+      success_spline_path_generation, success_linear_path_generation);
     spline_shift_path = helper_->getPreviousSplineShiftPath();
   }
 

@@ -554,6 +554,12 @@ private:
 
   mutable std::unordered_map<std::string, rclcpp::Time> unknown_type_object_first_seen_time_map_;
 
+  // [OBSTACLE-CLUSTER 2026-09-04] persistent per-object-pair hysteresis state for
+  // utils::static_obstacle_avoidance::clusterNearbyObjects(). Scene-instance member -- this module
+  // instance persists across planning cycles the same way stored_objects_/stopped_objects_/
+  // unknown_type_object_first_seen_time_map_ above do, so no manager-level storage is needed.
+  mutable ObjectClusterEdgeStateMap object_cluster_edge_states_;
+
   mutable size_t safe_count_{0};
 
   mutable DebugData debug_data_;

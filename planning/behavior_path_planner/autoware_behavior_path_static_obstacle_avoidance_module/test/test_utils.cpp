@@ -3010,6 +3010,261 @@ TEST(TestUtils, RescueCloseRangeShiftLineEndReportsGenuineInfeasibility)
        "object -- this is a real kinematic infeasibility, not an arithmetic accident.";
 }
 
+// [index-gap fix 2026-09-04] Direct regression test for the live-observed follow-on bug: the
+// original rescue (no path_arclength_arr) produced start=0.050, end=0.365 (~0.315 m window),
+// which passes is_valid_shift_line()'s start < end check but, against a reference path resampled
+// at resample_interval_for_planning ~= 0.3 m, snaps to reference-path point indices only 1 apart
+// (idx_gap <= 1) -- exactly the "shift start point and end point can't be adjoining" failure
+// PathShifter::generate() then hits, causing scene.cpp to silently fall back to the previous path.
+// With path_arclength_arr supplied (points every 0.3 m, matching the live resample interval), the
+// rescue must extend end_longitudinal at least to the arclength of the point 2 indices ahead of
+// start's nearest index, so PathShifter::generate() can actually build the shift line.
+TEST(TestUtils, RescueCloseRangeShiftLineEndExtendsForIndexGapRequirement)
+{
+  constexpr double start_longitudinal = 0.05;
+  constexpr double min_transition_distance = 0.315;  // reproduces the live ~0.315 m naive window
+  constexpr double object_longitudinal = 2.0;        // plenty of room past the naive window
+  constexpr double approach_buffer = 1e-2;
+  // Reference path resampled at 0.3 m, matching the live resample_interval_for_planning default.
+  const std::vector<double> path_arclength_arr{0.0, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.1, 2.4};
+
+  const auto naive_result = rescueCloseRangeShiftLineEnd(
+    start_longitudinal, min_transition_distance, object_longitudinal, approach_buffer);
+  ASSERT_TRUE(naive_result.has_value());
+  // Confirm the premise: the naive (no-path-awareness) rescue really does land inside a single
+  // 0.3 m segment -- i.e. it would snap start/end to adjacent indices (idx_gap <= 1).
+  EXPECT_NEAR(naive_result.value(), 0.365, 1e-9);
+
+  const auto result = rescueCloseRangeShiftLineEnd(
+    start_longitudinal, min_transition_distance, object_longitudinal, approach_buffer,
+    path_arclength_arr);
+
+  ASSERT_TRUE(result.has_value())
+    << "there is plenty of room before the object -- this must be rescued, just with a wider "
+       "window than the naive longitudinal-only computation.";
+  // With ego_offset_along_path defaulted to 0.0 (path_arclength_arr is already ego-relative),
+  // start_longitudinal=0.05 snaps to start_idx=1 (first arr[i] > 0.05 is arr[1]=0.3). To get
+  // end_idx >= start_idx + 2 = 3, end_longitudinal must be at least arr[start_idx + 1] = arr[2] =
+  // 0.6 (findPathIndexFromArclength(arr, 0.6) returns 3, since arr[2]=0.6 is not > 0.6).
+  EXPECT_DOUBLE_EQ(result.value(), 0.6)
+    << "rescued end_longitudinal must be extended far enough to satisfy PathShifter::generate()'s "
+       "idx_gap > 1 requirement, not just the naive min_transition_distance window.";
+  EXPECT_GT(result.value(), naive_result.value())
+    << "the index-gap-aware rescue must extend beyond the naive (too-short) window.";
+  EXPECT_LE(result.value(), object_longitudinal - approach_buffer);
+}
+
+// [index-gap fix 2026-09-04] Genuine "no room" infeasibility that is ONLY visible once the
+// index-gap requirement is taken into account: the object is close enough that satisfying
+// idx_gap > 1 would require running past the object itself. The naive (path-unaware) rescue would
+// incorrectly report success here with a window that PathShifter::generate() would then reject
+// anyway -- this must instead report std::nullopt directly.
+TEST(TestUtils, RescueCloseRangeShiftLineEndReportsInfeasibilityWhenIndexGapCannotFit)
+{
+  constexpr double start_longitudinal = 0.05;
+  constexpr double min_transition_distance = 0.05;  // tiny -- naive rescue would "succeed"
+  constexpr double object_longitudinal = 0.2;       // but object is inside the same 0.3 m segment
+  constexpr double approach_buffer = 1e-2;
+  const std::vector<double> path_arclength_arr{0.0, 0.3, 0.6, 0.9, 1.2};
+
+  const auto naive_result = rescueCloseRangeShiftLineEnd(
+    start_longitudinal, min_transition_distance, object_longitudinal, approach_buffer);
+  ASSERT_TRUE(naive_result.has_value())
+    << "premise check: the naive path-unaware rescue does report success here.";
+
+  const auto result = rescueCloseRangeShiftLineEnd(
+    start_longitudinal, min_transition_distance, object_longitudinal, approach_buffer,
+    path_arclength_arr);
+
+  EXPECT_FALSE(result.has_value())
+    << "satisfying idx_gap > 1 here requires end_longitudinal >= arr[start_idx + 1] = 0.6 "
+       "(start_longitudinal=0.05 snaps to start_idx=1), which is past "
+       "object_longitudinal - approach_buffer (0.19) -- this is genuine infeasibility and must "
+       "NOT be silently rescued into another idx_gap <= 1 failure downstream.";
+}
+
+// [index-gap fix, shared helper] Direct test of computeIndexGapSafeEndLongitudinal(), factored out
+// of rescueCloseRangeShiftLineEnd() so it can be reused by evaluateFillGapShiftLine(). Same
+// resample geometry as RescueCloseRangeShiftLineEndExtendsForIndexGapRequirement above.
+TEST(TestUtils, ComputeIndexGapSafeEndLongitudinalMatchesRescueHelper)
+{
+  const std::vector<double> path_arclength_arr{0.0, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.1, 2.4};
+
+  const auto result = computeIndexGapSafeEndLongitudinal(0.05, path_arclength_arr);
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_DOUBLE_EQ(result.value(), 0.6);
+}
+
+// [index-gap fix, shared helper] Empty path_arclength_arr means "no path to check against" --
+// must pass start_longitudinal straight through unchanged rather than reporting infeasibility.
+TEST(TestUtils, ComputeIndexGapSafeEndLongitudinalNoOpWhenArrayEmpty)
+{
+  const auto result = computeIndexGapSafeEndLongitudinal(0.05, {});
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_DOUBLE_EQ(result.value(), 0.05);
+}
+
+// [index-gap fix, shared helper] No room at all ahead of start -- genuine infeasibility.
+TEST(TestUtils, ComputeIndexGapSafeEndLongitudinalReportsInfeasibilityAtPathEnd)
+{
+  const std::vector<double> path_arclength_arr{0.0, 0.3};
+
+  const auto result = computeIndexGapSafeEndLongitudinal(0.05, path_arclength_arr);
+
+  EXPECT_FALSE(result.has_value());
+}
+
+namespace
+{
+AvoidLine makeFillGapTestLine(
+  const size_t start_idx, const size_t end_idx, const double start_shift_length,
+  const double end_shift_length)
+{
+  AvoidLine line{};
+  line.start_idx = start_idx;
+  line.end_idx = end_idx;
+  line.start_shift_length = start_shift_length;
+  line.end_shift_length = end_shift_length;
+  return line;
+}
+}  // namespace
+
+// [FILL-GAP-INDEX-FIX 2026-09-04] Regression test for the second, independent "adjoining" source
+// found live: a fresh, far object (longitudinal=8.22 m, current_ego_shift=0.0, NOT a BUG-A-RESCUE
+// close-range case at all) whose avoid-to-return gap-fill connector line collapsed to idx_gap<=1
+// because its front+rear longitudinal margins were small. A window with idx_gap > 1 must be kept
+// unchanged.
+TEST(TestUtils, EvaluateFillGapShiftLineKeepsIndexGapSafeLine)
+{
+  const auto line = makeFillGapTestLine(/*start_idx=*/10, /*end_idx=*/13, -0.9, -0.9);
+
+  const auto decision = evaluateFillGapShiftLine(line);
+
+  EXPECT_TRUE(decision.keep);
+}
+
+// The exact live-observed failure shape: start_idx and end_idx only 1 apart (idx_gap == 1), and
+// the connector is FLAT (start_shift_length == end_shift_length, always true for the
+// avoid-line-end-to-return-line-start connector by construction -- see
+// ShiftLineGenerator::generateAvoidOutline(), al_return.start_shift_length =
+// al_avoid.end_shift_length). This must be dropped (not kept), and reported as the safe/lossless
+// "flat" case -- PathShifter carries the prior shift value forward through the gap regardless, so
+// dropping this connector changes nothing about the actual shift profile.
+TEST(TestUtils, EvaluateFillGapShiftLineDropsFlatIndexGapUnsafeLineLosslessly)
+{
+  const auto line = makeFillGapTestLine(/*start_idx=*/40, /*end_idx=*/41, -0.895, -0.895);
+
+  const auto decision = evaluateFillGapShiftLine(line);
+
+  EXPECT_FALSE(decision.keep);
+  EXPECT_TRUE(decision.is_flat)
+    << "matching start/end shift_length must be classified as the safe/lossless flat case.";
+}
+
+// idx_gap == 0 (end_idx == start_idx, an even more degenerate collapse than idx_gap == 1) must
+// also be dropped, not kept -- PathShifter::generate()'s own check is `idx_gap <= 1`, not `< 1`.
+TEST(TestUtils, EvaluateFillGapShiftLineDropsZeroIndexGapFlatLine)
+{
+  const auto line = makeFillGapTestLine(/*start_idx=*/5, /*end_idx=*/5, 0.0, 0.0);
+
+  const auto decision = evaluateFillGapShiftLine(line);
+
+  EXPECT_FALSE(decision.keep);
+  EXPECT_TRUE(decision.is_flat);
+}
+
+// Index-gap-unsafe AND non-flat (a genuine shift-length transition is needed across this window,
+// e.g. the generic "fill gap among shift lines" pass between two different objects' shift lines
+// that do not happen to share the same boundary shift length): must still be dropped (never hand
+// PathShifter a doomed candidate that fails generate() for the entire shift_lines_ list), but
+// reported as the non-flat case so the caller can log that a real transition was lost.
+TEST(TestUtils, EvaluateFillGapShiftLineDropsNonFlatIndexGapUnsafeLineWithWarning)
+{
+  const auto line = makeFillGapTestLine(/*start_idx=*/40, /*end_idx=*/41, -0.9, -0.4);
+
+  const auto decision = evaluateFillGapShiftLine(line);
+
+  EXPECT_FALSE(decision.keep);
+  EXPECT_FALSE(decision.is_flat)
+    << "differing start/end shift_length must be classified as the non-flat, real-transition-lost "
+       "case, distinct from the always-safe flat case.";
+}
+
+// A tolerance-level near-flat line (tiny floating-point/noise-level difference) must still be
+// treated as flat -- the default flat_shift_length_tolerance exists exactly to absorb this.
+TEST(TestUtils, EvaluateFillGapShiftLineTreatsNearFlatWithinToleranceAsFlat)
+{
+  const auto line = makeFillGapTestLine(/*start_idx=*/40, /*end_idx=*/41, -0.9, -0.9 + 1e-4);
+
+  const auto decision = evaluateFillGapShiftLine(line);
+
+  EXPECT_FALSE(decision.keep);
+  EXPECT_TRUE(decision.is_flat);
+}
+
+// [MERGE-INDEX-FIX 2026-09-04] Regression tests for the THIRD, independent "adjoining" source found
+// live: ShiftLineGenerator::extractShiftLinesFromLine() (the MAIN merge pipeline's Step1, feeding
+// applyMergeProcess() -> generateCandidateShiftLine(), distinct from both BUG-A-RESCUE's close-range
+// rescue and FILL-GAP-INDEX-FIX's gap-fill connector construction) builds AvoidLine segments purely
+// from gradient-change detection with no index-gap validation at all -- confirmed live by a
+// PathShifter "shift start point and end point can't be adjoining" failure with neither
+// [BUG-A-RESCUE] nor [FILL-GAP-INDEX-FIX] logged nearby, right after several ASYM-HYSTERESIS cycles.
+//
+// The production fix (extractShiftLinesFromLine() in shift_line_generator.cpp) reuses this SAME
+// evaluateFillGapShiftLine() helper at each candidate-segment finalization point -- these tests
+// pin down that the helper's keep/drop decision is exactly what that call site relies on for a
+// segment shaped like the ones extractShiftLinesFromLine() builds (plain start/end index + shift
+// length, no dependency on how the segment's indices were derived).
+
+// A normal merge-pipeline segment with plenty of index-gap margin (the vast majority of real
+// gradient-change segments) must be completely unaffected by the new guard.
+TEST(TestUtils, MergeIndexFixKeepsNormalMergeSegmentUnaffected)
+{
+  const auto line = makeFillGapTestLine(/*start_idx=*/44, /*end_idx=*/60, -0.5, -0.9);
+
+  const auto decision = evaluateFillGapShiftLine(line);
+
+  EXPECT_TRUE(decision.keep)
+    << "a segment with plenty of index-gap margin must flow through completely unchanged.";
+}
+
+// The exact live-observed failure shape for this third source: two gradient-change points detected
+// only 1 index apart (idx_gap == 1) right after an ASYM-HYSTERESIS-driven nudge. Since this is a
+// mid-approach segment (there is more path ahead to extend into), the production call site treats
+// this as "extend" (do not finalize the boundary yet) rather than an unconditional drop -- but the
+// underlying keep/drop decision from evaluateFillGapShiftLine() that triggers that extension must
+// correctly flag the segment as unsafe to finalize as-is.
+TEST(TestUtils, MergeIndexFixFlagsNearAdjacentGradientChangeSegmentForExtension)
+{
+  const auto line = makeFillGapTestLine(/*start_idx=*/44, /*end_idx=*/45, -0.5, -0.62);
+
+  const auto decision = evaluateFillGapShiftLine(line);
+
+  EXPECT_FALSE(decision.keep)
+    << "idx_gap == 1 must be flagged as unsafe to finalize, triggering the extend-forward path.";
+  EXPECT_FALSE(decision.is_flat)
+    << "a genuine gradient-change-driven segment (differing start/end shift_length) must be "
+       "classified as the non-flat, real-transition-at-risk case.";
+}
+
+// The final-closing-boundary shape: no more path to extend into (path end), and the trailing
+// segment happens to be flat (constant shift value all the way to the end of the reference path).
+// The production call site's final-boundary branch must be able to tell this apart from the
+// non-flat case so it can log it as the safe/lossless drop.
+TEST(TestUtils, MergeIndexFixFlagsFlatFinalSegmentAsLosslessDrop)
+{
+  const auto line = makeFillGapTestLine(/*start_idx=*/98, /*end_idx=*/99, -0.9, -0.9);
+
+  const auto decision = evaluateFillGapShiftLine(line);
+
+  EXPECT_FALSE(decision.keep);
+  EXPECT_TRUE(decision.is_flat)
+    << "a constant-shift trailing segment dropped at path end is lossless -- PathShifter carries "
+       "the prior shift value forward regardless.";
+}
+
 // [ASYM-HYSTERESIS 2026-09-04] Growing an already-approved shift (more clearance/more urgent)
 // must be let through immediately when hysteresis_in_cycles == 1 (the default configuration) --
 // this is the safety-critical direction and must react fast, matching the live bug scenario where
@@ -3118,5 +3373,332 @@ TEST(TestUtils, ApplyAsymmetricShiftHysteresisResetsOppositeStreakOnDirectionCha
   EXPECT_DOUBLE_EQ(noop_applied, -1.081);
   EXPECT_EQ(grow_streak, 0);
   EXPECT_EQ(shrink_streak, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// [OBSTACLE-CLUSTER 2026-09-04] tests for the preprocessing clustering stage.
+// ---------------------------------------------------------------------------------------------
+namespace
+{
+PredictedObject make_cluster_test_object(
+  const double x, const double y, const uint8_t id_seed,
+  const uint8_t label = ObjectClassification::CAR)
+{
+  PredictedObject object{};
+  object.object_id.uuid.fill(0);
+  object.object_id.uuid[0] = id_seed;
+  object.existence_probability = 1.0F;
+
+  ObjectClassification classification{};
+  classification.label = label;
+  classification.probability = 1.0F;
+  object.classification.push_back(classification);
+
+  object.kinematics.initial_pose_with_covariance.pose =
+    autoware::test_utils::createPose(x, y, 0.0, 0.0, 0.0, 0.0);
+
+  object.shape.type = Shape::BOUNDING_BOX;
+  object.shape.dimensions = create_vector3(1.0, 1.0, 1.0);
+  return object;
+}
+
+std::shared_ptr<AvoidanceParameters> make_cluster_test_parameters(
+  const double max_neighbor_distance, const int merge_in_cycles = 1,
+  const int split_out_cycles = 5, const bool enable = true)
+{
+  auto parameters = get_parameters();
+  parameters->enable_obstacle_clustering = enable;
+  parameters->obstacle_cluster_max_neighbor_distance = max_neighbor_distance;
+  parameters->obstacle_cluster_merge_in_cycles = merge_in_cycles;
+  parameters->obstacle_cluster_split_out_cycles = split_out_cycles;
+  return parameters;
+}
+}  // namespace
+
+TEST(TestUtils, UnionFindGroupsHandlesSingletonsAndPairs)
+{
+  // no edges at all -- every node is its own singleton group.
+  {
+    const auto groups = unionFindGroups(3, {});
+    ASSERT_EQ(groups.size(), 3U);
+    for (size_t i = 0; i < 3; ++i) {
+      EXPECT_THAT(groups.at(i), ::testing::ElementsAre(i));
+    }
+  }
+
+  // a single edge merges exactly those two nodes, leaving the third alone.
+  {
+    const auto groups = unionFindGroups(3, {{0, 1}});
+    ASSERT_EQ(groups.size(), 2U);
+    EXPECT_THAT(groups.at(0), ::testing::ElementsAre(0U, 1U));
+    EXPECT_THAT(groups.at(1), ::testing::ElementsAre(2U));
+  }
+}
+
+// Transitive union-find behavior: edges (0,1) and (1,2) must merge nodes 0, 1, AND 2 into one
+// group, even though (0,2) is never itself an edge -- confirms this is genuine union-find/DBSCAN-
+// style transitive clustering, not a literal (non-transitive) k-nearest-neighbor pairing.
+TEST(TestUtils, UnionFindGroupsIsTransitive)
+{
+  const auto groups = unionFindGroups(3, {{0, 1}, {1, 2}});
+  ASSERT_EQ(groups.size(), 1U);
+  EXPECT_THAT(groups.front(), ::testing::ElementsAre(0U, 1U, 2U));
+}
+
+// [REV-F1-style regression] calcPathFrameDistance() must use arc-length-along-the-polyline +
+// lateral offset, NOT raw map-frame Euclidean distance -- otherwise two points on opposite sides
+// of a bend that happen to be geometrically close (e.g. a lane that loops back near itself) would
+// be wrongly treated as "close" when they are actually far apart along the route. Build a path
+// that loops nearly all the way around a circle, so index 1 (near the start) and index ~last (near
+// the end, but geometrically almost back at the start) sit right next to each other in XY while
+// being almost the entire path length apart along the polyline.
+TEST(TestUtils, CalcPathFrameDistanceUsesArcLengthNotRawEuclideanOnCurvedPath)
+{
+  // Note: autoware::test_utils::generateTrajectory<PathWithLaneId>() places point i at radius
+  // i*point_interval (an Archimedean spiral, radius growing with index), which is NOT suitable
+  // here -- every point ends up farther from the origin than the last, so nothing ever loops back
+  // close in XY. Build an actual constant-radius circular path by hand instead, so the path
+  // genuinely loops back near itself while the arc-length-along-the-polyline stays large.
+  constexpr size_t num_points = 100;
+  constexpr double circumference = 100.0;
+  constexpr double radius = circumference / (2.0 * M_PI);
+  constexpr double delta_theta = 2.0 * M_PI / static_cast<double>(num_points);
+
+  PathWithLaneId path;
+  for (size_t i = 0; i < num_points; ++i) {
+    const double theta = static_cast<double>(i) * delta_theta;
+    PathPointWithLaneId p;
+    p.point.pose = autoware::test_utils::createPose(
+      radius * std::cos(theta), radius * std::sin(theta), 0.0, 0.0, 0.0, theta + M_PI / 2.0);
+    path.points.push_back(p);
+  }
+
+  const auto & p_start = path.points.at(1).point.pose.position;
+  const auto & p_near_loop_close = path.points.at(num_points - 1).point.pose.position;
+  const auto & ego_pos = path.points.at(0).point.pose.position;
+
+  const auto raw_euclidean = autoware_utils::calc_distance2d(p_start, p_near_loop_close);
+  const auto path_frame_distance =
+    calcPathFrameDistance(path, ego_pos, p_start, p_near_loop_close);
+
+  // Geometrically these two points are right next to each other (the loop almost closes)...
+  EXPECT_LT(raw_euclidean, 3.0);
+  // ...but they are actually separated by nearly the entire route length -- a naive Euclidean
+  // clustering distance would wrongly consider merging them; the path-frame metric must not.
+  EXPECT_GT(path_frame_distance, 50.0);
+}
+
+TEST(TestUtils, CalcClusterConvexHullOfTwoBoxesIsTheirBoundingHull)
+{
+  // Two 1x1 boxes centered 3m apart along x: (0,0) and (3,0). The convex hull of their union
+  // should span roughly x in [-0.5, 3.5], y in [-0.5, 0.5].
+  const auto object_a = make_cluster_test_object(0.0, 0.0, 1);
+  const auto object_b = make_cluster_test_object(3.0, 0.0, 2);
+
+  const auto hull = calcClusterConvexHull({object_a, object_b});
+
+  ASSERT_GE(hull.outer().size(), 4U);
+
+  double min_x = std::numeric_limits<double>::max();
+  double max_x = std::numeric_limits<double>::lowest();
+  double min_y = std::numeric_limits<double>::max();
+  double max_y = std::numeric_limits<double>::lowest();
+  for (const auto & p : hull.outer()) {
+    min_x = std::min(min_x, p.x());
+    max_x = std::max(max_x, p.x());
+    min_y = std::min(min_y, p.y());
+    max_y = std::max(max_y, p.y());
+  }
+
+  EXPECT_NEAR(min_x, -0.5, 1e-6);
+  EXPECT_NEAR(max_x, 3.5, 1e-6);
+  EXPECT_NEAR(min_y, -0.5, 1e-6);
+  EXPECT_NEAR(max_y, 0.5, 1e-6);
+}
+
+TEST(TestUtils, BuildMergedClusterObjectIsAlwaysUnknownAndAlwaysStatic)
+{
+  // One member is fast-moving (would fail isMovingObject() if processed individually).
+  auto moving_member = make_cluster_test_object(0.0, 0.0, 1, ObjectClassification::CAR);
+  moving_member.kinematics.initial_twist_with_covariance.twist.linear.x = 5.0;
+  const auto static_member = make_cluster_test_object(1.0, 0.0, 2, ObjectClassification::CAR);
+
+  const auto merged = buildMergedClusterObject({moving_member, static_member});
+
+  ASSERT_EQ(merged.classification.size(), 1U);
+  EXPECT_EQ(merged.classification.front().label, ObjectClassification::UNKNOWN);
+
+  // [SAFETY-RELEVANT] the merged object's own twist must be zero, regardless of the moving
+  // member's velocity -- this is what makes fillObjectMovingTime()/isMovingObject() treat the
+  // merged blob as always-static/always-avoidable downstream, with zero changes to that
+  // downstream machinery.
+  EXPECT_DOUBLE_EQ(merged.kinematics.initial_twist_with_covariance.twist.linear.x, 0.0);
+  EXPECT_DOUBLE_EQ(merged.kinematics.initial_twist_with_covariance.twist.linear.y, 0.0);
+
+  ObjectData merged_object_data;
+  merged_object_data.object = merged;
+  merged_object_data.move_time = 0.0;  // fillObjectMovingTime() would set this given zero twist.
+  EXPECT_FALSE(filtering_utils::isMovingObject(merged_object_data, get_parameters()))
+    << "a cluster containing a moving member must not be excluded via the MOVING_OBJECT path.";
+}
+
+TEST(TestUtils, BuildMergedClusterObjectIdIsDeterministicAndOrderIndependent)
+{
+  const auto object_a = make_cluster_test_object(0.0, 0.0, 11);
+  const auto object_b = make_cluster_test_object(1.0, 0.0, 22);
+
+  const auto merged_ab = buildMergedClusterObject({object_a, object_b});
+  const auto merged_ba = buildMergedClusterObject({object_b, object_a});
+
+  EXPECT_EQ(
+    autoware_utils::to_hex_string(merged_ab.object_id),
+    autoware_utils::to_hex_string(merged_ba.object_id))
+    << "merged object_id must depend only on the set of member ids, not their order, so the same "
+       "underlying cluster gets the same id across cycles regardless of iteration order.";
+
+  const auto object_c = make_cluster_test_object(2.0, 0.0, 33);
+  const auto merged_abc = buildMergedClusterObject({object_a, object_b, object_c});
+  EXPECT_NE(
+    autoware_utils::to_hex_string(merged_ab.object_id),
+    autoware_utils::to_hex_string(merged_abc.object_id))
+    << "a different member set must (in practice) yield a different merged id.";
+}
+
+TEST(TestUtils, ClusterNearbyObjectsMergesTwoCloseObjects)
+{
+  const auto path = make_straight_reference_path(0.0);
+  const auto parameters = make_cluster_test_parameters(/*max_neighbor_distance=*/2.0);
+  ObjectClusterEdgeStateMap edge_states;
+
+  const std::vector<PredictedObject> objects{
+    make_cluster_test_object(5.0, 0.0, 1), make_cluster_test_object(5.5, 0.0, 2)};
+
+  const auto result = clusterNearbyObjects(
+    objects, path, geometry_msgs::msg::Point{}, parameters, edge_states);
+
+  ASSERT_EQ(result.size(), 1U);
+  EXPECT_EQ(result.front().classification.front().label, ObjectClassification::UNKNOWN);
+}
+
+TEST(TestUtils, ClusterNearbyObjectsKeepsTwoFarObjectsSeparate)
+{
+  const auto path = make_straight_reference_path(0.0);
+  const auto parameters = make_cluster_test_parameters(/*max_neighbor_distance=*/2.0);
+  ObjectClusterEdgeStateMap edge_states;
+
+  const std::vector<PredictedObject> objects{
+    make_cluster_test_object(2.0, 0.0, 1), make_cluster_test_object(18.0, 0.0, 2)};
+
+  const auto result = clusterNearbyObjects(
+    objects, path, geometry_msgs::msg::Point{}, parameters, edge_states);
+
+  ASSERT_EQ(result.size(), 2U);
+  // both objects pass through completely unchanged (not reclassified/re-shaped) since neither was
+  // merged with anything.
+  EXPECT_EQ(result.at(0).classification.front().label, ObjectClassification::CAR);
+  EXPECT_EQ(result.at(1).classification.front().label, ObjectClassification::CAR);
+}
+
+// Transitive chain: A-B close, B-C close, A-C far apart. All three must end up in ONE merged
+// cluster (genuine union-find transitivity), not two separate pairs / a pair + a singleton.
+TEST(TestUtils, ClusterNearbyObjectsMergesTransitiveChainIntoOneCluster)
+{
+  const auto path = make_straight_reference_path(0.0);
+  const auto parameters = make_cluster_test_parameters(/*max_neighbor_distance=*/1.5);
+  ObjectClusterEdgeStateMap edge_states;
+
+  // A at x=2.0, B at x=3.2 (A-B distance 1.2 < 1.5), C at x=4.4 (B-C distance 1.2 < 1.5).
+  // A-C distance is 2.4 > 1.5, so A and C are only connected transitively through B.
+  const std::vector<PredictedObject> objects{
+    make_cluster_test_object(2.0, 0.0, 1), make_cluster_test_object(3.2, 0.0, 2),
+    make_cluster_test_object(4.4, 0.0, 3)};
+
+  const auto result = clusterNearbyObjects(
+    objects, path, geometry_msgs::msg::Point{}, parameters, edge_states);
+
+  ASSERT_EQ(result.size(), 1U);
+  EXPECT_EQ(result.front().classification.front().label, ObjectClassification::UNKNOWN);
+}
+
+TEST(TestUtils, ClusterNearbyObjectsDisabledIsNoOp)
+{
+  const auto path = make_straight_reference_path(0.0);
+  const auto parameters = make_cluster_test_parameters(
+    /*max_neighbor_distance=*/2.0, /*merge_in_cycles=*/1, /*split_out_cycles=*/5,
+    /*enable=*/false);
+  ObjectClusterEdgeStateMap edge_states;
+
+  const std::vector<PredictedObject> objects{
+    make_cluster_test_object(5.0, 0.0, 1), make_cluster_test_object(5.5, 0.0, 2)};
+
+  const auto result = clusterNearbyObjects(
+    objects, path, geometry_msgs::msg::Point{}, parameters, edge_states);
+
+  ASSERT_EQ(result.size(), 2U);
+  EXPECT_EQ(result.at(0).classification.front().label, ObjectClassification::CAR);
+  EXPECT_EQ(result.at(1).classification.front().label, ObjectClassification::CAR);
+}
+
+// [OBSTACLE-CLUSTER hysteresis] an object pair oscillating right at the threshold boundary across
+// cycles must not cause cluster membership to flicker: with merge_in_cycles=1 (fast merge) and
+// split_out_cycles=3 (slow split), the pair merges immediately on the first close cycle, then must
+// STAY merged through brief single-cycle excursions back out past the threshold, only actually
+// splitting after 3 CONSECUTIVE out-of-range cycles.
+TEST(TestUtils, ClusterNearbyObjectsMembershipHysteresisPreventsFlicker)
+{
+  const auto path = make_straight_reference_path(0.0);
+  const auto parameters =
+    make_cluster_test_parameters(/*max_neighbor_distance=*/1.0, /*merge_in_cycles=*/1,
+    /*split_out_cycles=*/3);
+  ObjectClusterEdgeStateMap edge_states;
+
+  const auto close_objects = [] {
+    return std::vector<PredictedObject>{
+      make_cluster_test_object(5.0, 0.0, 1), make_cluster_test_object(5.5, 0.0, 2)};
+  };
+  const auto far_objects = [] {
+    return std::vector<PredictedObject>{
+      make_cluster_test_object(5.0, 0.0, 1), make_cluster_test_object(6.5, 0.0, 2)};
+  };
+
+  // Cycle 1: close -> merges immediately (merge_in_cycles=1).
+  {
+    const auto result =
+      clusterNearbyObjects(close_objects(), path, geometry_msgs::msg::Point{}, parameters, edge_states);
+    ASSERT_EQ(result.size(), 1U) << "cycle 1: should merge immediately";
+  }
+
+  // Cycles 2-3: briefly out of range (2 consecutive cycles, less than split_out_cycles=3) -- must
+  // still be reported as merged (flicker prevention).
+  for (int cycle = 2; cycle <= 3; ++cycle) {
+    const auto result =
+      clusterNearbyObjects(far_objects(), path, geometry_msgs::msg::Point{}, parameters, edge_states);
+    EXPECT_EQ(result.size(), 1U) << "cycle " << cycle << ": must stay merged during brief excursion";
+  }
+
+  // Cycle 4: back close again -- resets the split streak, still merged.
+  {
+    const auto result = clusterNearbyObjects(
+      close_objects(), path, geometry_msgs::msg::Point{}, parameters, edge_states);
+    EXPECT_EQ(result.size(), 1U) << "cycle 4: back in range, still merged";
+  }
+
+  // Cycles 5-7: now genuinely stay far for 3 consecutive cycles -- must actually split on the 3rd.
+  {
+    const auto result =
+      clusterNearbyObjects(far_objects(), path, geometry_msgs::msg::Point{}, parameters, edge_states);
+    EXPECT_EQ(result.size(), 1U) << "cycle 5: still within the debounce window";
+  }
+  {
+    const auto result =
+      clusterNearbyObjects(far_objects(), path, geometry_msgs::msg::Point{}, parameters, edge_states);
+    EXPECT_EQ(result.size(), 1U) << "cycle 6: still within the debounce window";
+  }
+  {
+    const auto result =
+      clusterNearbyObjects(far_objects(), path, geometry_msgs::msg::Point{}, parameters, edge_states);
+    EXPECT_EQ(result.size(), 2U)
+      << "cycle 7: 3 consecutive out-of-range cycles -- must actually split now";
+  }
 }
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance

@@ -393,10 +393,10 @@ bool shouldRearmHeldShiftLine(
   const double clearance_margin);
 
 /**
- * @brief [BUG-A fix 2026-09-04] Decide whether a close-range avoid shift-line candidate whose raw
- * end_longitudinal has collapsed to at or below start_longitudinal (object very close --
- * "object.longitudinal - constant_distance" going non-positive) can be rescued, instead of being
- * silently treated as geometrically invalid and dropped.
+ * @brief [BUG-A fix 2026-09-04, index-gap fix 2026-09-04] Decide whether a close-range avoid
+ * shift-line candidate whose raw end_longitudinal has collapsed to at or below start_longitudinal
+ * (object very close -- "object.longitudinal - constant_distance" going non-positive) can be
+ * rescued, instead of being silently treated as geometrically invalid and dropped.
  *
  * Background: ShiftLineGenerator::generateAvoidOutline() used to build end_longitudinal as a raw
  * "object longitudinal - constant distance" arithmetic result with no floor. As ego closes in on
@@ -408,19 +408,130 @@ bool shouldRearmHeldShiftLine(
  * start_longitudinal + min_transition_distance so that proof is actually used to build a valid
  * (steeper) shift line, rather than being discarded by degenerate arithmetic.
  *
+ * [index-gap fix] The original rescue only checked `start_longitudinal < end_longitudinal`, the
+ * same loose check used by is_valid_shift_line(). But PathShifter::generate() enforces a
+ * stricter, separate requirement on the RESAMPLED reference path: the shift line's start/end
+ * points, once snapped to the nearest reference-path point index, must be at least 2 indices
+ * apart (`end_idx - start_idx > 1`) -- "shift start point and end point can't be adjoining".
+ * Because the reference path is resampled at `resample_interval_for_planning` (commonly ~0.3 m),
+ * a longitudinally-valid but short rescue window (e.g. ~0.3 m) can still collapse to
+ * `idx_gap <= 1` and silently fail PathShifter::generate(), after which scene.cpp's plan() falls
+ * back to the previous path with no visible error -- the module looks healthy (RTC still
+ * RUNNING/safe) while the trajectory silently freezes short of the required shift. This function
+ * now also consults `path_arclength_arr` (the SAME arclength array used to index start_idx/end_idx
+ * elsewhere in this module, e.g. AvoidancePlanningData::arclength_from_ego, which is exactly the
+ * arclength array PathShifter::generate() will snap indices against) and, if the naive rescue
+ * window would still produce `idx_gap <= 1`, further extends end_longitudinal to the arclength of
+ * the point two indices ahead of start's nearest index -- the minimum needed to satisfy
+ * PathShifter::generate()'s own requirement. If extending that far would run past
+ * `object_longitudinal - approach_buffer`, or the reference path simply doesn't have 2 more points
+ * ahead of start, this is genuine infeasibility (both constraints can't be satisfied at once) and
+ * the function reports std::nullopt, exactly like the original Bug A infeasibility case.
+ *
  * @param start_longitudinal the already-valid (> 0) start point of the shift line.
  * @param min_transition_distance minimum jerk-feasible longitudinal transition distance for this
  * shift's magnitude (see AvoidanceHelper::getMinAvoidanceDistance()).
  * @param object_longitudinal the object's longitudinal distance from ego.
  * @param approach_buffer small buffer [m] to keep the transition from finishing at/after the
  * object itself.
- * @return the rescued end_longitudinal if the minimum transition still fits before reaching the
- * object; std::nullopt if even the minimum transition cannot fit -- a genuine kinematic
- * infeasibility, not an arithmetic accident, and the caller should treat this as a real rejection.
+ * @param path_arclength_arr arclength array of the SAME reference path that will be handed to
+ * PathShifter::setPath()/generate() (e.g. AvoidancePlanningData::arclength_from_ego), used to
+ * replicate PathShifter::generate()'s idx_gap requirement exactly. May be empty (e.g. legacy
+ * callers/tests not modeling a path) -- in that case the index-gap check is skipped and only the
+ * original longitudinal-distance check applies. NOTE: `path_arclength_arr` is indexed in
+ * path-front-relative arclength, while `start_longitudinal`/`object_longitudinal` are ego-relative
+ * -- use `ego_offset_along_path` to convert between the two frames (see below).
+ * @param ego_offset_along_path the path-front-relative arclength of ego's own position (e.g.
+ * `AvoidancePlanningData::arclength_from_ego.at(ego_closest_path_index)`), needed to convert
+ * ego-relative `start_longitudinal`/`object_longitudinal` into the same path-front-relative frame
+ * as `path_arclength_arr` before looking up indices. Defaults to 0.0, i.e. "path_arclength_arr is
+ * already ego-relative" -- correct for callers/tests that construct an ego-relative array
+ * directly, and a no-op when `path_arclength_arr` is empty.
+ * @return the rescued end_longitudinal (in the same ego-relative frame as `start_longitudinal`) if
+ * the minimum transition (extended if necessary to satisfy the index-gap requirement) still fits
+ * before reaching the object; std::nullopt if even that cannot fit -- a genuine
+ * kinematic/resolution infeasibility, not an arithmetic accident, and the caller should treat this
+ * as a real rejection.
  */
 std::optional<double> rescueCloseRangeShiftLineEnd(
   const double start_longitudinal, const double min_transition_distance,
-  const double object_longitudinal, const double approach_buffer);
+  const double object_longitudinal, const double approach_buffer,
+  const std::vector<double> & path_arclength_arr = {}, const double ego_offset_along_path = 0.0);
+
+/**
+ * @brief [index-gap fix, shared helper] Given an already-valid (start < end) longitudinal
+ * shift-line start point, compute the smallest end_longitudinal (in the same frame as
+ * `start_longitudinal`) that will satisfy PathShifter::generate()'s `end_idx - start_idx > 1`
+ * index-gap requirement once both points are snapped to `path_arclength_arr`. Factored out of
+ * rescueCloseRangeShiftLineEnd() so the same index-gap logic can be reused by any other shift-line
+ * construction site (e.g. ShiftLineGenerator's gap-fill connector lines) without duplicating the
+ * arclength-index math.
+ *
+ * @param start_longitudinal ego-relative (or whatever frame `path_arclength_arr` +
+ * `ego_offset_along_path` together resolve to) start point of the candidate shift line.
+ * @param path_arclength_arr arclength array of the SAME reference path that will be handed to
+ * PathShifter::setPath()/generate() (e.g. AvoidancePlanningData::arclength_from_ego). May be empty,
+ * in which case this function returns `start_longitudinal` unchanged (index-gap check skipped).
+ * @param ego_offset_along_path path-front-relative arclength of ego's own position, used to convert
+ * `start_longitudinal` into the same frame as `path_arclength_arr` (see
+ * rescueCloseRangeShiftLineEnd()'s doc comment for the full frame explanation). Defaults to 0.0.
+ * @return the minimum index-gap-safe end_longitudinal (same frame as `start_longitudinal`), or
+ * std::nullopt if the reference path does not have at least 2 more points ahead of start's nearest
+ * index -- genuine infeasibility, there is no end_longitudinal that can satisfy the index-gap
+ * requirement at all.
+ */
+std::optional<double> computeIndexGapSafeEndLongitudinal(
+  const double start_longitudinal, const std::vector<double> & path_arclength_arr,
+  const double ego_offset_along_path = 0.0);
+
+/**
+ * @brief [FILL-GAP-INDEX-FIX 2026-09-04] Root cause of a SEPARATE "shift start point and end point
+ * can't be adjoining" source from Bug A's close-range rescue: ShiftLineGenerator's gap-fill
+ * connector lines (built by the local `fill()` helper in shift_line_generator.cpp, bridging e.g. an
+ * object's avoid-line end to its return-line start) copy their start_idx/end_idx directly from the
+ * two lines being bridged -- with NO check at all that the resulting index gap satisfies
+ * PathShifter::generate()'s `end_idx - start_idx > 1` requirement. For a small object with small
+ * (or zero-configured) front/rear longitudinal margins on a small ego platform, the avoid-end to
+ * return-start gap (front_constant_distance + rear_constant_distance) can collapse below 2 resampled
+ * path points even though the object is far away (confirmed live: a fresh object at
+ * longitudinal=8.22 m, current_ego_shift=0.0, no BUG-A-RESCUE involvement at all -- this is an
+ * entirely independent failure path). Because PathShifter::generate() rejects its ENTIRE
+ * shift_lines_ list the moment ANY one line fails the index-gap check, this one small connector
+ * freezes the WHOLE avoidance maneuver on the previous spline path every single cycle
+ * (FALLBACK-VISIBILITY fires every cycle, never resolving on its own).
+ *
+ * This function decides what to do with such a connector line:
+ *  - If its index gap is already fine (> 1), return it completely unchanged (`kKeep`).
+ *  - If not, and the connector is FLAT (start_shift_length == end_shift_length, which is always the
+ *    case for the avoid-to-return connector by construction -- see
+ *    ShiftLineGenerator::generateAvoidOutline(), al_return.start_shift_length =
+ *    al_avoid.end_shift_length), it is *provably redundant*: PathShifter's
+ *    apply_linear_shifter()/apply_spline_shifter() apply each shift line's delta cumulatively
+ *    relative to whatever shift is already present at its own end_idx from previously-processed
+ *    lines, and any longitudinal stretch NOT covered by any shift_line simply continues carrying
+ *    forward the last-applied shift value -- exactly what a flat connector would have produced
+ *    anyway. Dropping it (`kDrop`) introduces no discontinuity and lets PathShifter::generate()
+ *    actually succeed instead of failing every cycle.
+ *  - If not flat (a genuine shift-length transition needs to happen across this gap) and it cannot
+ *    be made index-gap-safe without overlapping/reordering neighboring lines, this is a real
+ *    infeasibility. Still return `kDrop` (never hand PathShifter a doomed candidate that takes down
+ *    the entire shift_lines_ list with it) but the caller should log this case loudly -- unlike the
+ *    flat case, dropping here DOES lose a real (if small) shift-length transition.
+ *
+ * @param line the constructed gap-fill connector line (as returned by the local `fill()` helper).
+ * @param flat_shift_length_tolerance [m] treat |end_shift_length - start_shift_length| below this
+ * as "flat" (`kDrop` is then unconditionally safe/lossless).
+ * @return `{kKeep, line unchanged}` if the index gap is already fine; `{kDrop, is_flat}` otherwise,
+ * where `is_flat` tells the caller whether this was the safe/lossless case or the rarer
+ * genuine-transition-lost case (for logging purposes).
+ */
+struct FillGapLineDecision
+{
+  bool keep{true};
+  bool is_flat{true};
+};
+FillGapLineDecision evaluateFillGapShiftLine(
+  const AvoidLine & line, const double flat_shift_length_tolerance = 1e-3);
 
 /**
  * @brief [ASYM-HYSTERESIS 2026-09-04] Apply asymmetric hysteresis to the decision of whether to
@@ -471,6 +582,92 @@ double applyAsymmetricShiftHysteresis(
  * @return true if at least one target object is still ahead of ego (return shift must be held).
  */
 bool existsUnclearedAvoidanceObjectAhead(const ObjectDataArray & target_objects);
+
+/**
+ * @brief [OBSTACLE-CLUSTER 2026-09-04] pure, generic union-find grouping helper: given `n` nodes
+ * (indices 0..n-1) and a list of undirected "these two are in the same group" edges, returns the
+ * connected components (each as a sorted vector of member indices), including transitive merges
+ * (e.g. edges (0,1) and (1,2) put 0, 1, and 2 all in the same group, even though (0,2) is not
+ * itself an edge). Singleton nodes with no edges are returned as their own one-element group.
+ * @param n number of nodes.
+ * @param edges undirected edges (node index pairs).
+ * @return connected components, each a sorted vector of member node indices; groups are ordered by
+ * their smallest member index.
+ */
+std::vector<std::vector<size_t>> unionFindGroups(
+  const size_t n, const std::vector<std::pair<size_t, size_t>> & edges);
+
+/**
+ * @brief [OBSTACLE-CLUSTER 2026-09-04] path-frame distance between two map-frame points: hypot of
+ * the arc-length delta (along `path`, from `ego_pos`) and the lateral-offset delta (perpendicular
+ * distance to `path` at each point's nearest path index). Reuses the exact same projection
+ * utilities (autoware::motion_utils::calcSignedArcLength() for arc-length,
+ * calc_lateral_distance() for lateral offset) already used by
+ * fillLongitudinalAndLengthByClosestEnvelopeFootprint() -- deliberately NOT raw map-frame Euclidean
+ * distance, per the REV-F1 lesson that raw/coarse distance math silently breaks near lanelet
+ * bends/curves. `path` must be a densely-resampled path (e.g. AvoidancePlanningData::reference_path),
+ * not a raw/coarse upstream path.
+ */
+double calcPathFrameDistance(
+  const PathWithLaneId & path, const Point & ego_pos, const Point & p1, const Point & p2);
+
+/**
+ * @brief [OBSTACLE-CLUSTER 2026-09-04] convex hull (map frame) of the union of every member
+ * object's raw shape footprint polygon (autoware_utils::to_polygon2d(object), i.e. the
+ * un-buffered, un-enveloped footprint -- NOT each member's own expanded envelope polygon, so the
+ * envelope buffer margin for the merged/UNKNOWN object type is only applied once, downstream,
+ * exactly like any ordinary single object). Uses the same
+ * boost::geometry::convex_hull()+boost::geometry::correct() pattern already used by
+ * createOneStepPolygon() in this file.
+ * @param members the PredictedObjects being merged into one cluster (must be non-empty).
+ * @return the convex hull polygon, closed and corrected (CW/CCW per boost::geometry::correct()).
+ */
+Polygon2d calcClusterConvexHull(const std::vector<PredictedObject> & members);
+
+/**
+ * @brief [OBSTACLE-CLUSTER 2026-09-04] build one synthetic merged PredictedObject representing a
+ * cluster of nearby objects, per the user's explicit design: classification is always UNKNOWN,
+ * kinematics.initial_twist_with_covariance is always zero (i.e. always treated as static --
+ * SAFETY-RELEVANT: this deliberately bypasses the MOVING_OBJECT filtering path a member's own
+ * velocity would otherwise trigger if it were processed individually), and shape is a POLYGON
+ * whose footprint is calcClusterConvexHull(members) expressed relative to the hull's centroid
+ * (identity orientation, so autoware_utils::to_polygon2d() on the result reproduces the hull
+ * exactly). object_id is deterministically derived from the sorted hex object_ids of `members`, so
+ * that the same underlying member set always yields the same merged object_id across cycles --
+ * this is what lets downstream per-object persisted state (is_avoidance_committed,
+ * hard_margin_infeasible_streak, shift_grow_streak/shift_shrink_streak, stopped_objects_ /
+ * stored_objects_ matching, etc.) accumulate continuity for the merged blob exactly like it would
+ * for any ordinary tracked object, with zero changes to that downstream machinery.
+ * @param members the PredictedObjects being merged into one cluster (must have size() >= 2; a
+ * single-member "cluster" should be passed through unchanged by the caller instead of calling this).
+ * @return the synthetic merged PredictedObject.
+ */
+PredictedObject buildMergedClusterObject(const std::vector<PredictedObject> & members);
+
+/**
+ * @brief [OBSTACLE-CLUSTER 2026-09-04] preprocessing stage, run once per planning cycle BEFORE
+ * per-object filtering (filterTargetObjects()/generateAvoidOutline()/etc.): groups `objects` into
+ * clusters by path-frame distance threshold (calcPathFrameDistance() against each object's raw
+ * detected pose position) using union-find (unionFindGroups()) over an asymmetric-hysteresis edge
+ * graph (edge_states, mutated in place -- fast merge / slow split, mirroring
+ * AvoidanceParameters::shift_hysteresis_in_cycles/out_cycles), then replaces every cluster of size
+ * >= 2 with one buildMergedClusterObject() synthetic object. Clusters of size 1 (i.e. objects with
+ * no close neighbor) are passed through completely unchanged -- this function is therefore a
+ * strict no-op whenever no two objects are within threshold distance of each other.
+ * @param objects raw detected objects for this cycle (already lane/area-filtered, pre-createObjectData).
+ * @param reference_path densely-resampled reference path (AvoidancePlanningData::reference_path).
+ * @param ego_position current ego position.
+ * @param parameters avoidance parameters (obstacle_cluster_max_neighbor_distance,
+ * obstacle_cluster_merge_in_cycles, obstacle_cluster_split_out_cycles, enable_obstacle_clustering).
+ * @param edge_states persistent per-edge hysteresis state, mutated in place across cycles.
+ * @return objects with merged clusters replaced by their synthetic representative; unclustered
+ * objects returned unchanged and in their original relative order (merged objects are appended at
+ * the end).
+ */
+std::vector<PredictedObject> clusterNearbyObjects(
+  const std::vector<PredictedObject> & objects, const PathWithLaneId & reference_path,
+  const Point & ego_position, const std::shared_ptr<AvoidanceParameters> & parameters,
+  ObjectClusterEdgeStateMap & edge_states);
 
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
 
