@@ -2198,13 +2198,20 @@ void StaticObstacleAvoidanceModule::insertStopPoint(
     return;
   }
 
+  if (shifted_path.path.points.empty()) {
+    return;
+  }
+
   const auto stop_idx = [&]() {
     const auto ego_idx = planner_data_->findEgoIndex(shifted_path.path.points);
     for (size_t idx = ego_idx; idx < shifted_path.path.points.size(); ++idx) {
       const auto & estimated_pose = shifted_path.path.points.at(idx).point.pose;
       if (!utils::isEgoWithinOriginalLane(
             data.current_lanelets, estimated_pose, planner_data_->parameters)) {
-        return idx - 1;
+        // NOTE: ego can already be outside the original lane at idx == 0 (e.g. while holding a
+        // shift plan). do not underflow the unsigned index here, it propagates into
+        // calcSignedArcLength() as SIZE_MAX and throws std::out_of_range.
+        return idx == 0 ? idx : idx - 1;
       }
     }
 
