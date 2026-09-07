@@ -4,4 +4,20 @@
       default_retrace_distance_m: 10.0
       min_retrace_distance_m: 1.0
       retrace_velocity_mps: 1.0
-      goal_reach_tolerance_m: 0.5
+      # 2026-09-05: doubled 0.5 -> 1.0 per user request, for the goal-proximity
+      # escape-hatch threshold used by shouldSuppressReversedFollowReactivation()
+      # (reverse-follow-latch bypass fix, see docs/research/reverse-lane-follow-goal-overshoot-fix.md).
+      # NOTE side effect: this same param also gates canTransitSuccessState()'s
+      # goal-reach / success-state check and the retrace-distance goal-proximity
+      # check in scene.cpp/utils.cpp, so doubling it loosens those too, not just
+      # the new latch-bypass use.
+      #
+      # 2026-09-05: reverse-goal-overshoot-vs-braking-distance investigation deliberately left
+      # retrace_velocity_mps UNCHANGED (considered reducing it to shrink required braking distance,
+      # v^2/(2*|a|), but this param is dual-use per the note above and was just raised today to fix
+      # a separate, more severe bug -- the goal stop being skipped entirely near lanelet boundaries.
+      # Reducing it risks reopening that regression. The overshoot is instead fully addressed via
+      # pid.param.yaml's stopping_state_stop_dist (braking-distance runway) and
+      # emergency_state_overshoot_stop_dist (tightened backstop) at this v=1.0 m/s value -- see
+      # pid.param.yaml comments for the v^2/(2*|a|) math.
+      goal_reach_tolerance_m: 1.0

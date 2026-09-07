@@ -112,6 +112,25 @@ private:
   // manager creates a *brand-new* ReverseLaneFollowModule via createNewSceneModuleInstance() for
   // every activation attempt, so a plain instance member here would reset on every single
   // re-attempt and never actually suppress anything (confirmed live).
+  //
+  // [BIDIR-BUG-FIX #3] This one-way latch resurfaced the exact bug commit 4f4bc9378 ("stop at
+  // goal on reversed final approach") had already fixed: goals commonly sit right at a lanelet
+  // boundary, exactly where getClosestLaneletWithinRoute()'s lack of hysteresis is most likely to
+  // fire a spurious true->false transition -- if that transition latches the goal's own lanelet
+  // (or any lanelet ego re-enters while still approaching the goal), plan() falls back to
+  // getPreviousModuleOutput() permanently for that lanelet, which carries none of
+  // buildRouteReversedFollowPath()'s goal-truncation/zero-velocity injection: ego drives straight
+  // through the goal with no stop. Narrowed (not removed -- the original flip-flop bug this latch
+  // exists for is still real) via two complementary, goal-scoped exemptions in
+  // updateRouteReversedFollow():
+  //   1. Never arm the latch for a lanelet where route_handler->isInGoalRouteSection() is true
+  //      (see the exemption at the point the latch is set).
+  //   2. Even if the latch is already armed for a lanelet in the newly-built follow window, allow
+  //      reactivation anyway once ego is within parameters_->goal_reach_tolerance_m of
+  //      route_handler->getGoalPose() (see reverse_lane_follow_utils::
+  //      shouldSuppressReversedFollowReactivation() in utils.hpp).
+  // Both are narrow, goal-scoped bypasses -- the latch still suppresses exactly as before for any
+  // lanelet far from the goal.
   std::shared_ptr<std::optional<lanelet::Id>> last_exited_inverted_lanelet_id_;
 
   std::shared_ptr<ReverseLaneFollowParameters> parameters_;

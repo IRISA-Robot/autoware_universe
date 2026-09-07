@@ -308,19 +308,17 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
     [&route_handler](const auto & llt) { return route_handler->isInGoalRouteSection(llt); });
   if (sequence_contains_goal) {
     const auto goal_pose = route_handler->getGoalPose();
-    const size_t goal_idx =
-      autoware::motion_utils::findNearestIndex(path.points, goal_pose.position);
-    if (goal_idx + 1 < path.points.size()) {
-      path.points.resize(goal_idx + 1);
-    }
-    if (!path.points.empty()) {
-      path.points.back().point.longitudinal_velocity_mps = 0.0F;
-    }
+    // [BIDIR-BUG-FIX #4] Inserts an exact point at goal_pose (interpolated via
+    // insertTargetPoint()) instead of snapping to the nearest existing resampled point -- see
+    // truncatePathAtGoal()'s doc comment in utils.hpp for why the old findNearestIndex()-only
+    // truncation could overshoot the true goal by up to one waypoint-spacing.
+    truncatePathAtGoal(path, goal_pose);
     RCLCPP_WARN_THROTTLE(
       logger, steady_clock, 2000,
       "[BIDIR-DEBUG] buildRouteReversedFollowPath: goal is within this window's lanelet "
-      "sequence -- truncated path to goal_idx=%zu and forced zero velocity there",
-      goal_idx);
+      "sequence -- truncated path to exact goal pose (%.2f, %.2f), %zu points remain, forced "
+      "zero velocity at the new end point",
+      goal_pose.position.x, goal_pose.position.y, path.points.size());
   } else if (forward_end_is_genuine_discontinuity) {
     // [BIDIR-BUG-FIX #2] The forward walk stopped short of the raw window's own end because
     // isHeadingContinuousAcross() found a genuine ~180 degree flip right after
@@ -356,6 +354,56 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
     path.points.back().point.longitudinal_velocity_mps);
 
   return RouteReversedFollow{path, lanelet_sequence};
+}
+
+bool shouldSuppressReversedFollowReactivation(
+  const std::optional<lanelet::Id> & last_exited_inverted_lanelet_id,
+  const lanelet::ConstLanelets & follow_lanelets, const double distance_to_goal_m,
+  const double goal_reach_tolerance_m)
+{
+  if (!last_exited_inverted_lanelet_id.has_value()) {
+    return false;
+  }
+
+  const bool follow_contains_latched_lanelet = std::any_of(
+    follow_lanelets.begin(), follow_lanelets.end(), [&](const auto & llt) {
+      return llt.id() == last_exited_inverted_lanelet_id.value();
+    });
+  if (!follow_contains_latched_lanelet) {
+    return false;
+  }
+
+  // [BIDIR-BUG-FIX #3] Goal-proximity escape hatch -- see this function's doc comment in
+  // utils.hpp. Never let the latch withhold the goal-stop itself.
+  const bool ego_near_goal = distance_to_goal_m < goal_reach_tolerance_m;
+  return !ego_near_goal;
+}
+
+void truncatePathAtGoal(PathWithLaneId & path, const Pose & goal_pose)
+{
+  if (path.points.empty()) {
+    return;
+  }
+
+  const auto goal_seg_idx =
+    autoware::motion_utils::findNearestSegmentIndex(path.points, goal_pose.position);
+  const auto insert_idx =
+    autoware::motion_utils::insertTargetPoint(goal_seg_idx, goal_pose.position, path.points, 1e-3);
+
+  size_t goal_idx = 0;
+  if (insert_idx) {
+    goal_idx = insert_idx.value();
+  } else {
+    // insertTargetPoint() declined to insert (e.g. goal_pose is ~coincident with an existing
+    // point, or its sharp-angle/overlap guard tripped) -- fall back to the previous (less
+    // precise) nearest-existing-sample behavior rather than leaving the path untruncated.
+    goal_idx = autoware::motion_utils::findNearestIndex(path.points, goal_pose.position);
+  }
+
+  if (goal_idx + 1 < path.points.size()) {
+    path.points.resize(goal_idx + 1);
+  }
+  path.points.back().point.longitudinal_velocity_mps = 0.0F;
 }
 
 }  // namespace autoware::behavior_path_planner::reverse_lane_follow_utils

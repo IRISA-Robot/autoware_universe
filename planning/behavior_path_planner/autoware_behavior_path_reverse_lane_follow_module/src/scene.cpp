@@ -30,6 +30,7 @@ namespace autoware::behavior_path_planner
 using reverse_lane_follow_utils::buildRouteReversedFollowPath;
 using reverse_lane_follow_utils::extractTraveledTailPath;
 using reverse_lane_follow_utils::reversePathForRetrace;
+using reverse_lane_follow_utils::shouldSuppressReversedFollowReactivation;
 
 ReverseLaneFollowModule::ReverseLaneFollowModule(
   const std::string & name, rclcpp::Node & node,
@@ -141,12 +142,33 @@ void ReverseLaneFollowModule::updateRouteReversedFollow()
   // recorded a true->false exit from, this is boundary-line noise re-arming the module, not a
   // genuine new reversed segment -- suppress it (treat exactly like the nullopt case below). See
   // last_exited_inverted_lanelet_id_'s doc comment in scene.hpp for why this is safe/expected.
-  const bool reactivation_suppressed =
+  //
+  // [BIDIR-BUG-FIX #3] ...UNLESS ego is close enough to the actual goal that suppressing here
+  // would drop the goal-stop entirely -- see shouldSuppressReversedFollowReactivation()'s doc
+  // comment in utils.hpp for the full rationale (goals commonly sit right at a lanelet boundary,
+  // exactly where this latch is most likely to have already fired spuriously).
+  const double distance_to_goal_m =
+    autoware_utils::calc_distance2d(getEgoPose(), planner_data_->route_handler->getGoalPose());
+  const bool follow_contains_latched_lanelet =
     follow && last_exited_inverted_lanelet_id_->has_value() &&
     std::any_of(
       follow->lanelets.begin(), follow->lanelets.end(), [&](const auto & llt) {
         return llt.id() == last_exited_inverted_lanelet_id_->value();
       });
+  const bool reactivation_suppressed =
+    follow && shouldSuppressReversedFollowReactivation(
+                *last_exited_inverted_lanelet_id_, follow->lanelets, distance_to_goal_m,
+                parameters_->goal_reach_tolerance_m);
+
+  if (follow_contains_latched_lanelet && !reactivation_suppressed) {
+    RCLCPP_WARN(
+      getLogger(),
+      "[BIDIR-DEBUG] one-way latch BYPASSED (goal proximity): ego=(%.2f, %.2f) is %.2fm from "
+      "goal (< goal_reach_tolerance_m=%.2f) -- allowing reversed-follow reactivation despite "
+      "prior exit latch on lanelet_id=%ld, so the goal-truncation stop point is not lost",
+      getEgoPose().position.x, getEgoPose().position.y, distance_to_goal_m,
+      parameters_->goal_reach_tolerance_m, last_exited_inverted_lanelet_id_->value());
+  }
 
   if (!follow || reactivation_suppressed) {
     // [BIDIR-DEBUG] edge-triggered, UNTHROTTLED (unlike buildRouteReversedFollowPath's own
@@ -159,7 +181,23 @@ void ReverseLaneFollowModule::updateRouteReversedFollow()
     // disappearing: plan() falls back to getPreviousModuleOutput() every time this is inactive.
     if (was_active) {
       if (!previously_active_lanelets.empty()) {
-        *last_exited_inverted_lanelet_id_ = previously_active_lanelets.back().id();
+        const auto & exited_lanelet = previously_active_lanelets.back();
+        // [BIDIR-BUG-FIX #3] Never arm the latch for the lanelet that actually contains the
+        // route's goal. This is the proactive counterpart to the goal-proximity escape hatch
+        // above: if the exit we are about to latch IS the goal's own lanelet, a spurious
+        // true->false transition here is exactly the boundary-noise case the latch cannot be
+        // allowed to punish, since re-entering this exact lanelet is also how the final approach
+        // reaches (and stops at) the goal itself.
+        if (planner_data_->route_handler->isInGoalRouteSection(exited_lanelet)) {
+          RCLCPP_WARN(
+            getLogger(),
+            "[BIDIR-DEBUG] one-way latch NOT armed for lanelet_id=%ld: isInGoalRouteSection() is "
+            "true -- exempting the goal's own lanelet from the latch so a boundary-noise exit "
+            "there can never permanently suppress the final approach's goal-stop",
+            exited_lanelet.id());
+        } else {
+          *last_exited_inverted_lanelet_id_ = exited_lanelet.id();
+        }
       }
       RCLCPP_WARN(
         getLogger(),

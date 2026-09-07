@@ -131,6 +131,58 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
   const std::shared_ptr<RouteHandler> & route_handler, const Pose & ego_pose,
   const double backward_distance_m, const double forward_distance_m);
 
+/**
+ * @brief Pure decision function for the one-way reverse-follow reactivation latch (see
+ * ReverseLaneFollowModule::last_exited_inverted_lanelet_id_'s doc comment in scene.hpp for the
+ * latch's full rationale: it exists to stop getClosestLaneletWithinRoute()'s lack of hysteresis
+ * from flip-flopping activation at a mid-route direction-change boundary, not to ever withhold
+ * the goal-stop itself).
+ *
+ * [BIDIR-BUG-FIX #3] Goal-proximity escape hatch: goals are commonly placed right at/near a
+ * lanelet boundary -- exactly where the latch above is most likely to have already fired once,
+ * spuriously, before ego has actually reached the goal. If the latch is allowed to suppress
+ * reactivation there, plan() falls back to getPreviousModuleOutput() for the rest of the
+ * approach, which carries none of buildRouteReversedFollowPath()'s goal-truncation/zero-velocity
+ * injection -- the vehicle drives straight through the goal with no stop at all. So: once ego is
+ * within `goal_reach_tolerance_m` of the actual goal, the latch must never suppress reactivation,
+ * regardless of which lanelet it was armed for. Exposed as a standalone pure function (no
+ * RouteHandler/ROS-node dependency) so it is unit-testable, matching this module's existing
+ * pure-logic test convention (see test/test_reverse_lane_follow_utils.cpp).
+ *
+ * @param last_exited_inverted_lanelet_id current latch state (nullopt = latch not armed at all)
+ * @param follow_lanelets lanelet sequence buildRouteReversedFollowPath() just returned for this
+ *        cycle
+ * @param distance_to_goal_m ego's current straight-line distance to route_handler->getGoalPose()
+ * @param goal_reach_tolerance_m same tolerance canTransitSuccessState() already uses to judge
+ *        "close enough to the goal" for retrace paths -- reused here rather than inventing a new
+ *        threshold, per this module's existing goal-proximity convention.
+ * @return true if reactivation should be suppressed (latch fires this cycle), false otherwise
+ *         (either the latch isn't armed for any lanelet in follow_lanelets, or ego is close
+ *         enough to the goal that the latch is bypassed).
+ */
+bool shouldSuppressReversedFollowReactivation(
+  const std::optional<lanelet::Id> & last_exited_inverted_lanelet_id,
+  const lanelet::ConstLanelets & follow_lanelets, const double distance_to_goal_m,
+  const double goal_reach_tolerance_m);
+
+/**
+ * @brief Truncate `path` at the exact geometric location of `goal_pose`: inserts an interpolated
+ * point exactly at goal_pose (via autoware::motion_utils::insertTargetPoint()) rather than
+ * snapping to the nearest existing resampled point, then forces zero velocity at that new point
+ * and drops everything after it.
+ *
+ * [BIDIR-BUG-FIX #4] buildRouteReversedFollowPath()'s goal-truncation previously used
+ * findNearestIndex() alone, which can only land on an *existing* path sample -- for a sliding
+ * window resampled at, say, 1m spacing, that can overshoot the true goal by up to ~1 waypoint
+ * spacing before the zero-velocity point takes effect. Using insertTargetPoint() to add an exact
+ * point at goal_pose closes that gap. Falls back to the old nearest-existing-sample behavior if
+ * insertTargetPoint() declines to insert (e.g. goal_pose is ~coincident with an existing point, or
+ * its sharp-angle/overlap guard trips) rather than leaving the path untruncated.
+ *
+ * No-op if `path` is empty.
+ */
+void truncatePathAtGoal(PathWithLaneId & path, const Pose & goal_pose);
+
 }  // namespace autoware::behavior_path_planner::reverse_lane_follow_utils
 
 #endif  // AUTOWARE__BEHAVIOR_PATH_REVERSE_LANE_FOLLOW_MODULE__UTILS_HPP_
