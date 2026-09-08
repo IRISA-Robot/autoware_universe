@@ -44,10 +44,27 @@ void ReverseLaneFollowModuleManager::init(rclcpp::Node * node)
     node->declare_parameter<double>(ns + "retrace_velocity_mps", p.retrace_velocity_mps);
   p.goal_reach_tolerance_m =
     node->declare_parameter<double>(ns + "goal_reach_tolerance_m", p.goal_reach_tolerance_m);
+  // [BIDIR-BUG-FIX #5/#6] goal-overshoot fix (2026-09-06): conservative deceleration magnitude
+  // for reverse_lane_follow_utils::applyGoalDecelerationRamp() -- see data_structs.hpp for the
+  // full rationale and physics.
+  p.goal_stop_decel_mps2 =
+    node->declare_parameter<double>(ns + "goal_stop_decel_mps2", p.goal_stop_decel_mps2);
+  // [BIDIR-BUG-FIX #7/#8] goal-overshoot fix continued (2026-09-07): see data_structs.hpp for the
+  // full rationale for both new params.
+  p.goal_decel_ramp_resample_interval_m = node->declare_parameter<double>(
+    ns + "goal_decel_ramp_resample_interval_m", p.goal_decel_ramp_resample_interval_m);
+  p.reactive_goal_clamp_trigger_distance_m = node->declare_parameter<double>(
+    ns + "reactive_goal_clamp_trigger_distance_m", p.reactive_goal_clamp_trigger_distance_m);
+  p.reactive_goal_clamp_velocity_mps = node->declare_parameter<double>(
+    ns + "reactive_goal_clamp_velocity_mps", p.reactive_goal_clamp_velocity_mps);
   p.route_reversed_forward_distance_m = node->declare_parameter<double>(
     ns + "route_reversed_forward_distance_m", p.route_reversed_forward_distance_m);
   p.route_reversed_backward_distance_m = node->declare_parameter<double>(
     ns + "route_reversed_backward_distance_m", p.route_reversed_backward_distance_m);
+  // [BIDIR-BUG-FIX #10] ARRIVED-state fix (2026-09-07): see data_structs.hpp for the full
+  // rationale.
+  p.arrived_stop_velocity_mps =
+    node->declare_parameter<double>(ns + "arrived_stop_velocity_mps", p.arrived_stop_velocity_mps);
 
   parameters_ = std::make_shared<ReverseLaneFollowParameters>(p);
 
@@ -70,10 +87,20 @@ void ReverseLaneFollowModuleManager::updateModuleParams(
   update_param<double>(parameters, ns + "min_retrace_distance_m", p->min_retrace_distance_m);
   update_param<double>(parameters, ns + "retrace_velocity_mps", p->retrace_velocity_mps);
   update_param<double>(parameters, ns + "goal_reach_tolerance_m", p->goal_reach_tolerance_m);
+  update_param<double>(parameters, ns + "goal_stop_decel_mps2", p->goal_stop_decel_mps2);
+  update_param<double>(
+    parameters, ns + "goal_decel_ramp_resample_interval_m", p->goal_decel_ramp_resample_interval_m);
+  update_param<double>(
+    parameters, ns + "reactive_goal_clamp_trigger_distance_m",
+    p->reactive_goal_clamp_trigger_distance_m);
+  update_param<double>(
+    parameters, ns + "reactive_goal_clamp_velocity_mps", p->reactive_goal_clamp_velocity_mps);
   update_param<double>(
     parameters, ns + "route_reversed_forward_distance_m", p->route_reversed_forward_distance_m);
   update_param<double>(
     parameters, ns + "route_reversed_backward_distance_m", p->route_reversed_backward_distance_m);
+  update_param<double>(
+    parameters, ns + "arrived_stop_velocity_mps", p->arrived_stop_velocity_mps);
 
   std::for_each(observers_.begin(), observers_.end(), [&p](const auto & observer) {
     if (!observer.expired()) observer.lock()->updateModuleParams(p);

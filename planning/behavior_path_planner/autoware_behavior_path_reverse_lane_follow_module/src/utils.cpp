@@ -142,7 +142,9 @@ PathWithLaneId reversePathForRetrace(
 
 std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
   const std::shared_ptr<RouteHandler> & route_handler, const Pose & ego_pose,
-  const double backward_distance_m, const double forward_distance_m)
+  const double backward_distance_m, const double forward_distance_m,
+  const double cruise_velocity_mps, const double goal_decel_mps2,
+  const double goal_decel_ramp_resample_interval_m)
 {
   // [BIDIR-DEBUG] temporary diagnostic logging for the "trajectory doesn't follow reversed
   // lanelet / control goes the wrong way" investigation. Remove once root cause is confirmed
@@ -291,6 +293,25 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
       -std::abs(path_point.point.longitudinal_velocity_mps);
   }
 
+  // [BIDIR-BUG-FIX #5] (2026-09-06 goal-overshoot investigation) Cap the raw centerline velocity
+  // (just negated above) at cruise_velocity_mps (caller passes parameters_->retrace_velocity_mps)
+  // instead of letting it ride at whatever the underlying lanelet's speed_limit happens to be --
+  // see capReverseFollowCruiseVelocity()'s doc comment in utils.hpp for the live-confirmed
+  // evidence (a 1.389 m/s lanelet speed_limit vs. this module's own intended 1.0 m/s reverse
+  // speed).
+  const float pre_cap_max_speed_mps = path.points.empty() ? 0.0F : std::max_element(
+    path.points.begin(), path.points.end(),
+    [](const auto & a, const auto & b) {
+      return std::abs(a.point.longitudinal_velocity_mps) <
+             std::abs(b.point.longitudinal_velocity_mps);
+    })->point.longitudinal_velocity_mps;
+  capReverseFollowCruiseVelocity(path, cruise_velocity_mps);
+  RCLCPP_WARN_THROTTLE(
+    logger, steady_clock, 2000,
+    "[BIDIR-DEBUG] buildRouteReversedFollowPath: cruise-speed cap applied -- raw max speed on "
+    "this window was %.3f m/s, capped to cruise_velocity_mps=%.3f m/s",
+    std::abs(pre_cap_max_speed_mps), std::abs(cruise_velocity_mps));
+
   // [BIDIR-BUG-FIX] Unlike reversePathForRetrace() (which always stops at the end of its tail
   // path) or the normal forward-driving path (which goes through
   // DefaultFixedGoalPlanner::modifyPathForSmoothGoalConnection() and always gets a hard
@@ -319,6 +340,52 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
       "sequence -- truncated path to exact goal pose (%.2f, %.2f), %zu points remain, forced "
       "zero velocity at the new end point",
       goal_pose.position.x, goal_pose.position.y, path.points.size());
+
+    // [BIDIR-BUG-FIX #7] (2026-09-07 continued-overshoot investigation) Densify the path near the
+    // goal BEFORE ramping -- see densifyPathNearGoal()'s doc comment in utils.hpp. Without this,
+    // applyGoalDecelerationRamp() only has whatever native centerline waypoints happen to exist
+    // near the goal to act on, which can be too sparse (live-confirmed: ~2m gaps) to produce a
+    // real gradual slowdown regardless of the ramp formula being applied correctly. Span sized
+    // exactly to the ramp's own full braking distance (v^2 / (2*|decel|)) -- nothing farther back
+    // than the ramp could ever reach needs densifying.
+    const double decel_abs = std::abs(goal_decel_mps2);
+    const double ramp_span_m = (decel_abs < 1e-6)
+                                  ? 0.0
+                                  : (cruise_velocity_mps * cruise_velocity_mps) / (2.0 * decel_abs);
+    const size_t pre_densify_point_count = path.points.size();
+    densifyPathNearGoal(path, ramp_span_m, goal_decel_ramp_resample_interval_m);
+    RCLCPP_WARN_THROTTLE(
+      logger, steady_clock, 2000,
+      "[BIDIR-DEBUG] buildRouteReversedFollowPath: goal-approach densify applied -- ramp_span_m="
+      "%.3f, max_spacing_m=%.3f, point count %zu -> %zu",
+      ramp_span_m, goal_decel_ramp_resample_interval_m, pre_densify_point_count,
+      path.points.size());
+
+    // [BIDIR-BUG-FIX #6] (2026-09-06 goal-overshoot investigation) The truncation above places an
+    // exact, geometrically-correct zero-velocity point at the goal -- but until now every
+    // preceding point still rode at the (now cruise-capped, see BIDIR-BUG-FIX #5 above) cruise
+    // speed right up to that last point, i.e. an abrupt single-cycle drop to zero with no
+    // deceleration shaping at all. Apply a conservative backward-pass decel ramp so the commanded
+    // trajectory itself gradually slows down approaching the goal -- see
+    // applyGoalDecelerationRamp()'s doc comment in utils.hpp for the physics and reasoning.
+    applyGoalDecelerationRamp(path, goal_decel_mps2);
+    {
+      // [BIDIR-DEBUG] Sample a few points near the goal so a future investigation can see the
+      // ramp working (or not) immediately from logs, per this session's logging convention.
+      std::string sample_str;
+      const size_t n = path.points.size();
+      const size_t sample_count = std::min<size_t>(5, n);
+      for (size_t k = 0; k < sample_count; ++k) {
+        const size_t idx = n - sample_count + k;
+        sample_str += "[" + std::to_string(idx) + "]=" +
+                      std::to_string(path.points[idx].point.longitudinal_velocity_mps) + " ";
+      }
+      RCLCPP_WARN_THROTTLE(
+        logger, steady_clock, 2000,
+        "[BIDIR-DEBUG] buildRouteReversedFollowPath: goal-decel ramp applied -- "
+        "goal_decel_mps2=%.3f, last %zu point velocities (m/s) approaching the goal: %s",
+        std::abs(goal_decel_mps2), sample_count, sample_str.c_str());
+    }
   } else if (forward_end_is_genuine_discontinuity) {
     // [BIDIR-BUG-FIX #2] The forward walk stopped short of the raw window's own end because
     // isHeadingContinuousAcross() found a genuine ~180 degree flip right after
@@ -404,6 +471,202 @@ void truncatePathAtGoal(PathWithLaneId & path, const Pose & goal_pose)
     path.points.resize(goal_idx + 1);
   }
   path.points.back().point.longitudinal_velocity_mps = 0.0F;
+}
+
+void capReverseFollowCruiseVelocity(PathWithLaneId & path, const double cruise_velocity_mps)
+{
+  const float cap_mps = static_cast<float>(std::abs(cruise_velocity_mps));
+  for (auto & path_point : path.points) {
+    const float raw_speed_mps = std::abs(path_point.point.longitudinal_velocity_mps);
+    const float capped_speed_mps = std::min(raw_speed_mps, cap_mps);
+    // Preserve the existing sign convention (this module always emits reverse/negative velocity
+    // for this path -- see buildRouteReversedFollowPath()'s -std::abs() assignment right before
+    // this is called) rather than assuming a sign here.
+    const float sign = (path_point.point.longitudinal_velocity_mps < 0.0F) ? -1.0F : 1.0F;
+    path_point.point.longitudinal_velocity_mps = sign * capped_speed_mps;
+  }
+}
+
+void applyGoalDecelerationRamp(PathWithLaneId & path, const double decel_mps2)
+{
+  const double decel = std::abs(decel_mps2);
+  if (path.points.size() < 2 || decel < 1e-6) {
+    // Fewer than 2 points: nothing to ramp over. ~Zero decel: sqrt(2*0*d) == 0 for every point,
+    // which would zero out the entire path rather than leaving it as a no-op -- guard against a
+    // misconfigured param doing that.
+    return;
+  }
+
+  double distance_to_goal_m = 0.0;
+  // Tracks the smallest index the loop below actually modifies -- i.e. the farthest-from-goal
+  // point the backward physics pass reaches into. Starts at points.size()-1 (the goal point
+  // itself) so the forward clean-up pass below is a no-op if the backward pass never modifies
+  // anything (physics limit already looser than cruise speed everywhere).
+  size_t ramp_region_start_idx = path.points.size() - 1;
+  // path.points.back() is expected to already be the exact, zero-velocity goal point (see
+  // truncatePathAtGoal()) -- start the backward walk from the point just before it.
+  for (size_t i = path.points.size() - 1; i-- > 0;) {
+    distance_to_goal_m +=
+      autoware_utils::calc_distance2d(
+        path.points[i].point.pose.position, path.points[i + 1].point.pose.position);
+
+    const double v_limit_mps = std::sqrt(2.0 * decel * distance_to_goal_m);
+    const float current_speed_mps = std::abs(path.points[i].point.longitudinal_velocity_mps);
+    if (v_limit_mps >= current_speed_mps) {
+      // This point is already far enough from the goal that the physics limit exceeds its
+      // (already cruise-capped) speed -- no clamp needed here. Every earlier point (walking
+      // further backward) is at least as far from the goal, so the limit there is at least as
+      // loose too -- safe to stop the backward walk here rather than scanning the whole path.
+      // (The forward clean-up pass below is what guarantees full monotonicity regardless of this
+      // early exit -- see its own comment.)
+      break;
+    }
+
+    const float sign = (path.points[i].point.longitudinal_velocity_mps < 0.0F) ? -1.0F : 1.0F;
+    path.points[i].point.longitudinal_velocity_mps = sign * static_cast<float>(v_limit_mps);
+    ramp_region_start_idx = i;
+  }
+
+  // [BIDIR-BUG-FIX #7] (2026-09-07 continued-overshoot investigation) Forward monotonicity
+  // clean-up pass, added on top of the backward physics pass above. The backward pass alone
+  // clamps each point to sqrt(2*decel*distance_to_goal_m) -- a valid "can still physically brake
+  // to 0 in the remaining distance" bound in isolation -- but that bound is computed from
+  // ABSOLUTE distance-to-goal, not from the (possibly already-slower) point immediately behind
+  // it. When the raw/cruise-capped input speed is itself non-monotonic along the path (live-
+  // confirmed: a point ~2m from the goal sitting on a naturally-faster stretch, ~1.1455 m/s,
+  // while points several meters farther back sat on a naturally-slower upstream curve, ~0.833
+  // m/s), the backward pass alone can leave a point CLOSER to the goal faster than one farther
+  // away -- a real, published, non-monotonic "slows down, speeds back up, then instant stop"
+  // velocity bump, exactly the symptom this investigation's live evidence showed.
+  //
+  // Deliberately scoped to [ramp_region_start_idx, end] only -- NOT the whole path -- by
+  // comparing each point from ramp_region_start_idx onward to its immediate predecessor (which
+  // may itself be just outside the ramp-affected region, i.e. the untouched cruise/raw-speed
+  // point the ramp region borders). Points before ramp_region_start_idx (never touched by the
+  // backward pass, because the physics limit there was already looser than their raw/cruise
+  // speed) are left completely alone: an unrelated slow curve far earlier in the path (nothing to
+  // do with this goal) must not permanently cap every faster point after it for the rest of the
+  // path -- only the ramp's own region, and its one shared boundary with whatever precedes it, is
+  // ever clamped here. Only ever reduces a velocity further (never increases it, preserving every
+  // other function's "only clamps down" principle), and is a no-op whenever the backward pass's
+  // output was already monotonic (the common case of uniform/monotonic raw speed).
+  for (size_t i = ramp_region_start_idx; i < path.points.size(); ++i) {
+    if (i == 0) {
+      continue;
+    }
+    const float prev_mag = std::abs(path.points[i - 1].point.longitudinal_velocity_mps);
+    const float this_mag = std::abs(path.points[i].point.longitudinal_velocity_mps);
+    if (this_mag > prev_mag) {
+      const float sign = (path.points[i].point.longitudinal_velocity_mps < 0.0F) ? -1.0F : 1.0F;
+      path.points[i].point.longitudinal_velocity_mps = sign * prev_mag;
+    }
+  }
+}
+
+void densifyPathNearGoal(PathWithLaneId & path, const double max_span_m, const double max_spacing_m)
+{
+  if (path.points.size() < 2 || max_spacing_m < 1e-3 || max_span_m < 1e-3) {
+    return;
+  }
+
+  // Walk backward from the terminal (goal) point, same traversal direction/idiom as
+  // applyGoalDecelerationRamp(), to find how far back (index-wise) densification needs to reach.
+  // Always includes at least the final segment (guaranteed by decrementing at least once before
+  // checking the span), even if that single segment alone already exceeds max_span_m -- that is
+  // exactly the pathological "one huge terminal segment" case that must still be densified.
+  double cumulative_m = 0.0;
+  size_t first_idx = path.points.size() - 1;
+  while (first_idx > 0) {
+    const double seg_len = autoware_utils::calc_distance2d(
+      path.points[first_idx - 1].point.pose.position, path.points[first_idx].point.pose.position);
+    --first_idx;
+    cumulative_m += seg_len;
+    if (cumulative_m >= max_span_m) {
+      break;
+    }
+  }
+
+  // Rebuild points[first_idx .. end] with every original segment longer than max_spacing_m
+  // subdivided into evenly spaced interpolated points. Original points are preserved exactly
+  // (same pose, velocity, lane ids); only new interpolated points are added in between.
+  std::vector<autoware_internal_planning_msgs::msg::PathPointWithLaneId> rebuilt;
+  rebuilt.push_back(path.points[first_idx]);
+  for (size_t i = first_idx + 1; i < path.points.size(); ++i) {
+    const auto & from_point = path.points[i - 1];
+    const auto & to_point = path.points[i];
+    const double seg_len = autoware_utils::calc_distance2d(
+      from_point.point.pose.position, to_point.point.pose.position);
+    const int n_extra = static_cast<int>(std::floor(seg_len / max_spacing_m));
+    for (int k = 1; k <= n_extra; ++k) {
+      const double t = static_cast<double>(k) / static_cast<double>(n_extra + 1);
+      auto pt = from_point;
+      pt.point.pose.position.x =
+        from_point.point.pose.position.x +
+        t * (to_point.point.pose.position.x - from_point.point.pose.position.x);
+      pt.point.pose.position.y =
+        from_point.point.pose.position.y +
+        t * (to_point.point.pose.position.y - from_point.point.pose.position.y);
+      pt.point.pose.position.z =
+        from_point.point.pose.position.z +
+        t * (to_point.point.pose.position.z - from_point.point.pose.position.z);
+      // Orientation/lane-id metadata: reuse the point closer to the goal (to_point) -- an
+      // adequate approximation over a span this short; velocity: copy from_point's (the *faster*
+      // of the two endpoints, since this module's paths always slow down toward the goal) so this
+      // placeholder never reads as "already ramped" before applyGoalDecelerationRamp() runs --
+      // that function re-shapes every one of these new points' velocity immediately after this
+      // call regardless.
+      pt.point.pose.orientation = to_point.point.pose.orientation;
+      pt.point.longitudinal_velocity_mps = from_point.point.longitudinal_velocity_mps;
+      rebuilt.push_back(pt);
+    }
+    rebuilt.push_back(to_point);
+  }
+
+  path.points.erase(path.points.begin() + static_cast<std::ptrdiff_t>(first_idx), path.points.end());
+  path.points.insert(path.points.end(), rebuilt.begin(), rebuilt.end());
+}
+
+void clampVelocityNearEgoWhenCloseToGoal(
+  PathWithLaneId & path, const Pose & ego_pose, const bool goal_within_follow_window,
+  const double distance_to_goal_m, const double trigger_distance_m,
+  const double clamp_velocity_mps)
+{
+  if (!goal_within_follow_window || distance_to_goal_m >= trigger_distance_m) {
+    // [BIDIR-BUG-FIX #8] Narrow, goal-scoped gating -- mirrors
+    // shouldSuppressReversedFollowReactivation()'s own discipline so this reactive layer can never
+    // fire far from any actual goal (e.g. mid-route on an ordinary reversed stretch with no goal
+    // anywhere nearby).
+    return;
+  }
+
+  const float clamp_mps = static_cast<float>(std::abs(clamp_velocity_mps));
+  for (auto & path_point : path.points) {
+    const double dist_to_ego =
+      autoware_utils::calc_distance2d(ego_pose.position, path_point.point.pose.position);
+    if (dist_to_ego > trigger_distance_m) {
+      // Only clamp points near ego's current position -- a (possibly much longer) follow window
+      // farther away is left to whatever truncatePathAtGoal()/densifyPathNearGoal()/
+      // applyGoalDecelerationRamp() already computed for it.
+      continue;
+    }
+    const float current_speed_mps = std::abs(path_point.point.longitudinal_velocity_mps);
+    if (current_speed_mps <= clamp_mps) {
+      // Never increase a point's velocity -- same principle as every other velocity-shaping
+      // helper in this file.
+      continue;
+    }
+    const float sign = (path_point.point.longitudinal_velocity_mps < 0.0F) ? -1.0F : 1.0F;
+    path_point.point.longitudinal_velocity_mps = sign * clamp_mps;
+  }
+}
+
+bool isEgoArrivedAndStoppedAtGoal(
+  const double distance_to_goal_m, const double ego_speed_mps,
+  const double goal_reach_tolerance_m, const double arrived_stop_velocity_mps)
+{
+  const bool ego_within_goal_tolerance = distance_to_goal_m < goal_reach_tolerance_m;
+  const bool ego_genuinely_stopped = std::abs(ego_speed_mps) < arrived_stop_velocity_mps;
+  return ego_within_goal_tolerance && ego_genuinely_stopped;
 }
 
 }  // namespace autoware::behavior_path_planner::reverse_lane_follow_utils

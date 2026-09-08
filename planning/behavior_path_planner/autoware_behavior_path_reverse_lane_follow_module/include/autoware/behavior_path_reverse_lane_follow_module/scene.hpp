@@ -91,6 +91,14 @@ private:
   // buildRouteReversedFollowPath().
   void updateRouteReversedFollow();
 
+  // [BIDIR-BUG-FIX #10] (2026-09-07 ARRIVED-state investigation) Ego's current speed magnitude
+  // (m/s) from planner_data_->self_odometry, or 0.0 if unavailable (defensive -- self_odometry
+  // should always be populated by the time this module runs, but this avoids a null-deref on any
+  // as-yet-unobserved call ordering). Shared by updateRouteReversedFollow() (goal-approach hold
+  // decision) and canTransitSuccessState() (route_reversed_path success decision) so both use the
+  // exact same live speed reading for the same planning cycle.
+  double getEgoSpeedMps() const;
+
   // [BIDIR-BUG-FIX] One-way latch used to stop is_route_reversed_active from flip-flopping right
   // at a mid-route direction-change boundary (e.g. taman map's 18(inv) -> 291(fwd)):
   // getClosestLaneletWithinRoute() has no hysteresis, so as ego's pose sits within centimeters of

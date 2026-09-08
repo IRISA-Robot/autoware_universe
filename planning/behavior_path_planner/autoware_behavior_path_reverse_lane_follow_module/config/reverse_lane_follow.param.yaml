@@ -3,7 +3,7 @@
     reverse_lane_follow:
       default_retrace_distance_m: 10.0
       min_retrace_distance_m: 1.0
-      retrace_velocity_mps: 1.0
+      retrace_velocity_mps: 1.389
       # 2026-09-05: doubled 0.5 -> 1.0 per user request, for the goal-proximity
       # escape-hatch threshold used by shouldSuppressReversedFollowReactivation()
       # (reverse-follow-latch bypass fix, see docs/research/reverse-lane-follow-goal-overshoot-fix.md).
@@ -20,4 +20,100 @@
       # pid.param.yaml's stopping_state_stop_dist (braking-distance runway) and
       # emergency_state_overshoot_stop_dist (tightened backstop) at this v=1.0 m/s value -- see
       # pid.param.yaml comments for the v^2/(2*|a|) math.
-      goal_reach_tolerance_m: 1.0
+      #
+      # 2026-09-06 UPDATE: retrace_velocity_mps is now ALSO the cruise-speed cap consumed by
+      # buildRouteReversedFollowPath() via reverse_lane_follow_utils::capReverseFollowCruiseVelocity()
+      # (see docs/research/reverse-lane-follow-goal-overshoot-fix.md, 2026-09-06 section). Root
+      # cause found: buildRouteReversedFollowPath() was NOT using this param at all -- it simply
+      # negated whatever velocity the raw lanelet centerline carried (a lanelet speed_limit,
+      # confirmed live at 5 km/h = 1.389 m/s, ~39% faster than this param's 1.0 m/s), so all of
+      # yesterday's braking-distance math above was computed for a cruise speed the vehicle wasn't
+      # actually being commanded at. Now genuinely triple-use: (1) reversePathForRetrace()'s flat
+      # override for the separate retrace-request path, (2) this cap in
+      # buildRouteReversedFollowPath(), (3) still gates goal_reach_tolerance_m-adjacent checks per
+      # the note above (unrelated, just documenting the existing multi-use nature of this param
+      # namespace).
+      #
+      # 2026-09-07 UPDATE: user request "bisa ga dibuat sama 5 kmh saja?" -- reverse-follow cruise
+      # speed raised to match forward mode's 5 km/h lanelet speed_limit exactly, instead of the
+      # deliberately-lower 1.0 m/s (3.6 km/h) reverse cap. retrace_velocity_mps: 1.0 -> 1.389
+      # (5 km/h = 5000/3600 = 1.3889 m/s, matching this file's existing 1.389 precision convention,
+      # e.g. the 2026-09-06 UPDATE comment above and the live-confirmed lanelet speed_limit note).
+      # This is the SAME value capReverseFollowCruiseVelocity() was already designed to cap toward
+      # (see 2026-09-06 UPDATE above) -- at 1.389 m/s the cap becomes a no-op against the raw
+      # lanelet centerline speed, i.e. reverse cruise now equals forward cruise on this lanelet.
+      # Downstream braking-distance/ramp params recomputed for this new cruise speed (see
+      # pid.param.yaml's stopping_state_stop_dist/emergency_state_overshoot_stop_dist and this
+      # file's goal_stop_decel_mps2 window-margin check -- docs/research/
+      # reverse-lane-follow-goal-overshoot-fix.md, 2026-09-07 section, for full math).
+      goal_reach_tolerance_m: 1.3
+      # 2026-09-06: new param, goal-overshoot-fix part 2 (see
+      # docs/research/reverse-lane-follow-goal-overshoot-fix.md, 2026-09-06 section). Magnitude
+      # (m/s^2) of the conservative deceleration reverse_lane_follow_utils::
+      # applyGoalDecelerationRamp() uses to shape a gradual pre-goal slowdown in
+      # buildRouteReversedFollowPath()'s output: v(s) = sqrt(2 * goal_stop_decel_mps2 *
+      # distance_to_goal_m), applied backward from the exact zero-velocity goal point
+      # truncatePathAtGoal() already inserts. Deliberately NOT reusing velocity_smoother's
+      # aggressive general-maneuvering limits (normal.min_acc=-2.0 / limit.min_acc=-4.0 -- see
+      # docs/research/aggressive-tuning-ruang-bawah-kantor.md) -- this is a narrowly-scoped
+      # "definitely stop at the goal" ramp and needs to guarantee real stopping margin regardless
+      # of what those general limits would otherwise allow, so it is picked to sit in the same
+      # conservative ballpark as pid.param.yaml's smooth_stop_weak_acc=-0.3.
+      #
+      # 2026-09-07 CHECK (no change): at the new retrace_velocity_mps=1.389 m/s cruise, the ramp
+      # needs sqrt-inverted 1.389^2/(2*0.3) = 3.215 m of remaining path before the goal to fully
+      # decelerate from cruise to 0 at this decel. route_reversed_forward_distance_m/
+      # route_reversed_backward_distance_m (code defaults 150.0/100.0 m, not overridden in this
+      # file) size the sliding follow window, and default_retrace_distance_m above is 10.0 m -- all
+      # comfortably >> 3.215 m, so the window guarantees the ramp distance fits. goal_stop_decel_mps2
+      # left at 0.3 (unchanged): it is a physics constant (conservative decel magnitude), not tied to
+      # cruise speed itself.
+      goal_stop_decel_mps2: 0.3
+      # 2026-09-07 (continued-overshoot investigation, "trajectory nya masih ada overshoot nya"):
+      # new param. Maximum waypoint spacing (m) reverse_lane_follow_utils::densifyPathNearGoal()
+      # enforces within the ramp's own braking-distance span of the goal, inserting interpolated
+      # points as needed, BEFORE applyGoalDecelerationRamp() runs. Root cause this fixes:
+      # live-confirmed the ramp only had 1-2 native centerline waypoints (~2m apart) to act on
+      # near this map's goal -- far too sparse for the ~3.215m braking distance above to actually
+      # ramp gradually, producing an almost-cruise-speed command until a last-instant cliff-drop
+      # (a real, live-observed non-monotonic velocity bump: two points ~2m from the goal still at
+      # ~1.1455 m/s, FASTER than points several meters farther back at ~0.833 m/s from a slower
+      # upstream curve -- applyGoalDecelerationRamp()'s backward-walk early-break assumes the
+      # pre-ramp speed is non-decreasing away from the goal, which is false when the raw lanelet
+      # centerline speed itself varies). 0.5 m gives the ramp ~6-7 points over the 3.215 m
+      # distance -- see docs/research/reverse-lane-follow-goal-overshoot-fix.md, 2026-09-07
+      # continued section, for the full live trace.
+      goal_decel_ramp_resample_interval_m: 0.5
+      # 2026-09-07 (continued-overshoot investigation): new param, reactive/closed-loop safety
+      # layer requested by the user ("kalau udah longitudinal error nya kecil langsung ramp
+      # deselerasi") -- see reverse_lane_follow_utils::clampVelocityNearEgoWhenCloseToGoal() in
+      # utils.hpp. Independent of (and applied AFTER) the open-loop
+      # truncatePathAtGoal()/densifyPathNearGoal()/applyGoalDecelerationRamp() chain above: reacts
+      # directly to the LIVE, real-time straight-line distance to the goal every cycle, so it
+      # cannot be defeated by any blind spot specific to that path-shaping chain. Requested as
+      # explicit defense-in-depth given pid.param.yaml's enable_overshoot_emergency is
+      # intentionally left false (user: "memang sengaja aku buat false, bahaya itu") -- with that
+      # control-side backstop disabled, this module's own path-shaping was otherwise the ONLY
+      # defense against a reverse-goal overshoot. Distance (m) below which this layer engages;
+      # picked larger than goal_reach_tolerance_m (1.0) so it is already active for some distance
+      # before ego would be considered "at" the goal by that separate, unrelated check.
+      reactive_goal_clamp_trigger_distance_m: 2.0
+      # 2026-09-07: forced/clamped velocity magnitude (m/s) applied once the reactive layer above
+      # engages -- a conservative crawl speed, well below retrace_velocity_mps (1.389), in the
+      # same conservative ballpark as goal_stop_decel_mps2/pid.param.yaml's smooth_stop_weak_acc.
+      reactive_goal_clamp_velocity_mps: 0.5
+      # 2026-09-07 (ARRIVED-state investigation, "arrived never fires even after overshoot fixed"):
+      # new param. Speed magnitude (m/s) below which ego is considered "genuinely at rest" by
+      # reverse_lane_follow_utils::isEgoArrivedAndStoppedAtGoal() -- used by
+      # canTransitSuccessState() (route_reversed_path branch: previously returned false
+      # UNCONDITIONALLY, blocking success/ARRIVED forever once parked at a goal inside the final
+      # reversed lanelet) and updateRouteReversedFollow() (holds a fully zero-velocity path once
+      # this fires, instead of re-deriving a fresh ramp/reactive-clamp velocity from ego's live,
+      # mm-noisy pose every cycle). Deliberately NOT the same as
+      # autoware_motion_utils::VehicleStopCheckerBase's own hardcoded, non-parameterized 1mm/s bound
+      # mission_planner's arrival check gates on downstream -- reusing that same ultra-tight bound
+      # here would recreate the exact chicken-and-egg deadlock this fix closes (see
+      # docs/research/reverse-lane-follow-goal-overshoot-fix.md, 2026-09-07 sections, for the full
+      # mechanism and live-confirmed peak residual creep, ~0.00105 m/s, this value comfortably
+      # exceeds).
+      arrived_stop_velocity_mps: 0.05
