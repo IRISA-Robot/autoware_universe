@@ -1,0 +1,209 @@
+/**:
+  ros__parameters:
+    update_rate_hz: 10.0
+
+    # Rollout gate.  Chosen from a launch argument so the staged deployment below can
+    # be walked through without a rebuild and without editing run_aw_gama.sh again:
+    #
+    #   detect_only : classify and publish only.  Never touches the robot.  Safe to
+    #                 leave enabled permanently in production.
+    #   probe       : additionally arms the recovery costmap and measures the free
+    #                 lateral corridor, and logs the decision it *would* have made.
+    #   recovery    : full behaviour -- hands over to the freespace planner.
+    mode: "detect_only"
+
+    # --- stuck detection ---------------------------------------------------
+    th_stopped_velocity_mps: 0.05
+    # Progress is measured as displacement from the pose where SUSPECT began, not as
+    # path length: a robot shuffling back and forth by 10 cm has not escaped anything
+    # and must keep counting as stuck.
+    unstuck_progress_m: 0.5
+    # [TEST] shortened from 12.0 so the scenario can be exercised without a long wait.
+    # Raise it back before running on the robot for real -- 12 s is what keeps a normal
+    # traffic pause from being treated as being stuck.
+    suspect_timeout_sec: 3.0
+    goal_reached_dist_m: 1.0
+    # A map stop (stop_line, crosswalk, ...) is legitimate -- but one that never
+    # releases is pathological in its own right, so the patience is long, not infinite.
+    map_stop_patience_sec: 90.0
+    # Commanded to move but standing still => wheels slipping / something caught /
+    # actuator interlock.  Reversing out of that is the wrong answer, so this is
+    # classified before the obstacle case and routes straight to ABORT.
+    # A STOP planning factor only counts as a blockage if its control point is this
+    # close.  Stops a far-away obstacle_stop from being blamed when the robot happens to
+    # be standing still for some other reason.
+    th_stop_factor_distance_m: 3.0
+    th_commanded_velocity_mps: 0.15
+    mechanical_confirm_sec: 2.0
+
+    # --- corridor sweep (shared by the PROBE precondition and the RECOVERY exit) ---
+    probe_warmup_sec: 1.0
+    probe_step_m: 0.25
+    # Clearance added on each side of the vehicle footprint.  Threshold for the robot
+    # to "fit" is vehicle_width + 2 * this, i.e. 0.78 + 0.30 = 1.08 m by default.
+    lateral_margin_m: 0.15
+    max_scan_half_width_m: 4.0
+    occupancy_threshold: 50
+
+    # --- recovery ----------------------------------------------------------
+    # How far ahead the corridor question is asked, for both the PROBE precondition and
+    # the RECOVERY exit test.  Deliberately local: the recovery costmap is only 20 m
+    # wide, and stations beyond it would read as blocked.
+    corridor_scan_distance_m: 8.0
+
+    # Goal-candidate search along the current trajectory.  Candidates are tried from
+    # min_long_distance_to_check outward, every goal_check_interval_m, up to
+    # max_goal_search_distance_m -- i.e. on towards the real mission goal.  A candidate
+    # that sits on the obstacle, on unmapped ground, or outside the costmap window is
+    # skipped rather than fatal: astar_search rejects a colliding goal outright and
+    # never retries, so one bad candidate used to kill the whole attempt.
+    # Floor only.  The search actually starts just PAST the nearest blockage, whose
+    # distance the corridor sweep already measures: shooting a fixed distance from the
+    # robot could put the first goal on the near side of the obstacle, where freespace
+    # has no reason to go around it at all.
+    min_long_distance_to_check: 3.0
+    goal_offset_beyond_obstacle_m: 2.0
+    goal_check_interval_m: 1.0
+    max_goal_search_distance_m: 30.0
+    # Must mirror vehicle_shape_margin_m in recovery_freespace_planner.param.yaml.  The
+    # escape goal is validated against the same inflated footprint freespace will use,
+    # so we never hand it a goal it rejects outright as "Invalid start or goal pose".
+    goal_shape_margin_m: 0.2
+    recovery_timeout_sec: 60.0
+    # Hysteresis on the exit test, so a pedestrian crossing in front for half a second
+    # cannot make the scenario flip back and forth.
+    clear_hold_sec: 1.0
+    # Reversing a long way is fine as long as it gets the robot past the obstacle; this
+    # is a runaway stop, not a shaping knob.  Hard-clamped to 20 m in the node.
+    max_reverse_distance_m: 10.0
+    max_lateral_excursion_m: 2.0
+
+    # --- backoff -----------------------------------------------------------
+    # When freespace cannot plan from where the robot stands -- typically because its
+    # own footprint is inside the inflated obstacle, which no choice of goal can fix --
+    # the robot retreats along the path it came from at a crawl, then lets freespace try
+    # again from further back.  Alternating BACKOFF and RECOVERY is what lets it shuffle
+    # back and forth until it gets past.
+    #
+    # Stepped rather than continuous on purpose: freespace_planner only replans once the
+    # vehicle has actually stopped ("Waiting for the vehicle to stop before generating a
+    # new trajectory"), so retreating without pausing would never produce a new plan.
+    # Hard ceiling for everything this scenario drives -- the relayed freespace plan as
+    # much as the backoff.  Enforced in the supervisor's relay, which is the single
+    # publisher of the recovery trajectory, so nothing downstream can raise it.
+    recovery_speed_limit_mps: 0.278   # 1 km/h
+    backoff_speed_mps: 0.278          # 1 km/h, same crawl
+    # Retreat is triggered after this many failed goal attempts, and covers that count
+    # x goal_check_interval_m -- the robot gives back exactly the ground it worked
+    # through in the candidate list, stops, and tries the goals again from there.
+    backoff_after_failed_goals: 2
+    # The retreat is considered finished once the robot is within this of the target,
+    # instead of demanding it land exactly -- a 1 km/h crawl through the velocity
+    # smoother never stops on the millimetre, and insisting on that is how a retreat
+    # hangs in BACKOFF forever.
+    backoff_reach_tolerance_m: 0.3
+    backoff_lookback_m: 15.0   # how much path behind ego to keep as retreat geometry
+
+    # How long to wait for a usable plan before trying the next goal candidate.  A goal
+    # is only abandoned after this; the robot backs off only once every candidate failed.
+    goal_retry_sec: 2.0   # [TEST] shortened from 4.0
+
+    # Forced replan.  When the robot stops past the live part of freespace's plan, the
+    # nearest trajectory point to it already has zero velocity: the smoother then reads
+    # target_vel = 0 and will never restart it, while freespace sees no reason to replan
+    # (its trajectory is not empty, no obstacle is on the remaining path, and the robot
+    # is still well within th_course_out_distance_m).  Re-publishing the route makes it
+    # reset and plan afresh from where the robot actually is.
+    replan_wait_sec: 5.0        # freespace only plans once the vehicle has stopped
+    max_replan_attempts: 3      # then fall back to retreating
+    # The plan must look spent for this long, continuously, before a replan is forced.
+    # Judging it instantly produced a RECOVERY <-> REPLAN oscillation: a single short
+    # partial from freespace was enough to trigger a forced replan, and that republishes
+    # the route -- which makes freespace reset() and discard the plan it had just made.
+    spent_hold_sec: 2.0
+    # Retreating is the answer to being stuck in the same place, not to falling a little
+    # short.  If the robot has covered at least this much since the last retreat -- it
+    # edged past part of the obstacle, or just paused for AEB -- the manoeuvre is working,
+    # so replan from where it is instead of backing off and starting the whole thing over.
+    backoff_progress_reset_m: 0.5
+
+    # A freespace plan is only acted on if it arrived AFTER this episode's goal was
+    # published, and within this long.  /planning/recovery/route has to be
+    # transient_local (freespace subscribes latched), so a goal from a previous episode
+    # survives on the topic and freespace can answer it the instant it is re-armed --
+    # relaying that answer once sent the robot off to a previous scenario's goal.
+    freespace_plan_timeout_sec: 1.0
+
+    # The recovery costmap must be FRESH, not merely present.  Keeping the last grid
+    # received meant that when the recovery container died (freespace_planner crashed on
+    # an empty partial_trajectory_), the supervisor carried on sweeping a frozen snapshot
+    # -- reporting an unchanging clear corridor and leaving RECOVERY after one second,
+    # with nothing to suggest the planner was gone.
+    costmap_timeout_sec: 1.0
+
+    # --- budget ------------------------------------------------------------
+    max_attempts: 2
+    cooldown_sec: 10.0    # [TEST] shortened from 60.0
+    max_episode_duration_sec: 180.0
+    # ABORT releases itself after the blockage has been gone this long, and returns via
+    # COOLDOWN.  Latching it forever left the watchdog dead for the rest of the session
+    # even once the obstacle had been removed.  A mechanical stall stays latched
+    # regardless -- that one needs a human.
+    abort_release_sec: 5.0
+
+    # --- stop attribution --------------------------------------------------
+    # Planning factor topic suffixes; the node subscribes to
+    # /planning/planning_factors/<name> for each (see planning_factor_interface.hpp).
+    # Verify the live list once on the robot with:
+    #   ros2 topic list | grep planning_factors
+    pathological_factor_topics:
+      - "obstacle_stop"
+      - "dynamic_obstacle_stop"
+      - "run_out"
+      - "road_user_stop"
+      - "out_of_lane"
+      - "boundary_departure_prevention"
+    legit_factor_topics:
+      - "stop_line"
+      - "crosswalk"
+      - "walkway"
+      - "detection_area"
+      - "virtual_traffic_light"
+      - "road_crossing"
+
+    # road_crossing FSM states that mean "it is deliberately holding":
+    # ARMED_CROSSWALK(1), REROUTING_TO_ALT(3), ARMED_LIGHT(4), WAIT_GREEN(5),
+    # REROUTING_TO_GOAL(8).  That FSM has its own watchdog -- never compete with it.
+    road_crossing_hold_states: [1, 3, 4, 5, 8]
+
+    # --- topics ------------------------------------------------------------
+    topic_odometry: "/localization/kinematic_state"
+    topic_velocity_status: "/vehicle/status/velocity_status"
+    topic_control_cmd: "/control/command/control_cmd"
+    topic_trajectory: "/planning/scenario_planning/trajectory"
+    topic_route: "/planning/mission_planning/route"
+    topic_route_state: "/api/routing/state"
+    topic_operation_mode: "/api/operation_mode/state"
+    topic_control_mode: "/vehicle/status/control_mode"
+    topic_gear: "/vehicle/status/gear_status"
+    topic_scenario: "/planning/scenario_planning/scenario"
+    topic_occupancy_grid: "/planning/recovery/costmap_generator/occupancy_grid"
+    topic_recovery_trajectory: "/planning/recovery/trajectory"
+    # freespace publishes here; the supervisor is the single publisher on
+    # topic_out_recovery_trajectory, relaying freespace verbatim or its own backoff plan.
+    topic_freespace_trajectory: "/planning/recovery/freespace_trajectory"
+    topic_recovery_is_completed: "/planning/recovery/is_completed"
+    topic_road_crossing_state: "/planning/road_crossing/fsm_state"
+    topic_emergency_code: "/gama/mw/emergency_code"
+    topic_robot_fsm: "/robot_fsm"
+
+    topic_out_scenario: "/planning/recovery/scenario"
+    topic_out_route: "/planning/recovery/route"
+    topic_out_force_recovery: "/planning/recovery/force_recovery"
+    topic_out_state: "/planning/stuck_recovery/state"
+    topic_out_state_int: "/planning/stuck_recovery/state_int"
+    topic_out_diagnosis: "/planning/stuck_recovery/diagnosis"
+    topic_out_markers: "/planning/stuck_recovery/debug/markers"
+    topic_out_escape_goal: "/planning/stuck_recovery/debug/escape_goal"
+    topic_out_recovery_trajectory: "/planning/recovery/trajectory"
+    service_force_recovery: "/planning/stuck_recovery/force_recovery"

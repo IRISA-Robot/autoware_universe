@@ -6,6 +6,10 @@
   <arg name="input_odometry"/>
   <arg name="input_operation_mode_state"/>
   <arg name="is_parking_completed"/>
+  <!-- [STUCK-RECOVERY] defaults keep the previous behaviour when nothing requests recovery -->
+  <arg name="input_recovery_trajectory" default="/planning/recovery/trajectory"/>
+  <arg name="input_force_recovery" default="/planning/recovery/force_recovery"/>
+  <arg name="enable_recovery_scenario" default="false"/>
 
   <arg name="output_scenario"/>
   <arg name="output_trajectory"/>
@@ -20,10 +24,15 @@
     <remap from="input/odometry" to="$(var input_odometry)"/>
     <remap from="input/operation_mode_state" to="$(var input_operation_mode_state)"/>
     <remap from="is_parking_completed" to="$(var is_parking_completed)"/>
+    <!-- [STUCK-RECOVERY] -->
+    <remap from="input/recovery/trajectory" to="$(var input_recovery_trajectory)"/>
+    <remap from="input/force_recovery" to="$(var input_force_recovery)"/>
 
     <remap from="output/scenario" to="$(var output_scenario)"/>
     <remap from="output/trajectory" to="$(var output_trajectory)"/>
     <!-- Parameter -->
     <param from="$(var config_file)"/>
+    <!-- [STUCK-RECOVERY] declared with a default in the node, so this is the only knob -->
+    <param name="enable_recovery_scenario" value="$(var enable_recovery_scenario)"/>
   </node>
 </launch>

@@ -1,0 +1,73 @@
+<launch>
+  <!--
+    Stuck watchdog + private freespace recovery pipeline.
+
+    The costmap_generator and freespace_planner below are ordinary upstream nodes,
+    unmodified.  They run as our *own* instances under /planning/recovery and are fed
+    a scenario and a route that the supervisor publishes on private topics, which is
+    what lets them work outside a parking lot: freespace_planner only checks that its
+    own ~/input/scenario contains "Parking", and costmap_generator does the same once
+    activate_by_scenario is true.  Nothing upstream sees these topics.
+  -->
+  <arg name="stuck_recovery_mode" default="detect_only" description="detect_only | probe | recovery"/>
+  <arg name="vehicle_param_file"/>
+  <arg name="container_type" default="component_container_mt"/>
+
+  <arg name="input_objects_topic_name" default="/perception/object_recognition/objects"/>
+  <arg name="input_pointcloud_topic_name" default="/perception/obstacle_segmentation/pointcloud"/>
+
+  <arg name="stuck_recovery_supervisor_param_path"
+       default="$(find-pkg-share autoware_stuck_recovery_supervisor)/config/stuck_recovery_supervisor.param.yaml"/>
+  <arg name="recovery_costmap_generator_param_path"/>
+  <arg name="recovery_freespace_planner_param_path"/>
+
+  <group>
+    <push-ros-namespace namespace="/planning"/>
+    <node pkg="autoware_stuck_recovery_supervisor" exec="stuck_recovery_supervisor_node"
+          name="stuck_recovery_supervisor" output="screen">
+      <param from="$(var stuck_recovery_supervisor_param_path)"/>
+      <param from="$(var vehicle_param_file)"/>
+      <param name="mode" value="$(var stuck_recovery_mode)"/>
+    </node>
+  </group>
+
+  <group>
+    <push-ros-namespace namespace="/planning/recovery"/>
+
+    <node_container pkg="rclcpp_components" exec="$(var container_type)" name="recovery_container" namespace="" output="screen">
+      <composable_node pkg="autoware_costmap_generator" plugin="autoware::costmap_generator::CostmapGenerator" name="costmap_generator" namespace="">
+        <remap from="~/input/objects" to="$(var input_objects_topic_name)"/>
+        <remap from="~/input/points_no_ground" to="$(var input_pointcloud_topic_name)"/>
+        <remap from="~/input/vector_map" to="/map/vector_map"/>
+        <!-- private scenario topic: armed by the supervisor, invisible to the rest of the stack -->
+        <remap from="~/input/scenario" to="/planning/recovery/scenario"/>
+        <remap from="~/output/grid_map" to="costmap_generator/grid_map"/>
+        <remap from="~/output/occupancy_grid" to="costmap_generator/occupancy_grid"/>
+        <param from="$(var vehicle_param_file)"/>
+        <param from="$(var recovery_costmap_generator_param_path)"/>
+        <extra_arg name="use_intra_process_comms" value="false"/>
+      </composable_node>
+
+      <composable_node pkg="autoware_freespace_planner" plugin="autoware::freespace_planner::FreespacePlannerNode" name="freespace_planner" namespace="">
+        <!-- synthetic route from the supervisor: goal = a few metres ahead on the
+             current path.  The real mission route is never touched. -->
+        <remap from="~/input/route" to="/planning/recovery/route"/>
+        <remap from="~/input/scenario" to="/planning/recovery/scenario"/>
+        <remap from="~/input/occupancy_grid" to="costmap_generator/occupancy_grid"/>
+        <remap from="~/input/odometry" to="/localization/kinematic_state"/>
+        <!-- Freespace publishes to its OWN topic; the supervisor is the single
+             publisher on /planning/recovery/trajectory, relaying this verbatim or
+             substituting its backoff trajectory.  Verbatim matters: freespace already
+             splits its plan at every direction cusp and waits for the robot to stop
+             there, which is the only reason the MPC can follow a Reeds-Shepp path. -->
+        <remap from="~/output/trajectory" to="/planning/recovery/freespace_trajectory"/>
+        <remap from="is_completed" to="/planning/recovery/is_completed"/>
+        <param from="$(var vehicle_param_file)"/>
+        <param from="$(var recovery_freespace_planner_param_path)"/>
+        <extra_arg name="use_intra_process_comms" value="false"/>
+      </composable_node>
+
+      <composable_node pkg="autoware_glog_component" plugin="autoware::glog_component::GlogComponent" name="glog_component" namespace=""/>
+    </node_container>
+  </group>
+</launch>

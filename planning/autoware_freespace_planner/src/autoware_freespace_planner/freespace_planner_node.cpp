@@ -144,6 +144,19 @@ bool FreespacePlannerNode::isPlanRequired()
     return true;
   }
 
+  // [STUCK-RECOVERY] partial_trajectory_ can legitimately be empty here -- for example
+  // when get_partial_trajectory() collapsed to nothing because prev_target_index_ and
+  // target_index_ ended up equal after a reset.  checkCurrentTrajectoryCollision() calls
+  // findNearestIndex() on it, whose validateNonEmpty() THROWS, and nothing catches it:
+  // the exception propagates out of onTimer() and std::terminate() takes down the whole
+  // component container (costmap_generator included).  Observed as
+  // "process has died [exit code -6]" with validateNonEmpty at the top of the stack.
+  //
+  // No partial trajectory to follow simply means a plan is required.
+  if (partial_trajectory_.points.empty()) {
+    return true;
+  }
+
   if (node_param_.replan_when_obstacle_found && checkCurrentTrajectoryCollision()) {
     RCLCPP_DEBUG(get_logger(), "Found obstacle");
     return true;

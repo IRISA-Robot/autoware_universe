@@ -138,6 +138,10 @@ autoware_planning_msgs::msg::Trajectory::ConstSharedPtr ScenarioSelectorNode::ge
   if (scenario == autoware_internal_planning_msgs::msg::Scenario::PARKING) {
     return parking_trajectory_;
   }
+  // [STUCK-RECOVERY]
+  if (scenario == autoware_internal_planning_msgs::msg::Scenario::RECOVERY) {
+    return recovery_trajectory_;
+  }
   RCLCPP_ERROR_STREAM(this->get_logger(), "invalid scenario argument: " << scenario);
   return lane_driving_trajectory_;
 }
@@ -176,9 +180,50 @@ std::string ScenarioSelectorNode::selectScenarioByPosition()
   return current_scenario_;
 }
 
+// [STUCK-RECOVERY] -----------------------------------------------------------
+bool ScenarioSelectorNode::isForceRecoveryActive() const
+{
+  if (!enable_recovery_scenario_ || !force_recovery_requested_) {
+    return false;
+  }
+  return (this->now() - last_force_recovery_stamp_).seconds() <= force_recovery_timeout_sec_;
+}
+
+// ---------------------------------------------------------------------------
+
 void ScenarioSelectorNode::updateCurrentScenario()
 {
   const auto prev_scenario = current_scenario_;
+
+  // [STUCK-RECOVERY] The supervisor's request wins over the position-based logic:
+  // recovery happens exactly where the map says nothing special is going on.
+  if (enable_recovery_scenario_) {
+    const auto recovery_active = isForceRecoveryActive();
+    if (recovery_active && isAutonomous()) {
+      if (!isCurrentRecovery()) {
+        current_scenario_ = autoware_internal_planning_msgs::msg::Scenario::RECOVERY;
+        lane_driving_stop_time_ = {};
+        empty_parking_trajectory_time_ = {};
+        RCLCPP_WARN(this->get_logger(), "[STUCK-RECOVERY] entering recovery scenario");
+      }
+      return;
+    }
+    if (isCurrentRecovery()) {
+      // Hand back immediately.  Waiting for a fresh lane-driving trajectory first
+      // would deadlock: behavior_path_planner returns early while the scenario is
+      // not LANEDRIVING, so that trajectory can never appear until *after* we
+      // switch.  The handover gap is one planning cycle, and the trajectory topic
+      // monitor tolerates far more than that (error_rate 0.05 Hz, timeout 90 s in
+      // component_state_monitor/topics.yaml), so there is nothing to protect
+      // against here.  This is also exactly how the parking scenario hands back.
+      current_scenario_ = autoware_internal_planning_msgs::msg::Scenario::LANEDRIVING;
+      lane_driving_stop_time_ = {};
+      empty_parking_trajectory_time_ = {};
+      RCLCPP_WARN(
+        this->get_logger(), "[STUCK-RECOVERY] leaving recovery scenario -> LaneDriving");
+      return;
+    }
+  }
 
   const auto scenario_trajectory = getScenarioTrajectory(current_scenario_);
   const auto is_near_trajectory_end =
@@ -421,6 +466,19 @@ void ScenarioSelectorNode::onParkingTrajectory(
   publishTrajectory(msg);
 }
 
+// [STUCK-RECOVERY]
+void ScenarioSelectorNode::onRecoveryTrajectory(
+  const autoware_planning_msgs::msg::Trajectory::ConstSharedPtr msg)
+{
+  recovery_trajectory_ = msg;
+
+  if (current_scenario_ != autoware_internal_planning_msgs::msg::Scenario::RECOVERY) {
+    return;
+  }
+
+  publishTrajectory(msg);
+}
+
 void ScenarioSelectorNode::publishTrajectory(
   const autoware_planning_msgs::msg::Trajectory::ConstSharedPtr msg)
 {
@@ -446,7 +504,13 @@ ScenarioSelectorNode::ScenarioSelectorNode(const rclcpp::NodeOptions & node_opti
   th_stopped_time_sec_(this->declare_parameter<double>("th_stopped_time_sec")),
   th_stopped_velocity_mps_(this->declare_parameter<double>("th_stopped_velocity_mps")),
   enable_mode_switching_(this->declare_parameter<bool>("enable_mode_switching")),
-  is_parking_completed_(false)
+  is_parking_completed_(false),
+  // [STUCK-RECOVERY] off unless explicitly enabled, so the default build is unchanged
+  enable_recovery_scenario_(this->declare_parameter<bool>("enable_recovery_scenario", false)),
+  force_recovery_timeout_sec_(
+    this->declare_parameter<double>("force_recovery_timeout_sec", 1.0)),
+  force_recovery_requested_(false),
+  last_force_recovery_stamp_(0, 0, RCL_ROS_TIME)
 {
   lane_driving_stop_time_ = {};
   empty_parking_trajectory_time_ = {};
@@ -459,6 +523,20 @@ ScenarioSelectorNode::ScenarioSelectorNode(const rclcpp::NodeOptions & node_opti
   sub_parking_trajectory_ = this->create_subscription<autoware_planning_msgs::msg::Trajectory>(
     "input/parking/trajectory", rclcpp::QoS{1},
     std::bind(&ScenarioSelectorNode::onParkingTrajectory, this, std::placeholders::_1));
+
+  // [STUCK-RECOVERY]
+  sub_recovery_trajectory_ = this->create_subscription<autoware_planning_msgs::msg::Trajectory>(
+    "input/recovery/trajectory", rclcpp::QoS{1},
+    std::bind(&ScenarioSelectorNode::onRecoveryTrajectory, this, std::placeholders::_1));
+
+  sub_force_recovery_ = this->create_subscription<std_msgs::msg::Bool>(
+    "input/force_recovery", rclcpp::QoS{1},
+    [this](const std_msgs::msg::Bool::ConstSharedPtr msg) {
+      // Arrival time, not a stamped field: the dead-man must expire when the
+      // supervisor stops publishing, whatever it thinks the time is.
+      force_recovery_requested_ = msg->data;
+      last_force_recovery_stamp_ = this->now();
+    });
 
   sub_lanelet_map_ = this->create_subscription<autoware_map_msgs::msg::LaneletMapBin>(
     "input/lanelet_map", rclcpp::QoS{1}.transient_local(),

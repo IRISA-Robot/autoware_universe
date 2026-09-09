@@ -1,0 +1,12 @@
+# Manual override from the operator UI.
+#
+#   enable=true   -> force the supervisor into a recovery attempt right now,
+#                    skipping the SUSPECT timer (the PROBE clearance check still
+#                    applies -- an operator cannot force the robot into a gap it
+#                    does not fit through).
+#   enable=false  -> abort any running recovery and clear a latched ABORT/BLOCKED.
+bool enable
+string reason
+---
+bool success
+string message

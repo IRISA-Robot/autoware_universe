@@ -62,6 +62,8 @@ public:
   void onRoute(const autoware_planning_msgs::msg::LaneletRoute::ConstSharedPtr msg);
   void onLaneDrivingTrajectory(const autoware_planning_msgs::msg::Trajectory::ConstSharedPtr msg);
   void onParkingTrajectory(const autoware_planning_msgs::msg::Trajectory::ConstSharedPtr msg);
+  // [STUCK-RECOVERY]
+  void onRecoveryTrajectory(const autoware_planning_msgs::msg::Trajectory::ConstSharedPtr msg);
   void publishTrajectory(const autoware_planning_msgs::msg::Trajectory::ConstSharedPtr msg);
 
   void updateCurrentScenario();
@@ -87,6 +89,19 @@ private:
     return current_scenario_ == autoware_internal_planning_msgs::msg::Scenario::PARKING;
   }
 
+  // [STUCK-RECOVERY] ---------------------------------------------------------
+  inline bool isCurrentRecovery() const
+  {
+    return current_scenario_ == autoware_internal_planning_msgs::msg::Scenario::RECOVERY;
+  }
+
+  /// True while the stuck_recovery_supervisor is actively asking for the recovery
+  /// scenario.  This is a dead-man switch, not a latch: the request expires
+  /// force_recovery_timeout_sec after the last message, so if the supervisor dies or
+  /// hangs the selector falls back to its normal logic within a second.
+  bool isForceRecoveryActive() const;
+
+
   rclcpp::TimerBase::SharedPtr timer_;
 
   // subscribers
@@ -95,6 +110,9 @@ private:
   rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr
     sub_lane_driving_trajectory_;
   rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr sub_parking_trajectory_;
+  // [STUCK-RECOVERY]
+  rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr sub_recovery_trajectory_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_force_recovery_;
   rclcpp::Publisher<autoware_planning_msgs::msg::Trajectory>::SharedPtr pub_trajectory_;
   rclcpp::Publisher<autoware_internal_planning_msgs::msg::Scenario>::SharedPtr pub_scenario_;
   rclcpp::Publisher<autoware_internal_debug_msgs::msg::Float64Stamped>::SharedPtr
@@ -110,6 +128,8 @@ private:
   autoware_adapi_v1_msgs::msg::OperationModeState::ConstSharedPtr operation_mode_state_;
   autoware_planning_msgs::msg::Trajectory::ConstSharedPtr lane_driving_trajectory_;
   autoware_planning_msgs::msg::Trajectory::ConstSharedPtr parking_trajectory_;
+  // [STUCK-RECOVERY]
+  autoware_planning_msgs::msg::Trajectory::ConstSharedPtr recovery_trajectory_;
   autoware_planning_msgs::msg::LaneletRoute::ConstSharedPtr route_;
   nav_msgs::msg::Odometry::ConstSharedPtr current_pose_;
   geometry_msgs::msg::TwistStamped::ConstSharedPtr twist_;
@@ -128,6 +148,13 @@ private:
   double th_stopped_velocity_mps_;
   bool enable_mode_switching_;
   bool is_parking_completed_;
+
+  // [STUCK-RECOVERY] default false -- with no request this node behaves exactly as
+  // it did before.
+  bool enable_recovery_scenario_;
+  double force_recovery_timeout_sec_;
+  bool force_recovery_requested_;
+  rclcpp::Time last_force_recovery_stamp_;
 
   boost::optional<rclcpp::Time> lane_driving_stop_time_;
   boost::optional<rclcpp::Time> empty_parking_trajectory_time_;

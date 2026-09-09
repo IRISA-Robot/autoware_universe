@@ -4,6 +4,8 @@
   <!-- Input topic parameters -->
   <arg name="input_objects_topic_name"/>
   <arg name="input_pointcloud_topic_name"/>
+  <!-- [STUCK-RECOVERY] -->
+  <arg name="launch_stuck_recovery" default="false"/>
   <!-- scenario selector -->
   <group>
     <include file="$(find-pkg-share autoware_scenario_selector)/launch/scenario_selector.launch.xml">
@@ -16,6 +18,10 @@
       <arg name="output_scenario" value="/planning/scenario_planning/scenario"/>
       <arg name="output_trajectory" value="/planning/scenario_planning/scenario_selector/trajectory"/>
       <arg name="is_parking_completed" value="/planning/scenario_planning/parking/is_completed"/>
+      <!-- [STUCK-RECOVERY] -->
+      <arg name="input_recovery_trajectory" value="/planning/recovery/trajectory"/>
+      <arg name="input_force_recovery" value="/planning/recovery/force_recovery"/>
+      <arg name="enable_recovery_scenario" value="$(var launch_stuck_recovery)"/>
     </include>
   </group>
 
