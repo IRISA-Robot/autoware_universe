@@ -43,6 +43,7 @@
 #include <std_msgs/msg/u_int8.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -151,7 +152,14 @@ private:
     double goal_shape_margin_m{0.2};
     double recovery_timeout_sec{60.0};
     double clear_hold_sec{1.0};
-    double max_reverse_distance_m{3.0};
+    double max_reverse_distance_m{10.0};
+    // Cumulative reverse budget across episodes.  The per-episode limit above cannot
+    // bound an obstacle that keeps advancing on the robot: every new episode hands out a
+    // fresh allowance, so the robot could retreat indefinitely.  This one is cleared only
+    // by real forward progress toward the goal, so "retreat without ever getting
+    // anywhere" terminates.
+    double max_total_reverse_distance_m{15.0};
+    double total_reverse_reset_progress_m{5.0};
     double max_lateral_excursion_m{2.0};
 
     // Backoff: retreat along the path we came from at a crawl.  Stepped rather than
@@ -284,6 +292,9 @@ private:
   // Detection helpers
   void update_motion();
   void classify_stop();
+  /// Track the closest approach to the goal, and clear the cumulative reverse budget when
+  /// the robot has genuinely advanced.
+  void update_goal_progress();
   bool is_operational() const;
   bool is_stuck_candidate() const;
 
@@ -296,10 +307,6 @@ private:
   /// True on a reversed route, where the path yaw is the travel direction and the
   /// robot faces the other way -- so lateral left/right has to be mirrored.
   bool path_yaw_opposes_ego() const;
-  /// Did this step move against the intended direction of travel?  Direction-relative
-  /// on purpose, so the reverse budget still means something on a reversed route.
-  bool moved_against_path(
-    const geometry_msgs::msg::Pose & from, const geometry_msgs::msg::Pose & to) const;
   /// Is the inflated vehicle footprint at `pose` clear of the recovery grid?  Off-grid
   /// counts as blocked, which also keeps the goal inside the costmap window.
   bool footprint_is_free(const geometry_msgs::msg::Pose & pose) const;
@@ -361,6 +368,10 @@ private:
   bool has_last_pose_{false};
   double progress_since_entry_m_{0.0};
   double reverse_distance_m_{0.0};
+  double total_reverse_distance_m_{0.0};
+  /// Closest the robot has ever been to the goal.  Progress is measured against this, so
+  /// that reversing and re-approaching the same spot does not count as getting anywhere.
+  double best_remaining_to_goal_m_{std::numeric_limits<double>::max()};
 
   std::vector<geometry_msgs::msg::Pose> reference_path_{};
   std::optional<geometry_msgs::msg::Pose> escape_goal_{};

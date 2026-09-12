@@ -145,6 +145,10 @@ void StuckRecoverySupervisorNode::load_parameters()
   p.recovery_timeout_sec = declare_parameter<double>("recovery_timeout_sec", 60.0);
   p.clear_hold_sec = declare_parameter<double>("clear_hold_sec", 1.0);
   p.max_reverse_distance_m = declare_parameter<double>("max_reverse_distance_m", 10.0);
+  p.max_total_reverse_distance_m =
+    declare_parameter<double>("max_total_reverse_distance_m", 15.0);
+  p.total_reverse_reset_progress_m =
+    declare_parameter<double>("total_reverse_reset_progress_m", 5.0);
   p.max_lateral_excursion_m = declare_parameter<double>("max_lateral_excursion_m", 2.0);
 
   p.recovery_speed_limit_mps = declare_parameter<double>("recovery_speed_limit_mps", 0.278);
@@ -246,6 +250,8 @@ void StuckRecoverySupervisorNode::load_parameters()
   // the ceiling is here only to stop a runaway, not to shape the manoeuvre.
   p.max_reverse_distance_m =
     clamp_with_warning(p.max_reverse_distance_m, 0.0, 20.0, "max_reverse_distance_m");
+  p.max_total_reverse_distance_m = clamp_with_warning(
+    p.max_total_reverse_distance_m, 0.0, 40.0, "max_total_reverse_distance_m");
   p.max_lateral_excursion_m =
     clamp_with_warning(p.max_lateral_excursion_m, 0.0, 3.0, "max_lateral_excursion_m");
   p.corridor_scan_distance_m =
@@ -420,6 +426,7 @@ void StuckRecoverySupervisorNode::setup_interfaces()
 void StuckRecoverySupervisorNode::on_timer()
 {
   update_motion();
+  update_goal_progress();
   classify_stop();
 
   switch (state_) {
@@ -504,13 +511,26 @@ void StuckRecoverySupervisorNode::update_motion()
     const auto & pose = odom_->pose.pose;
     if (has_last_pose_) {
       const double delta = distance2d(last_pose_, pose);
-      // The reverse budget limits the *recovery manoeuvre*, so it has to mean "moved
-      // against the intended direction of travel" -- not "gear is R".  On a reversed
-      // route the robot is in R for the entire mission, and a gear-based budget would
-      // abort after three normal metres.  Project the step onto the path tangent
-      // instead: negative means genuinely backing up relative to where we want to go.
-      if (moved_against_path(last_pose_, pose)) {
-        reverse_distance_m_ += delta;
+      // The reverse budget bounds how far THIS scenario drives the robot backwards --
+      // backwards in the vehicle's own frame, because that is the direction it cannot
+      // see, which is the actual risk being limited.
+      //
+      // Two mistakes were made here before.  Measuring against the reference path
+      // tangent made the number depend on path geometry, so it could under-count real
+      // reverse travel (the hole) as easily as over-count it.  And accumulating in
+      // update_motion() regardless of state meant every metre the robot drove in plain
+      // lane driving counted too: the budget read 25 m against a 10 m limit, so it was
+      // measuring nothing meaningful.  Only count while this scenario is the one driving.
+      const bool we_are_driving = state_ == State::RECOVERY || state_ == State::BACKOFF ||
+                                  state_ == State::REPLAN;
+      if (we_are_driving && delta > 0.0) {
+        const double yaw = tf2::getYaw(pose.orientation);
+        const double dx = pose.position.x - last_pose_.position.x;
+        const double dy = pose.position.y - last_pose_.position.y;
+        if ((dx * std::cos(yaw) + dy * std::sin(yaw)) < 0.0) {
+          reverse_distance_m_ += delta;
+          total_reverse_distance_m_ += delta;
+        }
       }
     }
     last_pose_ = pose;
@@ -524,22 +544,26 @@ void StuckRecoverySupervisorNode::update_motion()
   }
 }
 
-bool StuckRecoverySupervisorNode::moved_against_path(
-  const geometry_msgs::msg::Pose & from, const geometry_msgs::msg::Pose & to) const
+void StuckRecoverySupervisorNode::update_goal_progress()
 {
-  if (reference_path_.size() < 2) {
-    return false;
+  if (!odom_ || !route_) {
+    return;
   }
-  const auto nearest = find_nearest_index(reference_path_, from);
-  if (!nearest) {
-    return false;
+  const double remaining = distance2d(odom_->pose.pose, route_->goal_pose);
+  if (remaining >= best_remaining_to_goal_m_) {
+    return;  // no closer than we have already been; nothing has been achieved
   }
-  const size_t i = std::min(*nearest, reference_path_.size() - 2);
-  const double tx = reference_path_[i + 1].position.x - reference_path_[i].position.x;
-  const double ty = reference_path_[i + 1].position.y - reference_path_[i].position.y;
-  const double dx = to.position.x - from.position.x;
-  const double dy = to.position.y - from.position.y;
-  return (tx * dx + ty * dy) < 0.0;
+
+  const bool made_progress =
+    best_remaining_to_goal_m_ != std::numeric_limits<double>::max() &&
+    (best_remaining_to_goal_m_ - remaining) >= param_.total_reverse_reset_progress_m;
+  best_remaining_to_goal_m_ = remaining;
+  if (made_progress && total_reverse_distance_m_ > 0.0) {
+    RCLCPP_INFO(
+      get_logger(), "advanced %.1f m toward the goal; clearing the %.2f m cumulative reverse budget",
+      param_.total_reverse_reset_progress_m, total_reverse_distance_m_);
+    total_reverse_distance_m_ = 0.0;
+  }
 }
 
 void StuckRecoverySupervisorNode::classify_stop()
@@ -1090,6 +1114,15 @@ void StuckRecoverySupervisorNode::begin_backoff(const std::string & why)
     return;
   }
 
+  if (total_reverse_distance_m_ >= param_.max_total_reverse_distance_m) {
+    transition(
+      State::ABORT,
+      "cumulative reverse budget exhausted (" +
+        std::to_string(total_reverse_distance_m_) +
+        " m without reaching the goal) -- an advancing obstacle may be pushing the robot "
+        "back; this needs an operator: " + why);
+    return;
+  }
   if (reverse_distance_m_ >= param_.max_reverse_distance_m) {
     transition(State::ABORT, "reverse budget exhausted: " + why);
     return;
@@ -1136,6 +1169,10 @@ void StuckRecoverySupervisorNode::step_backoff()
   }
   if (reverse_distance_m_ > param_.max_reverse_distance_m) {
     transition(State::ABORT, "reverse budget exceeded while backing off");
+    return;
+  }
+  if (total_reverse_distance_m_ > param_.max_total_reverse_distance_m) {
+    transition(State::ABORT, "cumulative reverse budget exceeded while backing off");
     return;
   }
   if ((now - episode_since_).seconds() > param_.max_episode_duration_sec) {
@@ -1914,6 +1951,7 @@ void StuckRecoverySupervisorNode::publish_outputs()
   state_msg.elapsed_in_state_s = static_cast<float>((now - state_since_).seconds());
   state_msg.elapsed_in_episode_s = static_cast<float>((now - episode_since_).seconds());
   state_msg.reverse_distance_m = static_cast<float>(reverse_distance_m_);
+  state_msg.total_reverse_distance_m = static_cast<float>(total_reverse_distance_m_);
   state_msg.goal_index = static_cast<uint16_t>(goal_index_);
   state_msg.goal_candidates = static_cast<uint16_t>(goal_candidates_.size());
   state_msg.abort_reason = abort_reason_;
@@ -2058,6 +2096,7 @@ void StuckRecoverySupervisorNode::on_diagnostics(
   stat.add("chosen_side", side_name(last_sweep_.best_side));
   stat.add("required_width_m", last_sweep_.required_width_m);
   stat.add("reverse_distance_m", reverse_distance_m_);
+  stat.add("total_reverse_distance_m", total_reverse_distance_m_);
   stat.add("abort_reason", abort_reason_);
 
   switch (state_) {

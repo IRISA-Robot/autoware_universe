@@ -76,6 +76,15 @@
     # Reversing a long way is fine as long as it gets the robot past the obstacle; this
     # is a runaway stop, not a shaping knob.  Hard-clamped to 20 m in the node.
     max_reverse_distance_m: 10.0
+
+    # Cumulative reverse budget ACROSS episodes.  max_reverse_distance_m above is reset on
+    # every episode, so on its own it cannot bound an obstacle that keeps advancing on the
+    # robot: it retreats 10 m, recovers, the obstacle closes in again, the new episode hands
+    # out a fresh 10 m, and the total is unbounded.  This one is cleared only once the robot
+    # has genuinely closed on the goal by total_reverse_reset_progress_m, so "retreating
+    # without ever getting anywhere" terminates and hands over to an operator.
+    max_total_reverse_distance_m: 15.0
+    total_reverse_reset_progress_m: 5.0
     max_lateral_excursion_m: 2.0
 
     # --- backoff -----------------------------------------------------------
