@@ -593,9 +593,28 @@ void StuckRecoverySupervisorNode::classify_stop()
   }
 
   if (route_state_ && route_state_->state != autoware_adapi_v1_msgs::msg::RouteState::SET) {
-    legit_stop_ = true;
-    legit_reason_ = "route_not_set";
-    return;
+    // ARRIVED is only a legitimate reason to stand still if the robot has actually
+    // arrived.  Seen on the robot: routing reported ARRIVED while the vehicle was still
+    // 15 m from the goal of that very route, held there by an obstacle_stop 5 cm ahead.
+    // The watchdog took the report at face value, never even classified the stop, and
+    // sat in NOMINAL while the robot was stuck exactly the way this node exists to
+    // catch.  Trust the geometry over the announcement: it is the same route's own goal
+    // pose being measured against, so a large distance contradicts the claim outright.
+    const bool arrived_claim =
+      route_state_->state == autoware_adapi_v1_msgs::msg::RouteState::ARRIVED;
+    const double to_goal = (odom_ && route_)
+                             ? distance2d(odom_->pose.pose, route_->goal_pose)
+                             : 0.0;
+    if (!arrived_claim || !odom_ || !route_ || to_goal <= param_.goal_reached_dist_m) {
+      legit_stop_ = true;
+      legit_reason_ = "route_not_set";
+      return;
+    }
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "routing reports ARRIVED but the goal of that route is still %.2f m away (> %.2f m): "
+      "not treating this as a finished mission",
+      to_goal, param_.goal_reached_dist_m);
   }
 
   if (odom_ && route_) {
