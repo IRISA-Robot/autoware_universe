@@ -780,6 +780,12 @@ void StuckRecoverySupervisorNode::transition(State next, const std::string & rea
   if (next == State::ABORT || next == State::BLOCKED) {
     abort_reason_ = reason;
   }
+  if (next == State::BLOCKED) {
+    // Arm the exit hysteresis on ENTRY.  Left carrying a timestamp from some earlier
+    // episode, clear_hold_sec had already elapsed by the time the first tick ran, so the
+    // hold was never applied at all and BLOCKED could be left on its very first look.
+    clear_since_ = this->now();
+  }
   if (next == State::ABORT) {
     // A mechanical stall means the robot was told to move and did not; recovering from
     // that is not a planning decision, so it stays latched for a human.
@@ -810,6 +816,7 @@ void StuckRecoverySupervisorNode::step_nominal()
 
   ++episode_id_;
   episode_since_ = this->now();
+  episode_stop_source_ = stop_source_;
   attempts_ = 0;
   reverse_distance_m_ = 0.0;
   progress_since_entry_m_ = 0.0;
@@ -918,13 +925,27 @@ void StuckRecoverySupervisorNode::step_probe()
   // handing over to freespace is meaningless -- it would plan a pointless detour, or
   // worse, straight through something the costmap cannot see.  Say so instead.
   if (!last_sweep_.has_blockage) {
-    RCLCPP_WARN(
+    // Normally a clear corridor means there is nothing to manoeuvre around, so handing
+    // over would buy a pointless detour -- or worse, a detour around something the
+    // costmap cannot see.  STOP_BEHIND is the exception, and it is the whole reason that
+    // stop source exists: the stop line sits BEHIND the robot, so insert_stop() has
+    // zeroed the entire trajectory ahead and lane driving provably cannot escape, however
+    // clear the road in front is.  A clear corridor is the EXPECTED reading there, not a
+    // contradiction, and driving straight out of the stop margin is exactly the escape.
+    if (stop_source_ != StuckDiagnosis::SOURCE_STOP_BEHIND) {
+      RCLCPP_WARN(
+        get_logger(),
+        "[episode %u] stopped by '%s' but the recovery costmap sees a clear %.2f m corridor: "
+        "the obstacle is not in the costmap (or is behind the robot). Not handing over.",
+        episode_id_, stop_source_module_.c_str(), last_sweep_.free_width_m);
+      transition(State::BLOCKED, "costmap shows no blockage to manoeuvre around");
+      return;
+    }
+    RCLCPP_INFO(
       get_logger(),
-      "[episode %u] stopped by '%s' but the recovery costmap sees a clear %.2f m corridor: "
-      "the obstacle is not in the costmap (or is behind the robot). Not handing over.",
-      episode_id_, stop_source_module_.c_str(), last_sweep_.free_width_m);
-    transition(State::BLOCKED, "costmap shows no blockage to manoeuvre around");
-    return;
+      "[episode %u] corridor is clear (%.2f m) and the stop line is behind the robot: "
+      "nothing to drive around, just drive out of the stop margin",
+      episode_id_, last_sweep_.free_width_m);
   }
 
   const bool fits = last_sweep_.free_width_m >= last_sweep_.required_width_m;
@@ -1103,6 +1124,23 @@ void StuckRecoverySupervisorNode::step_recovery()
   // the path had advanced past the blockage, so the sweep read clear, while lane driving
   // still saw the obstacle and stopped again.  Recovery then re-triggered, and the state
   // flipped between Recovery and LaneDriving indefinitely with the obstacle never passed.
+  // A STOP_BEHIND episode needs one extra thing before handing back.  Its corridor is
+  // clear from the very first tick -- that is the definition of the case: nothing is in
+  // the way, the robot is simply frozen inside a stop margin whose stop line lies behind
+  // it.  So the clear-corridor test is satisfied instantly, and handing back there
+  // returns the robot to lane driving still inside that margin, still frozen, to be
+  // detected all over again.  Require it to have actually driven out first.
+  if (
+    episode_stop_source_ == StuckDiagnosis::SOURCE_STOP_BEHIND &&
+    progress_since_entry_m_ <= param_.unstuck_progress_m) {
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "[episode %u] corridor clear, but this episode began inside a stop margin and the "
+      "robot has only moved %.2f m of the %.2f m needed to be out of it",
+      episode_id_, progress_since_entry_m_, param_.unstuck_progress_m);
+    return;
+  }
+
   const double offset = lateral_offset_from_path();
   if (offset > param_.rejoin_lateral_tolerance_m) {
     RCLCPP_INFO_THROTTLE(
@@ -1670,9 +1708,19 @@ void StuckRecoverySupervisorNode::step_blocked()
   }
   last_sweep_ = sweep(from);
   corridor_clear_ = last_sweep_.valid && last_sweep_.clear;
-  if (corridor_clear_) {
+
+  // Leaving BLOCKED must mean the robot is no longer STUCK -- not merely that the
+  // corridor reads clear.  Those are different questions, and conflating them span the
+  // watchdog: PROBE enters BLOCKED precisely BECAUSE the corridor reads clear (whatever
+  // holds the robot is not in the costmap), so exiting on "corridor clear" dropped it
+  // straight back into SUSPECT, one lap every few seconds, forever.  Ask the stop
+  // source and the odometer instead.
+  const bool still_held = stop_source_ == StuckDiagnosis::SOURCE_OBSTACLE_STOP ||
+                          stop_source_ == StuckDiagnosis::SOURCE_STOP_BEHIND ||
+                          stop_source_ == StuckDiagnosis::SOURCE_MAP_STOP;
+  if (!still_held || progress_since_entry_m_ > param_.unstuck_progress_m) {
     if ((this->now() - clear_since_).seconds() >= param_.clear_hold_sec) {
-      transition(State::NOMINAL, "blockage cleared on its own");
+      transition(State::NOMINAL, "no longer held: the robot is free to drive again");
     }
     return;
   }

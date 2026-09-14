@@ -390,6 +390,9 @@ private:
   bool corridor_clear_{false};
 
   uint32_t episode_id_{0};
+  // Stop source this episode was opened on.  STOP_BEHIND needs a different exit test
+  // from a normal blockage: its corridor reads clear from the very first tick.
+  uint8_t episode_stop_source_{0};
   uint16_t attempts_{0};
 
   geometry_msgs::msg::Pose entry_pose_{};
