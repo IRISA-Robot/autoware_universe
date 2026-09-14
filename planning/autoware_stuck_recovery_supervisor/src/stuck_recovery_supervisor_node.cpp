@@ -1079,6 +1079,27 @@ void StuckRecoverySupervisorNode::step_recovery()
       last_valid_plan_ = now;
       return;
     }
+    if (!rejoined_reference_path()) {
+      // Past the last goal but not back on the path: the manoeuvre is not finished, it
+      // has just run out of goals.  Look for a new one from where the robot actually is
+      // -- those are placed ON the reference path, so aiming at one pulls it back.
+      RCLCPP_WARN(
+        get_logger(),
+        "[episode %u] escape goal passed but the robot is %.2f m off the path (limit %.2f m) "
+        "-- looking for a goal to rejoin on rather than handing back",
+        episode_id_, lateral_offset_from_path(), param_.rejoin_lateral_tolerance_m);
+      goal_candidates_ = collect_goal_candidates();
+      goal_index_ = 0;
+      if (!goal_candidates_.empty() && publish_current_goal()) {
+        spent_since_ = now;
+        last_valid_plan_ = now;
+        return;
+      }
+      // Nothing to aim at and off the path: stopping is the only safe answer.  Handing an
+      // off-road robot back to lane driving is how this went wrong in the first place.
+      transition(State::ABORT, "ran out of escape goals while still off the path");
+      return;
+    }
     RCLCPP_INFO(
       get_logger(), "[episode %u] escape goal passed and none left ahead", episode_id_);
     cooldown_until_ = now + rclcpp::Duration::from_seconds(param_.cooldown_sec);
@@ -1336,7 +1357,9 @@ void StuckRecoverySupervisorNode::step_backoff()
   }
   last_sweep_ = sweep(from);
   corridor_clear_ = last_sweep_.valid && last_sweep_.clear;
-  if (corridor_clear_ && (now - clear_since_).seconds() >= param_.clear_hold_sec) {
+  if (
+    corridor_clear_ && (now - clear_since_).seconds() >= param_.clear_hold_sec &&
+    rejoined_reference_path()) {
     cooldown_until_ = now + rclcpp::Duration::from_seconds(param_.cooldown_sec);
     transition(State::COOLDOWN, "corridor cleared while backing off");
     return;
@@ -1733,6 +1756,10 @@ void StuckRecoverySupervisorNode::force_freespace_replan(const std::string & why
   // over by definition -- there is nothing left to escape towards.
   if (!goal_is_ahead(*escape_goal_)) {
     if (!advance_past_passed_goals()) {
+      if (!rejoined_reference_path()) {
+        transition(State::ABORT, "every escape goal is behind the robot and it is off the path");
+        return;
+      }
       RCLCPP_INFO(
         get_logger(), "[episode %u] every escape goal is behind the robot -- manoeuvre done (%s)",
         episode_id_, why.c_str());
@@ -1740,7 +1767,11 @@ void StuckRecoverySupervisorNode::force_freespace_replan(const std::string & why
       return;
     }
     if (!publish_current_goal()) {
-      transition(State::COOLDOWN, "no escape goal ahead of the robot is left");
+      if (rejoined_reference_path()) {
+        transition(State::COOLDOWN, "no escape goal ahead of the robot is left");
+      } else {
+        transition(State::ABORT, "no escape goal left and the robot is off the path");
+      }
       return;
     }
   }
@@ -1990,6 +2021,16 @@ double StuckRecoverySupervisorNode::lateral_offset_from_path() const
     return 0.0;
   }
   return distance2d(reference_path_[*nearest], odom_->pose.pose);
+}
+
+bool StuckRecoverySupervisorNode::rejoined_reference_path() const
+{
+  // Handing back while the robot is still out beside the obstacle is how it ended up off
+  // the road.  Only ONE of the hand-back paths used to check this; a manoeuvre that
+  // finished by driving past its escape goal skipped it entirely, so recovery could
+  // return a robot sitting two metres off the path to lane driving, which then had no
+  // way to fix it -- the next episode found the robot's own footprint inside an obstacle.
+  return lateral_offset_from_path() <= param_.rejoin_lateral_tolerance_m;
 }
 
 bool StuckRecoverySupervisorNode::goal_is_ahead(const geometry_msgs::msg::Pose & goal) const

@@ -30,6 +30,7 @@
 
 #include <limits>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -458,15 +459,44 @@ private:
   PathWithLaneId extendBackwardLength(const PathWithLaneId & original_path) const;
 
   /**
+   * @brief forget the "hold current registered shift plan" liveness state.
+   * @details see the [HOLD-ESCAPE] note in fillEgoStatus(). Called whenever the hold is exited so
+   *          that a later, unrelated hold starts its timeout from scratch.
+   */
+  void clearHoldState() const
+  {
+    hold_started_time_.reset();
+    hold_last_seen_time_.reset();
+    hold_trigger_object_id_.reset();
+  }
+
+  /**
    * @brief reset registered shift lines.
-   * @details reset only when the base offset is zero. Otherwise, sudden steering will be caused;
+   * @details reset only when the base offset is zero, OR when ego is (near-)stationary.
+   *          Otherwise, sudden steering will be caused;
    */
   void removeRegisteredShiftLines(const uint8_t state)
   {
     constexpr double threshold = 0.1;
-    if (std::abs(path_shifter_.getBaseOffset()) > threshold) {
+    // [RESET-WHEN-STOPPED 2026-09-14] The base-offset guard below exists to prevent sudden
+    // steering: clearing the registered shift lines while ego is mid-maneuver would make the
+    // committed plan jump. That hazard is a function of ego SPEED -- at standstill there is no
+    // steering transient to protect against, and refusing the reset there is what turns a
+    // temporary block into a permanent one: ego stops mid-shift (so base offset != 0), which
+    // makes this function a no-op forever, so generator_ is never reset, path_shifter_ is never
+    // cleared and unlockNewModuleLaunch() is never called -- the module can only be recovered by
+    // setting a new goal pose. Note this does NOT move ego laterally: base_offset_ is deliberately
+    // left untouched, so PathShifter::generate() keeps offsetting the whole path by ego's current
+    // lateral shift. Clearing only the shift LINES means "forget the stale plan, keep where I am,
+    // and replan from here" -- the generator then produces a fresh return-to-lane shift from
+    // ego's actual pose on the next cycle.
+    constexpr double stationary_ego_speed_threshold = 0.1;  // [m/s]
+    const auto ego_is_stationary = getEgoSpeed() < stationary_ego_speed_threshold;
+    if (std::abs(path_shifter_.getBaseOffset()) > threshold && !ego_is_stationary) {
       RCLCPP_INFO_THROTTLE(
-        getLogger(), *clock_, 3000, "base offset is not zero. can't reset registered shift lines.");
+        getLogger(), *clock_, 3000,
+        "base offset is not zero and ego is moving (v=%.3f). can't reset registered shift lines.",
+        getEgoSpeed());
       return;
     }
 
@@ -572,6 +602,16 @@ private:
 
   bool force_deactivated_{false};
   rclcpp::Time last_deactivation_triggered_time_;
+
+  // [HOLD-ESCAPE 2026-09-14] continuity/liveness tracking for the "hold current registered shift
+  // plan" branch in fillEgoStatus(). The hold itself is only sound while ego keeps moving forward
+  // (that is what makes the recomputed candidate evolve cycle to cycle); once ego is stopped the
+  // hold has no way out on its own. These track how long the hold has been continuously active
+  // and which object triggered it, so the hold can be abandoned instead of latching forever.
+  // Mutable because fillEgoStatus() is const.
+  mutable std::optional<rclcpp::Time> hold_started_time_;
+  mutable std::optional<rclcpp::Time> hold_last_seen_time_;
+  mutable std::optional<UUID> hold_trigger_object_id_;
 };
 
 }  // namespace autoware::behavior_path_planner

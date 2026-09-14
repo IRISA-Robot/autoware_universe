@@ -354,6 +354,9 @@ private:
   /// Advance goal_index_ past any candidate the robot has already passed.  Returns false
   /// when none are left ahead.
   bool advance_past_passed_goals();
+  /// True when the robot is close enough to the reference path that lane driving, which
+  /// drives that path, can take it back.  Every hand-back has to pass this.
+  bool rejoined_reference_path() const;
   /// Would following this plan drive into something the costmap now shows?
   bool recovery_path_is_blocked(const autoware_planning_msgs::msg::Trajectory & traj);
   /// Is the pose inside the recovery costmap window at all?  Used only to explain, in
