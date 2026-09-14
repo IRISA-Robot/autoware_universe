@@ -107,6 +107,21 @@
     # accepted that clearance.  Without it the brake latches on the inflation around the
     # robot and it can never move at all.
     aeb_skip_ahead_m: 0.3
+    # How far the robot may drift from the plan it is following before the plan stops
+    # describing where it is going.  This replaced a straight-line sweep ahead of the
+    # vehicle: a Reeds-Shepp escape is mostly turning, so the straight projection
+    # pointed into the obstacle the manoeuvre was curving around and braked for it.
+    aeb_max_deviation_m: 0.6
+    # Occupancy value at which the BRAKE treats a cell as solid.  Keep this equal to
+    # obstacle_threshold in recovery_freespace_planner.param.yaml.  Braking on cells the
+    # planner ignores means overruling a plan it validated moments earlier on the same
+    # grid -- the robot then holds against its own escape route until the episode times
+    # out, which is a deadlock rather than a safety net.  The margin above is likewise
+    # kept below the planner's vehicle_shape_margin_m, for the same reason.
+    aeb_occupancy_threshold: 100
+    # A brake held this long is not a passing hazard -- the plan is not drivable.
+    # Replan instead of holding until the episode times out.
+    aeb_hold_replan_sec: 3.0
     # Reversing a long way is fine as long as it gets the robot past the obstacle; this
     # is a runaway stop, not a shaping knob.  Hard-clamped to 20 m in the node.
     max_reverse_distance_m: 10.0

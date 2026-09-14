@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -151,6 +153,10 @@ void StuckRecoverySupervisorNode::load_parameters()
   p.aeb_lookahead_m = declare_parameter<double>("aeb_lookahead_m", 1.5);
   p.aeb_margin_m = declare_parameter<double>("aeb_margin_m", 0.05);
   p.aeb_skip_ahead_m = declare_parameter<double>("aeb_skip_ahead_m", 0.3);
+  p.aeb_max_deviation_m = declare_parameter<double>("aeb_max_deviation_m", 0.6);
+  p.aeb_occupancy_threshold =
+    static_cast<int>(declare_parameter<int64_t>("aeb_occupancy_threshold", 100));
+  p.aeb_hold_replan_sec = declare_parameter<double>("aeb_hold_replan_sec", 3.0);
   p.max_reverse_distance_m = declare_parameter<double>("max_reverse_distance_m", 10.0);
   p.max_total_reverse_distance_m =
     declare_parameter<double>("max_total_reverse_distance_m", 15.0);
@@ -793,6 +799,7 @@ void StuckRecoverySupervisorNode::transition(State next, const std::string & rea
     state_name(next).c_str(), reason.c_str());
   state_ = next;
   state_since_ = this->now();
+  aeb_holding_ = false;
   if (next == State::COOLDOWN || next == State::BLOCKED || next == State::ABORT) {
     // The scenario is no longer driving; drop the plan and goal so that re-arming later
     // cannot resurrect them.
@@ -1043,6 +1050,16 @@ void StuckRecoverySupervisorNode::step_recovery()
     transition(State::ABORT, "episode watchdog expired");
     return;
   }
+  // A brake that has been on for seconds is not protecting against something passing
+  // through -- the plan it is braking against is not drivable.  Holding it until the
+  // episode times out is how a whole 60 s recovery was lost with the robot never moving,
+  // so ask for a different plan instead.
+  if (aeb_holding_ && (now - aeb_hold_since_).seconds() > param_.aeb_hold_replan_sec) {
+    aeb_holding_ = false;
+    force_freespace_replan("the emergency brake has been holding against this plan");
+    return;
+  }
+
   // Freespace keeps publishing stop trajectories while it fails, so "has a plan" has
   // to mean "the trajectory actually moves the robot".
   start_blocked_ = odom_ && costmap_is_fresh() && !footprint_is_free(odom_->pose.pose);
@@ -1620,10 +1637,17 @@ void StuckRecoverySupervisorNode::relay_recovery_trajectory()
     for (auto & point : traj.points) {
       point.longitudinal_velocity_mps = 0.0f;
     }
+    if (!aeb_holding_) {
+      aeb_holding_ = true;
+      aeb_hold_since_ = this->now();
+    }
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 1000,
-      "[episode %u] recovery AEB in %s: obstacle within %.2f m of the planned path -- holding",
-      episode_id_, state_name(state_).c_str(), param_.aeb_lookahead_m);
+      "[episode %u] recovery AEB in %s: %s -- holding for %.1f s",
+      episode_id_, state_name(state_).c_str(), aeb_reason_.c_str(),
+      (this->now() - aeb_hold_since_).seconds());
+  } else {
+    aeb_holding_ = false;
   }
 
   pub_recovery_traj_->publish(traj);
@@ -1914,11 +1938,14 @@ bool StuckRecoverySupervisorNode::capture_reference_path()
 
 bool StuckRecoverySupervisorNode::footprint_is_free(const geometry_msgs::msg::Pose & pose) const
 {
-  return footprint_is_free_with_margin(pose, param_.goal_shape_margin_m);
+  // Goal placement stays on the stricter planning threshold: where the robot is asked
+  // to come to REST, a cell that is only probably occupied is reason enough to move on.
+  return footprint_is_free_with_margin(
+    pose, param_.goal_shape_margin_m, param_.occupancy_threshold);
 }
 
 bool StuckRecoverySupervisorNode::footprint_is_free_with_margin(
-  const geometry_msgs::msg::Pose & pose, double margin) const
+  const geometry_msgs::msg::Pose & pose, double margin, int threshold) const
 {
   if (!costmap_is_fresh() || grid_->info.resolution <= 0.0 || grid_->data.empty()) {
     return false;
@@ -1945,7 +1972,7 @@ bool StuckRecoverySupervisorNode::footprint_is_free_with_margin(
       }
       const auto value =
         grid_->data[static_cast<size_t>(row) * grid_->info.width + static_cast<size_t>(col)];
-      if (value < 0 || value >= param_.occupancy_threshold) {
+      if (value < 0 || value >= threshold) {
         return false;
       }
     }
@@ -2010,6 +2037,7 @@ bool StuckRecoverySupervisorNode::recovery_path_is_blocked(
       get_logger(), *get_clock(), 1000,
       "[episode %u] recovery AEB: costmap is stale, holding rather than driving blind",
       episode_id_);
+    aeb_reason_ = "costmap is stale";
     return true;
   }
 
@@ -2036,27 +2064,41 @@ bool StuckRecoverySupervisorNode::recovery_path_is_blocked(
     if (arc > param_.aeb_lookahead_m) {
       break;
     }
-    if (!footprint_is_free_with_margin(it->pose, param_.aeb_margin_m)) {
+    if (!footprint_is_free_with_margin(it->pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)) {
+      // Say exactly where, so a false brake can be checked against the costmap in rviz
+      // instead of argued about.
+      std::ostringstream why;
+      why << "plan is blocked " << std::fixed << std::setprecision(2) << arc << " m along it, at ("
+          << it->pose.position.x << ", " << it->pose.position.y << "), footprint margin "
+          << param_.aeb_margin_m << " m, threshold " << param_.aeb_occupancy_threshold;
+      aeb_reason_ = why.str();
       return true;
     }
   }
 
-  // (b) Where the ROBOT is actually going.  (a) only vouches for the path; if tracking
-  // has put the robot off it, the plan can read clear while the robot drives into
-  // something.  Sweep straight out from the current pose along the direction of travel,
-  // forwards or backwards, taken from the sign of the plan being followed.
+  // (b) Is the robot still ON the plan?  (a) only vouches for the path, so if tracking
+  // has put the robot somewhere else the plan can read clear while the robot drives into
+  // something.
+  //
+  // This used to sweep a straight line out from the ego pose along the direction of
+  // travel, and that was wrong in the one scenario it runs in: a Reeds-Shepp escape is
+  // mostly turning, so the straight projection pointed into the very obstacle the
+  // manoeuvre was curving around.  It held the brake for an entire 60 s episode until
+  // recovery timed out -- braking for the thing recovery exists to get past.
+  //
+  // Deviation is the honest form of the question, and unlike a straight projection it
+  // cannot contradict a plan the planner has already validated.
   if (travel_sign == 0.0) {
     return false;  // nothing is being commanded; nothing to brake for
   }
-  const auto & ego = odom_->pose.pose;
-  const double yaw = tf2::getYaw(ego.orientation);
-  for (double d = param_.aeb_skip_ahead_m; d <= param_.aeb_lookahead_m; d += 0.1) {
-    geometry_msgs::msg::Pose probe = ego;
-    probe.position.x += travel_sign * d * std::cos(yaw);
-    probe.position.y += travel_sign * d * std::sin(yaw);
-    if (!footprint_is_free_with_margin(probe, param_.aeb_margin_m)) {
-      return true;
-    }
+  const double deviation = distance2d(nearest->pose, odom_->pose.pose);
+  if (deviation > param_.aeb_max_deviation_m) {
+    aeb_reason_ = "robot is off the plan it is following";
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "[episode %u] recovery AEB: robot is %.2f m off the plan it is following (limit %.2f m)",
+      episode_id_, deviation, param_.aeb_max_deviation_m);
+    return true;
   }
   return false;
 }

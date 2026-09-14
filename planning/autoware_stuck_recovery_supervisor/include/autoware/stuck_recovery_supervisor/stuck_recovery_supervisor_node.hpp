@@ -172,6 +172,18 @@ private:
     // that clearance when it produced the plan.  Without this the brake latches on the
     // inflation around the robot and it can never move at all.
     double aeb_skip_ahead_m{0.3};
+    // How far the robot may be from the plan it is following before the plan stops
+    // describing where it is going and the brake goes on.
+    double aeb_max_deviation_m{0.6};
+    // Occupancy value at which the BRAKE considers a cell solid.  Must match the
+    // recovery freespace planner's obstacle_threshold: braking on cells the planner
+    // ignores means overruling a plan it just validated on the same grid, which is a
+    // deadlock, not a safety net.
+    int aeb_occupancy_threshold{100};
+    // A brake that has been on this long is not protecting against a passing hazard --
+    // the plan is no longer drivable, so replan instead of holding until the episode
+    // times out.  That deadlock is exactly what a whole 60 s episode was lost to.
+    double aeb_hold_replan_sec{3.0};
     double max_reverse_distance_m{10.0};
     // Cumulative reverse budget across episodes.  The per-episode limit above cannot
     // bound an obstacle that keeps advancing on the robot: every new episode hands out a
@@ -332,7 +344,8 @@ private:
   bool footprint_is_free(const geometry_msgs::msg::Pose & pose) const;
   /// Same test with a chosen margin, so the emergency brake can be stricter about what
   /// counts as a collision than the goal search is about where it may aim.
-  bool footprint_is_free_with_margin(const geometry_msgs::msg::Pose & pose, double margin) const;
+  bool footprint_is_free_with_margin(
+    const geometry_msgs::msg::Pose & pose, double margin, int threshold) const;
   /// Lateral distance from the robot to the reference path; the measure of "has rejoined".
   double lateral_offset_from_path() const;
   /// Is `goal` still ahead of the robot ALONG THE PATH?  Measured by arc position, not by
@@ -397,6 +410,10 @@ private:
   // Stop source this episode was opened on.  STOP_BEHIND needs a different exit test
   // from a normal blockage: its corridor reads clear from the very first tick.
   uint8_t episode_stop_source_{0};
+  // When the emergency brake first went on, to tell a passing hazard from a dead plan.
+  rclcpp::Time aeb_hold_since_{0, 0, RCL_ROS_TIME};
+  bool aeb_holding_{false};
+  std::string aeb_reason_;
   uint16_t attempts_{0};
 
   geometry_msgs::msg::Pose entry_pose_{};
