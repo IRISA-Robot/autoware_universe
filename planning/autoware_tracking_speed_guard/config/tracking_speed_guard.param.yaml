@@ -1,0 +1,53 @@
+/**:
+  ros__parameters:
+    update_rate_hz: 10.0
+
+    # --- when is tracking "bad" -------------------------------------------------
+    # Two ramps.  Below the _ok value the error costs nothing at all; at the _bad value
+    # the cap is all the way down at v_floor_mps; in between the cap is interpolated, so
+    # the robot eases off instead of stepping off a cliff.  The WORSE of the two ramps
+    # decides -- averaging them would let a robot pointing 30 degrees wrong carry on at
+    # speed just because it happens to be sitting on the line.
+    #
+    # These are first guesses.  The node publishes the measured errors on
+    # ~/debug/tracking_error every tick; calibrate from a bag before tightening them.
+    lat_ok_m: 0.3
+    lat_bad_m: 1.0
+    yaw_ok_rad: 0.17    # 10 deg
+    yaw_bad_rad: 0.52   # 30 deg
+
+    # --- the speed range the cap moves through ----------------------------------
+    # Ceiling.  Keep this equal to max_vel in
+    # config/planning/scenario_planning/common/common.param.yaml -- the selector already
+    # caps there, so anything higher here does nothing.
+    v_free_mps: 1.8
+    # Floor.  Deliberately not below 1 km/h: under roughly this the velocity smoother
+    # refuses to engage at all (stop_dist_to_prohibit_engage), which looks exactly like a
+    # robot frozen for no reason -- a failure this stack has already produced once.
+    v_floor_mps: 0.278
+
+    # How long both errors must stay in the clear before the cap is released.  Without the
+    # hold the cap flickers on and off while the robot settles around the threshold.
+    clear_hold_sec: 2.0
+
+    # Trajectory or odometry older than this counts as missing, and the cap is released.
+    # Holding the robot slow on the strength of a stale measurement is worse than letting
+    # go: the reason for the cap can no longer be checked.
+    input_timeout_sec: 1.0
+
+    # Only act while Autoware is actually driving.
+    require_autonomous: true
+
+    # The selector keeps one limit per sender and applies the smallest of them, so this
+    # name is what keeps this cap from fighting the obstacle, surround-check and MRM
+    # limits -- and what lets this node clear its own limit without touching theirs.
+    sender: "tracking_speed_guard"
+
+    # Same trajectory the controller follows (the planning_validator output), so the errors
+    # measured here are the ones the controller is actually acting on.
+    topic_trajectory: "/planning/trajectory"
+    topic_odometry: "/localization/kinematic_state"
+    topic_operation_mode: "/api/operation_mode/state"
+    topic_out_velocity_limit: "/planning/scenario_planning/max_velocity_candidates"
+    topic_out_clear_command: "/planning/scenario_planning/clear_velocity_limit"
+    topic_out_debug: "~/debug/tracking_error"

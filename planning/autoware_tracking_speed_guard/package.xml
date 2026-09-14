@@ -1,0 +1,61 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>autoware_tracking_speed_guard</name>
+  <version>0.1.0</version>
+  <description>
+    Slows the robot down while it is tracking the trajectory badly.
+
+    The node runs alongside the trajectory follower: it takes the same inputs the
+    controller takes -- the trajectory the controller is following and the vehicle
+    odometry -- and computes the same two quantities the MPC computes, the lateral
+    error and the heading error against the nearest point of that trajectory.  The
+    difference is the output: the MPC steers, this node only lowers a speed limit.
+
+    Nothing else in the stack does this.  The MPC has no error threshold at all and
+    no way to influence speed, and the planning validator's deviation checks are
+    configured with thresholds that never trip.  So a robot that has been left far
+    from its path -- after a recovery manoeuvre, say -- chases it at full speed.
+
+    The limit is published on the external velocity limit channel under its own
+    sender name, so it composes with every other limit in the system rather than
+    overriding them.  It is released only once BOTH errors have been small for a
+    while.
+
+    Forward and reverse missions are treated identically: the heading error is
+    measured against the direction of travel taken from the trajectory's velocity
+    sign, exactly as the MPC does, so one definition holds in both motion modes.
+  </description>
+
+  <maintainer email="azzamwildan5@gmail.com">azzamwildan462</maintainer>
+  <license>Apache License 2.0</license>
+
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
+  <buildtool_depend>autoware_cmake</buildtool_depend>
+
+  <!-- Core ROS2 -->
+  <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
+
+  <!-- Autoware msgs -->
+  <depend>autoware_planning_msgs</depend>
+  <depend>autoware_internal_planning_msgs</depend>
+  <depend>autoware_internal_debug_msgs</depend>
+  <depend>autoware_adapi_v1_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>diagnostic_updater</depend>
+
+  <!-- Geometry helpers -->
+  <depend>autoware_motion_utils</depend>
+  <depend>autoware_utils</depend>
+  <depend>tf2</depend>
+  <depend>tf2_geometry_msgs</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>autoware_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
