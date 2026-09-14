@@ -54,6 +54,10 @@ struct CorridorParams
   // read as blocked and drag the minimum to zero.
   double max_arc_m{8.0};
   double max_scan_half_width_m{4.0};  // how far sideways a ray is allowed to travel
+  // How far sideways the robot may work its way per metre travelled.  The corridor is
+  // measured relative to the path, and a real free band drifts as the path curves, so
+  // demanding one fixed offset the whole way is not a test any real detour passes.
+  double max_lateral_shift_per_m{1.0};
   double vehicle_width_m{0.78};
   double lateral_margin_m{0.15};
   int8_t occupancy_threshold{50};  // cell >= this is occupied; unknown (-1) counts too

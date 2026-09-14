@@ -22,6 +22,8 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <limits>
 #include <optional>
@@ -152,25 +154,76 @@ CorridorResult sweep_corridor(
   const double step = std::max(grid.info.resolution * 0.5, 0.02);
   const double half_footprint = params.vehicle_width_m * 0.5 + params.lateral_margin_m;
 
-  // Feasibility is evaluated PER LATERAL OFFSET, held across the whole corridor.
+  // Feasibility is a question of CONNECTIVITY along the corridor, per side.
   //
-  // Taking a per-station minimum width and, separately, the offset at whichever station
-  // produced it, let the two disagree: the corridor was measured 3.3 m wide at the
-  // obstacle, sitting in a wide lanelet, and the robot was told to shift 2.3 m sideways
-  // -- into a wall, because the stretch it had to cross first was narrow.  A width
-  // somewhere and an offset somewhere else is not a route.
+  // Two wrong answers were tried before this one.  Taking a per-station minimum width
+  // and, separately, the offset at whichever station produced it let the two disagree:
+  // the corridor measured 3.3 m at the obstacle, which sat in a wide lanelet, and the
+  // robot was told to shift 2.3 m sideways -- into a wall, because the stretch it had to
+  // cross first was narrow.  Requiring instead a single offset free at EVERY station was
+  // the opposite error: offsets are measured against the path, the free band drifts as
+  // the path curves, and on the robot the intersection over 8 m was empty even though
+  // every individual station had room.  Neither describes what a detour does.
   //
-  // So discretise the lateral axis once and, for every candidate offset, keep the
-  // SMALLEST free span that offset ever sat in.  An offset that is blocked at any single
-  // station -- or where the footprint does not fit -- collapses to zero and is out.
-  // Whatever survives is passable from end to end at one fixed offset, which is what the
-  // robot is actually being asked to do.
+  // So propagate reachability.  Start from the offsets the robot can occupy now, and at
+  // each station allow it to have worked its way sideways by max_lateral_shift_per_m for
+  // the distance travelled, then intersect with what is admissible there.  A band that
+  // drifts is followed; a band that jumps -- the far side of a wall the robot cannot
+  // cross in the distance available -- is not.  Run per side, so left stays left.
   const size_t lateral_bins =
     static_cast<size_t>(2.0 * params.max_scan_half_width_m / step) + 1;
-  std::vector<double> width_at(lateral_bins, std::numeric_limits<double>::max());
-  std::vector<geometry_msgs::msg::Pose> pose_at(lateral_bins);
   const auto offset_of = [&](size_t bin) {
     return -params.max_scan_half_width_m + static_cast<double>(bin) * step;
+  };
+
+  std::vector<double> station_width(lateral_bins, 0.0);
+  std::vector<char> reach_left(lateral_bins, 0);
+  std::vector<char> reach_right(lateral_bins, 0);
+  std::vector<char> grown(lateral_bins, 0);
+  bool seeded = false;
+
+  // Narrowest passage along each side's reachable route.
+  double min_left = std::numeric_limits<double>::max();
+  double min_right = std::numeric_limits<double>::max();
+  double left_offset_at_min = 0.0;
+  double right_offset_at_min = 0.0;
+  geometry_msgs::msg::Pose left_pose_at_min{};
+  geometry_msgs::msg::Pose right_pose_at_min{};
+
+  // Let the robot work sideways by this many bins between two stations.
+  const auto shift_bins = [&](double travelled) {
+    return static_cast<size_t>(
+      std::max(1.0, std::ceil(params.max_lateral_shift_per_m * travelled / step)));
+  };
+
+  // reach := dilate(reach, bins) & admissible-at-this-station
+  const auto advance = [&](std::vector<char> & reach, size_t bins) {
+    std::fill(grown.begin(), grown.end(), 0);
+    for (size_t b = 0; b < lateral_bins; ++b) {
+      if (!reach[b]) {
+        continue;
+      }
+      const size_t lo = (b > bins) ? b - bins : 0;
+      const size_t hi = std::min(lateral_bins - 1, b + bins);
+      for (size_t q = lo; q <= hi; ++q) {
+        grown[q] = 1;
+      }
+    }
+    for (size_t b = 0; b < lateral_bins; ++b) {
+      reach[b] = (grown[b] && station_width[b] > 0.0) ? 1 : 0;
+    }
+  };
+
+  // Widest passage still reachable at this station, and where it is.
+  const auto best_of = [&](const std::vector<char> & reach, double & width, double & offset) {
+    width = 0.0;
+    offset = 0.0;
+    for (size_t b = 0; b < lateral_bins; ++b) {
+      if (reach[b] && station_width[b] > width) {
+        width = station_width[b];
+        offset = offset_of(b);
+      }
+    }
   };
 
   bool clear = true;
@@ -192,6 +245,7 @@ CorridorResult sweep_corridor(
     if (since_last_sample < params.step_m) {
       continue;
     }
+    const double travelled_since_sample = std::max(since_last_sample, params.step_m);
     since_last_sample = 0.0;
 
     const auto & pose = path[i];
@@ -223,10 +277,53 @@ CorridorResult sweep_corridor(
           usable = std::max(usable, span.width());
         }
       }
-      if (usable < width_at[bin]) {
-        width_at[bin] = usable;
-        pose_at[bin] = pose;
+      station_width[bin] = usable;
+    }
+
+    if (!seeded) {
+      // Seed with everything the robot could be sitting in right now, split by side.
+      for (size_t b = 0; b < lateral_bins; ++b) {
+        const bool open = station_width[b] > 0.0;
+        reach_left[b] = (open && offset_of(b) >= 0.0) ? 1 : 0;
+        reach_right[b] = (open && offset_of(b) <= 0.0) ? 1 : 0;
       }
+      seeded = true;
+    } else {
+      const size_t bins = shift_bins(travelled_since_sample);
+      advance(reach_left, bins);
+      advance(reach_right, bins);
+    }
+
+    // Per-station trace, off unless CORRIDOR_DEBUG is set.  Whether a corridor is
+    // passable is decided over 30-odd stations at once, and the single width that comes
+    // out cannot show which station killed it -- this can, and it is how the two wrong
+    // models before this one were caught.
+    static const bool trace = std::getenv("CORRIDOR_DEBUG") != nullptr;
+    if (trace) {
+      size_t nl = 0, nr = 0, na = 0;
+      for (size_t b = 0; b < lateral_bins; ++b) {
+        nl += reach_left[b] ? 1 : 0;
+        nr += reach_right[b] ? 1 : 0;
+        na += station_width[b] > 0.0 ? 1 : 0;
+      }
+      std::fprintf(
+        stderr, "[corridor] arc=%.2f x=%.2f y=%.2f adm=%zu reachL=%zu reachR=%zu spans=%zu\n",
+        arc_from_start, px, py, na, nl, nr, spans.size());
+    }
+
+    double w = 0.0;
+    double off = 0.0;
+    best_of(reach_left, w, off);
+    if (w < min_left) {
+      min_left = w;
+      left_offset_at_min = off;
+      left_pose_at_min = pose;
+    }
+    best_of(reach_right, w, off);
+    if (w < min_right) {
+      min_right = w;
+      right_offset_at_min = off;
+      right_pose_at_min = pose;
     }
 
     // EXIT question, deliberately a different test: the robot must fit *centred on
@@ -257,33 +354,8 @@ CorridorResult sweep_corridor(
   }
 
   result.valid = true;
-
-  // Best offset per side, over offsets that survived every station.  Offset 0 belongs to
-  // both sides: driving straight through commits the robot to neither.
-  double best_left = 0.0;
-  double best_right = 0.0;
-  double left_offset_at_min = 0.0;
-  double right_offset_at_min = 0.0;
-  geometry_msgs::msg::Pose left_pose_at_min{};
-  geometry_msgs::msg::Pose right_pose_at_min{};
-  for (size_t bin = 0; bin < lateral_bins; ++bin) {
-    const double width = (width_at[bin] == std::numeric_limits<double>::max()) ? 0.0
-                                                                              : width_at[bin];
-    const double offset = offset_of(bin);
-    if (offset >= 0.0 && width > best_left) {
-      best_left = width;
-      left_offset_at_min = offset;
-      left_pose_at_min = pose_at[bin];
-    }
-    if (offset <= 0.0 && width > best_right) {
-      best_right = width;
-      right_offset_at_min = offset;
-      right_pose_at_min = pose_at[bin];
-    }
-  }
-
-  result.free_left_m = best_left;
-  result.free_right_m = best_right;
+  result.free_left_m = (min_left == std::numeric_limits<double>::max()) ? 0.0 : min_left;
+  result.free_right_m = (min_right == std::numeric_limits<double>::max()) ? 0.0 : min_right;
   result.clear = clear;
 
   // Commit to the better single side -- never the sum, never a per-station mix.

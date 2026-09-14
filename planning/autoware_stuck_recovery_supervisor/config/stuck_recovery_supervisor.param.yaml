@@ -43,6 +43,12 @@
     # to "fit" is vehicle_width + 2 * this, i.e. 0.78 + 0.30 = 1.08 m by default.
     lateral_margin_m: 0.15
     max_scan_half_width_m: 4.0
+    # How far sideways the robot may work its way per metre travelled, used when
+    # deciding whether a detour is reachable.  Offsets are measured against the path
+    # and the free band drifts as the path curves, so a corridor is judged by whether
+    # the robot can FOLLOW the band, not by whether one fixed offset is free the whole
+    # way.  1.0 means it may move a metre sideways per metre forward.
+    max_lateral_shift_per_m: 1.0
     occupancy_threshold: 50
 
     # --- recovery ----------------------------------------------------------
