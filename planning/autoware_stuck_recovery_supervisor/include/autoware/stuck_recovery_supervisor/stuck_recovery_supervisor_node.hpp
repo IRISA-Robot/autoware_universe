@@ -152,6 +152,22 @@ private:
     double goal_shape_margin_m{0.2};
     double recovery_timeout_sec{60.0};
     double clear_hold_sec{1.0};
+    // Recovery may only hand back once the robot has REJOINED the path.  Judging the exit
+    // purely on "the corridor ahead is clear" let it hand back while still standing beside
+    // the obstacle: the robot's projection onto the path had already advanced past the
+    // blockage, so the sweep looked clear, while lane driving -- which drives the path
+    // itself -- still saw the obstacle and stopped again.  That disagreement is what made
+    // the state flip between Recovery and LaneDriving indefinitely.
+    double rejoin_lateral_tolerance_m{0.5};
+
+    // Recovery's own emergency brake.  The relayed plan was computed against an older
+    // costmap; if the world has since put something in it, stop rather than drive it.
+    double aeb_lookahead_m{1.5};
+    double aeb_margin_m{0.05};
+    // Ignore anything this close: the robot is already there, and the planner accepted
+    // that clearance when it produced the plan.  Without this the brake latches on the
+    // inflation around the robot and it can never move at all.
+    double aeb_skip_ahead_m{0.3};
     double max_reverse_distance_m{10.0};
     // Cumulative reverse budget across episodes.  The per-episode limit above cannot
     // bound an obstacle that keeps advancing on the robot: every new episode hands out a
@@ -310,6 +326,19 @@ private:
   /// Is the inflated vehicle footprint at `pose` clear of the recovery grid?  Off-grid
   /// counts as blocked, which also keeps the goal inside the costmap window.
   bool footprint_is_free(const geometry_msgs::msg::Pose & pose) const;
+  /// Same test with a chosen margin, so the emergency brake can be stricter about what
+  /// counts as a collision than the goal search is about where it may aim.
+  bool footprint_is_free_with_margin(const geometry_msgs::msg::Pose & pose, double margin) const;
+  /// Lateral distance from the robot to the reference path; the measure of "has rejoined".
+  double lateral_offset_from_path() const;
+  /// Is `goal` still ahead of the robot ALONG THE PATH?  Measured by arc position, not by
+  /// the vehicle heading: on a reversed route the goal is legitimately behind the nose.
+  bool goal_is_ahead(const geometry_msgs::msg::Pose & goal) const;
+  /// Advance goal_index_ past any candidate the robot has already passed.  Returns false
+  /// when none are left ahead.
+  bool advance_past_passed_goals();
+  /// Would following this plan drive into something the costmap now shows?
+  bool recovery_path_is_blocked(const autoware_planning_msgs::msg::Trajectory & traj);
   /// Is the pose inside the recovery costmap window at all?  Used only to explain, in
   /// the log, why candidates were skipped.
   bool pose_is_on_grid(const geometry_msgs::msg::Pose & pose) const;
