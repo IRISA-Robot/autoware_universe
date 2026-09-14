@@ -152,14 +152,26 @@ CorridorResult sweep_corridor(
   const double step = std::max(grid.info.resolution * 0.5, 0.02);
   const double half_footprint = params.vehicle_width_m * 0.5 + params.lateral_margin_m;
 
-  // Per-side minima along the corridor.  Aggregating each side independently is the
-  // whole point: the robot has to stay on ONE side for the entire stretch.
-  double min_left = std::numeric_limits<double>::max();
-  double min_right = std::numeric_limits<double>::max();
-  double left_offset_at_min = 0.0;
-  double right_offset_at_min = 0.0;
-  geometry_msgs::msg::Pose left_pose_at_min{};
-  geometry_msgs::msg::Pose right_pose_at_min{};
+  // Feasibility is evaluated PER LATERAL OFFSET, held across the whole corridor.
+  //
+  // Taking a per-station minimum width and, separately, the offset at whichever station
+  // produced it, let the two disagree: the corridor was measured 3.3 m wide at the
+  // obstacle, sitting in a wide lanelet, and the robot was told to shift 2.3 m sideways
+  // -- into a wall, because the stretch it had to cross first was narrow.  A width
+  // somewhere and an offset somewhere else is not a route.
+  //
+  // So discretise the lateral axis once and, for every candidate offset, keep the
+  // SMALLEST free span that offset ever sat in.  An offset that is blocked at any single
+  // station -- or where the footprint does not fit -- collapses to zero and is out.
+  // Whatever survives is passable from end to end at one fixed offset, which is what the
+  // robot is actually being asked to do.
+  const size_t lateral_bins =
+    static_cast<size_t>(2.0 * params.max_scan_half_width_m / step) + 1;
+  std::vector<double> width_at(lateral_bins, std::numeric_limits<double>::max());
+  std::vector<geometry_msgs::msg::Pose> pose_at(lateral_bins);
+  const auto offset_of = [&](size_t bin) {
+    return -params.max_scan_half_width_m + static_cast<double>(bin) * step;
+  };
 
   bool clear = true;
   bool first_blocked_recorded = false;
@@ -202,48 +214,19 @@ CorridorResult sweep_corridor(
     // LEFT gaps, beyond its right edge are RIGHT gaps.  If the path itself is free,
     // the span straddling 0 is the corridor we are already in, and it is credited to
     // both sides because the robot can reach it without committing to either.
-    double station_left = 0.0;
-    double station_right = 0.0;
-    double station_left_offset = 0.0;
-    double station_right_offset = 0.0;
-
-    for (const auto & span : spans) {
-      const double width = span.width();
-      if (width <= 0.0) {
-        continue;
-      }
-      if (span.contains(0.0)) {
-        // Straddles the path: usable from either side.
-        if (width > station_left) {
-          station_left = width;
-          station_left_offset = span.centre();
-        }
-        if (width > station_right) {
-          station_right = width;
-          station_right_offset = span.centre();
-        }
-      } else if (span.centre() > 0.0) {
-        if (width > station_left) {
-          station_left = width;
-          station_left_offset = span.centre();
-        }
-      } else {
-        if (width > station_right) {
-          station_right = width;
-          station_right_offset = span.centre();
+    for (size_t bin = 0; bin < lateral_bins; ++bin) {
+      const double offset = offset_of(bin);
+      double usable = 0.0;
+      for (const auto & span : spans) {
+        // The robot must fit centred on this offset, not merely touch the span.
+        if (span.from <= offset - half_footprint && offset + half_footprint <= span.to) {
+          usable = std::max(usable, span.width());
         }
       }
-    }
-
-    if (station_left < min_left) {
-      min_left = station_left;
-      left_offset_at_min = station_left_offset;
-      left_pose_at_min = pose;
-    }
-    if (station_right < min_right) {
-      min_right = station_right;
-      right_offset_at_min = station_right_offset;
-      right_pose_at_min = pose;
+      if (usable < width_at[bin]) {
+        width_at[bin] = usable;
+        pose_at[bin] = pose;
+      }
     }
 
     // EXIT question, deliberately a different test: the robot must fit *centred on
@@ -274,8 +257,33 @@ CorridorResult sweep_corridor(
   }
 
   result.valid = true;
-  result.free_left_m = (min_left == std::numeric_limits<double>::max()) ? 0.0 : min_left;
-  result.free_right_m = (min_right == std::numeric_limits<double>::max()) ? 0.0 : min_right;
+
+  // Best offset per side, over offsets that survived every station.  Offset 0 belongs to
+  // both sides: driving straight through commits the robot to neither.
+  double best_left = 0.0;
+  double best_right = 0.0;
+  double left_offset_at_min = 0.0;
+  double right_offset_at_min = 0.0;
+  geometry_msgs::msg::Pose left_pose_at_min{};
+  geometry_msgs::msg::Pose right_pose_at_min{};
+  for (size_t bin = 0; bin < lateral_bins; ++bin) {
+    const double width = (width_at[bin] == std::numeric_limits<double>::max()) ? 0.0
+                                                                              : width_at[bin];
+    const double offset = offset_of(bin);
+    if (offset >= 0.0 && width > best_left) {
+      best_left = width;
+      left_offset_at_min = offset;
+      left_pose_at_min = pose_at[bin];
+    }
+    if (offset <= 0.0 && width > best_right) {
+      best_right = width;
+      right_offset_at_min = offset;
+      right_pose_at_min = pose_at[bin];
+    }
+  }
+
+  result.free_left_m = best_left;
+  result.free_right_m = best_right;
   result.clear = clear;
 
   // Commit to the better single side -- never the sum, never a per-station mix.

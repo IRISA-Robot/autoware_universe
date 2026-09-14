@@ -64,6 +64,11 @@
     min_long_distance_to_check: 3.0
     goal_offset_beyond_obstacle_m: 2.0
     goal_check_interval_m: 1.0
+    # A goal is only placed where the path has already been clear for this long.  Testing
+    # the goal's own footprint alone accepted a pose that was free but wedged a few
+    # centimetres past the obstacle it had just cleared -- no place to come to rest.
+    # The search is first-fit: the first point with this much clear path behind it wins.
+    goal_min_clear_length_m: 2.0
     max_goal_search_distance_m: 30.0
     # Must mirror vehicle_shape_margin_m in recovery_freespace_planner.param.yaml.  The
     # escape goal is validated against the same inflated footprint freespace will use,

@@ -145,6 +145,10 @@ private:
     // obstacle, where freespace has no reason to go around it at all.
     double goal_offset_beyond_obstacle_m{2.0};
     double goal_check_interval_m{1.0};
+    // A goal is only placed where the path has already been clear for this long.  A
+    // single free footprint is not enough: it can sit wedged a handful of centimetres
+    // past the obstacle, which is where the robot was being sent.
+    double goal_min_clear_length_m{2.0};
     double max_goal_search_distance_m{30.0};
     // Mirror of vehicle_shape_margin_m in the recovery freespace profile.  The escape
     // goal is validated against the same inflated footprint freespace will use, so we

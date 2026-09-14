@@ -140,6 +140,8 @@ void StuckRecoverySupervisorNode::load_parameters()
   p.goal_offset_beyond_obstacle_m =
     declare_parameter<double>("goal_offset_beyond_obstacle_m", 2.0);
   p.goal_check_interval_m = declare_parameter<double>("goal_check_interval_m", 1.0);
+  p.goal_min_clear_length_m =
+    declare_parameter<double>("goal_min_clear_length_m", 2.0);
   p.max_goal_search_distance_m = declare_parameter<double>("max_goal_search_distance_m", 30.0);
   p.goal_shape_margin_m = declare_parameter<double>("goal_shape_margin_m", 0.2);
   p.recovery_timeout_sec = declare_parameter<double>("recovery_timeout_sec", 60.0);
@@ -1379,16 +1381,44 @@ std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_
       search_from, last_sweep_.first_blocked_arc_m + param_.goal_offset_beyond_obstacle_m);
   }
 
+  // First fit along the path, rather than a fixed offset from the nearest obstacle.
+  //
+  // Testing only the goal's own footprint accepted a pose that was free but wedged
+  // against the obstacle it had just cleared -- the goal ended up a few centimetres from
+  // something solid behind it, which is no place to ask the robot to come to rest.  So
+  // walk the path continuously, track how long it has been free without interruption,
+  // and take the FIRST point that already has goal_min_clear_length_m of clear path
+  // behind it.  Later candidates are collected the same way as fallbacks.
+  // Upper bound on the search.  The static parameter is only a ceiling: the real limit
+  // is how far the mission goal itself is, measured ALONG the path rather than straight
+  // line, so the escape goal can never be placed past the place the robot is trying to
+  // reach.  On a short remaining route that shrinks on its own as the robot advances.
+  double search_limit = param_.max_goal_search_distance_m;
+  if (route_) {
+    if (const auto goal_idx = find_nearest_index(reference_path_, route_->goal_pose)) {
+      if (*goal_idx > ego_index) {
+        double to_goal = 0.0;
+        for (size_t k = ego_index + 1; k <= *goal_idx; ++k) {
+          to_goal += distance2d(reference_path_[k - 1], reference_path_[k]);
+        }
+        search_limit = std::fmin(search_limit, to_goal);
+      } else {
+        search_limit = 0.0;  // the mission goal is already behind us
+      }
+    }
+  }
+
   double arc = 0.0;
   double next_check = search_from;
+  double clear_run_m = 0.0;   // continuous free path ending at the current station
   size_t skipped_offgrid = 0;
+  size_t rejected_tight = 0;
+  bool first_fit_logged = false;
+
   for (size_t k = ego_index + 1; k < reference_path_.size(); ++k) {
-    arc += distance2d(reference_path_[k - 1], reference_path_[k]);
-    if (arc < next_check) {
-      continue;
-    }
-    next_check = arc + param_.goal_check_interval_m;
-    if (arc > param_.max_goal_search_distance_m) {
+    const double step = distance2d(reference_path_[k - 1], reference_path_[k]);
+    arc += step;
+    if (arc > search_limit) {
       break;
     }
 
@@ -1400,20 +1430,45 @@ std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_
       candidate.orientation.z = std::sin(yaw * 0.5);
       candidate.orientation.w = std::cos(yaw * 0.5);
     }
+
+    // The run is measured at every path point, not only at the ones we would consider
+    // placing a goal on -- otherwise an obstacle between two checks goes unnoticed.
     if (footprint_is_free(candidate)) {
-      candidates.push_back(candidate);
-    } else if (!pose_is_on_grid(candidate)) {
-      ++skipped_offgrid;
+      clear_run_m += step;
+    } else {
+      clear_run_m = 0.0;
+      if (!pose_is_on_grid(candidate)) {
+        ++skipped_offgrid;
+      }
+      continue;
     }
+
+    if (arc < next_check) {
+      continue;
+    }
+    if (clear_run_m < param_.goal_min_clear_length_m) {
+      ++rejected_tight;  // free here, but not yet far enough from what is behind it
+      continue;
+    }
+    next_check = arc + param_.goal_check_interval_m;
+    if (!first_fit_logged) {
+      RCLCPP_INFO(
+        get_logger(), "[episode %u] first fit at %.1f m along the path (%.1f m clear behind it)",
+        episode_id_, arc, clear_run_m);
+      first_fit_logged = true;
+    }
+    candidates.push_back(candidate);
   }
 
   RCLCPP_INFO(
     get_logger(),
     "[episode %u] %zu escape-goal candidates from %.1f m (blockage at %.1f m + %.1f m offset), "
-    "%zu skipped as off-grid%s",
+    "each with >= %.1f m of clear path behind it, searched out to %.1f m; "
+    "%zu rejected as too tight, %zu skipped as off-grid%s",
     episode_id_, candidates.size(), search_from,
     last_sweep_.has_blockage ? last_sweep_.first_blocked_arc_m : -1.0,
-    param_.goal_offset_beyond_obstacle_m, skipped_offgrid,
+    param_.goal_offset_beyond_obstacle_m, param_.goal_min_clear_length_m, search_limit,
+    rejected_tight, skipped_offgrid,
     mirror ? ", headings flipped for reversed route" : "");
   return candidates;
 }
