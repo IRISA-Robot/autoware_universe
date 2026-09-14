@@ -59,8 +59,6 @@ std::string state_name(State state)
       return "COOLDOWN";
     case State::ABORT:
       return "ABORT";
-    case State::BACKOFF:
-      return "BACKOFF";
     case State::REPLAN:
       return "REPLAN";
   }
@@ -157,26 +155,15 @@ void StuckRecoverySupervisorNode::load_parameters()
   p.aeb_occupancy_threshold =
     static_cast<int>(declare_parameter<int64_t>("aeb_occupancy_threshold", 100));
   p.aeb_hold_replan_sec = declare_parameter<double>("aeb_hold_replan_sec", 3.0);
-  p.max_reverse_distance_m = declare_parameter<double>("max_reverse_distance_m", 10.0);
-  p.max_total_reverse_distance_m =
-    declare_parameter<double>("max_total_reverse_distance_m", 15.0);
-  p.total_reverse_reset_progress_m =
-    declare_parameter<double>("total_reverse_reset_progress_m", 5.0);
   p.max_lateral_excursion_m = declare_parameter<double>("max_lateral_excursion_m", 2.0);
+  p.min_occupied_fraction = declare_parameter<double>("min_occupied_fraction", 0.05);
 
   p.recovery_speed_limit_mps = declare_parameter<double>("recovery_speed_limit_mps", 0.278);
   p.min_engageable_stop_distance_m =
     declare_parameter<double>("min_engageable_stop_distance_m", 0.3);
-  p.backoff_speed_mps = declare_parameter<double>("backoff_speed_mps", 0.278);
-  p.backoff_after_failed_goals =
-    static_cast<int>(declare_parameter<int64_t>("backoff_after_failed_goals", 2));
-  p.backoff_reach_tolerance_m = declare_parameter<double>("backoff_reach_tolerance_m", 0.3);
-  p.backoff_lookback_m = declare_parameter<double>("backoff_lookback_m", 15.0);
   p.goal_retry_sec = declare_parameter<double>("goal_retry_sec", 4.0);
   p.replan_wait_sec = declare_parameter<double>("replan_wait_sec", 5.0);
   p.spent_hold_sec = declare_parameter<double>("spent_hold_sec", 2.0);
-  p.backoff_progress_reset_m =
-    declare_parameter<double>("backoff_progress_reset_m", 0.5);
   p.freespace_plan_timeout_sec =
     declare_parameter<double>("freespace_plan_timeout_sec", 1.0);
   p.costmap_timeout_sec = declare_parameter<double>("costmap_timeout_sec", 1.0);
@@ -259,12 +246,6 @@ void StuckRecoverySupervisorNode::load_parameters()
     }
     return clamped;
   };
-  // Backing up a long way is fine as long as it gets the robot past the obstacle --
-  // the ceiling is here only to stop a runaway, not to shape the manoeuvre.
-  p.max_reverse_distance_m =
-    clamp_with_warning(p.max_reverse_distance_m, 0.0, 20.0, "max_reverse_distance_m");
-  p.max_total_reverse_distance_m = clamp_with_warning(
-    p.max_total_reverse_distance_m, 0.0, 40.0, "max_total_reverse_distance_m");
   p.max_lateral_excursion_m =
     clamp_with_warning(p.max_lateral_excursion_m, 0.0, 3.0, "max_lateral_excursion_m");
   p.corridor_scan_distance_m =
@@ -273,9 +254,6 @@ void StuckRecoverySupervisorNode::load_parameters()
     clamp_with_warning(p.goal_check_interval_m, 0.2, 5.0, "goal_check_interval_m");
   p.recovery_timeout_sec =
     clamp_with_warning(p.recovery_timeout_sec, 5.0, 120.0, "recovery_timeout_sec");
-  // Crawl speed only: the backoff is a blind reverse manoeuvre, so it is never allowed
-  // to go faster than the 1 km/h the recovery plan itself runs at.
-  p.backoff_speed_mps = clamp_with_warning(p.backoff_speed_mps, 0.05, 0.4, "backoff_speed_mps");
   p.recovery_speed_limit_mps =
     clamp_with_warning(p.recovery_speed_limit_mps, 0.05, 0.5, "recovery_speed_limit_mps");
 
@@ -348,6 +326,18 @@ void StuckRecoverySupervisorNode::setup_interfaces()
     [this](const nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg) {
       grid_ = msg;
       grid_at_ = this->now();
+      // A recovery grid with no occupied cell anywhere is not an empty road, it is a
+      // broken one.  costmap_generator fills the primitives layer by painting the whole
+      // grid occupied and carving the road lanelets out of it -- but if the map has no
+      // subtype=road lanelets it returns early and the layer stays free everywhere, with
+      // nothing logged.  Every "is this pose on drivable ground" test would then answer
+      // yes, anywhere, which is exactly the guarantee that must not fail quietly.
+      const auto occupied = std::count_if(
+        msg->data.begin(), msg->data.end(),
+        [this](int8_t v) { return v < 0 || v >= param_.aeb_occupancy_threshold; });
+      grid_occupied_fraction_ =
+        msg->data.empty() ? 0.0
+                          : static_cast<double>(occupied) / static_cast<double>(msg->data.size());
     });
   sub_recovery_traj_ = create_subscription<autoware_planning_msgs::msg::Trajectory>(
     param_.topic_recovery_trajectory, qos,
@@ -439,7 +429,6 @@ void StuckRecoverySupervisorNode::setup_interfaces()
 void StuckRecoverySupervisorNode::on_timer()
 {
   update_motion();
-  update_goal_progress();
   classify_stop();
 
   switch (state_) {
@@ -464,9 +453,6 @@ void StuckRecoverySupervisorNode::on_timer()
     case State::ABORT:
       step_abort();
       break;
-    case State::BACKOFF:
-      step_backoff();
-      break;
     case State::REPLAN:
       step_replan();
       break;
@@ -477,15 +463,12 @@ void StuckRecoverySupervisorNode::on_timer()
   // alive because that is how we notice the blockage going away.
   const bool arm_costmap =
     mode_ >= Mode::PROBE_ONLY && (state_ == State::PROBE || state_ == State::RECOVERY ||
-                                  state_ == State::BLOCKED || state_ == State::BACKOFF ||
-                                  state_ == State::REPLAN);
+                                  state_ == State::BLOCKED || state_ == State::REPLAN);
   publish_recovery_arming(arm_costmap);
 
   std_msgs::msg::Bool force;
-  // The backoff drives the robot too, so the scenario has to stay switched over.
-  force.data = (mode_ == Mode::RECOVERY &&
-                (state_ == State::RECOVERY || state_ == State::BACKOFF ||
-                 state_ == State::REPLAN));
+  force.data =
+    (mode_ == Mode::RECOVERY && (state_ == State::RECOVERY || state_ == State::REPLAN));
   pub_force_recovery_->publish(force);
 
   relay_recovery_trajectory();
@@ -522,30 +505,13 @@ void StuckRecoverySupervisorNode::update_motion()
 
   if (odom_) {
     const auto & pose = odom_->pose.pose;
-    if (has_last_pose_) {
-      const double delta = distance2d(last_pose_, pose);
-      // The reverse budget bounds how far THIS scenario drives the robot backwards --
-      // backwards in the vehicle's own frame, because that is the direction it cannot
-      // see, which is the actual risk being limited.
-      //
-      // Two mistakes were made here before.  Measuring against the reference path
-      // tangent made the number depend on path geometry, so it could under-count real
-      // reverse travel (the hole) as easily as over-count it.  And accumulating in
-      // update_motion() regardless of state meant every metre the robot drove in plain
-      // lane driving counted too: the budget read 25 m against a 10 m limit, so it was
-      // measuring nothing meaningful.  Only count while this scenario is the one driving.
-      const bool we_are_driving = state_ == State::RECOVERY || state_ == State::BACKOFF ||
-                                  state_ == State::REPLAN;
-      if (we_are_driving && delta > 0.0) {
-        const double yaw = tf2::getYaw(pose.orientation);
-        const double dx = pose.position.x - last_pose_.position.x;
-        const double dy = pose.position.y - last_pose_.position.y;
-        if ((dx * std::cos(yaw) + dy * std::sin(yaw)) < 0.0) {
-          reverse_distance_m_ += delta;
-          total_reverse_distance_m_ += delta;
-        }
-      }
-    }
+    // There is no reverse budget any more.  It existed to bound "the obstacle keeps
+    // closing in and the robot keeps retreating", and that case is now structurally
+    // impossible: recovery refuses to drive any plan that travels against the mission
+    // direction.  The budget was also measuring the wrong thing -- it projected
+    // displacement onto the VEHICLE heading, so in reverse motion mode every metre of
+    // ordinary recovery travel counted as reverse (4.03 m recorded in a run where the
+    // retreat never ran at all).
     last_pose_ = pose;
     has_last_pose_ = true;
 
@@ -554,28 +520,6 @@ void StuckRecoverySupervisorNode::update_motion()
     if (state_ != State::NOMINAL) {
       progress_since_entry_m_ = distance2d(entry_pose_, pose);
     }
-  }
-}
-
-void StuckRecoverySupervisorNode::update_goal_progress()
-{
-  if (!odom_ || !route_) {
-    return;
-  }
-  const double remaining = distance2d(odom_->pose.pose, route_->goal_pose);
-  if (remaining >= best_remaining_to_goal_m_) {
-    return;  // no closer than we have already been; nothing has been achieved
-  }
-
-  const bool made_progress =
-    best_remaining_to_goal_m_ != std::numeric_limits<double>::max() &&
-    (best_remaining_to_goal_m_ - remaining) >= param_.total_reverse_reset_progress_m;
-  best_remaining_to_goal_m_ = remaining;
-  if (made_progress && total_reverse_distance_m_ > 0.0) {
-    RCLCPP_INFO(
-      get_logger(), "advanced %.1f m toward the goal; clearing the %.2f m cumulative reverse budget",
-      param_.total_reverse_reset_progress_m, total_reverse_distance_m_);
-    total_reverse_distance_m_ = 0.0;
   }
 }
 
@@ -827,7 +771,6 @@ void StuckRecoverySupervisorNode::transition(State next, const std::string & rea
     reference_path_.clear();
     start_blocked_ = false;
     abort_was_mechanical_ = false;
-    reverse_distance_m_ = 0.0;
     attempts_ = 0;
     progress_since_entry_m_ = 0.0;
   }
@@ -846,10 +789,8 @@ void StuckRecoverySupervisorNode::step_nominal()
   episode_since_ = this->now();
   episode_stop_source_ = stop_source_;
   attempts_ = 0;
-  reverse_distance_m_ = 0.0;
   progress_since_entry_m_ = 0.0;
   entry_pose_ = odom_->pose.pose;
-  pose_at_last_backoff_ = odom_->pose.pose;
   capture_reference_path();
   transition(State::SUSPECT, "ego stopped without a legitimate reason");
 }
@@ -927,6 +868,19 @@ void StuckRecoverySupervisorNode::step_probe()
                         ? "recovery costmap went stale (is the recovery container alive?)"
                         : "recovery costmap never published (is the recovery container alive?)");
     }
+    return;
+  }
+
+  if (grid_occupied_fraction_ < param_.min_occupied_fraction) {
+    RCLCPP_ERROR(
+      get_logger(),
+      "[episode %u] only %.1f%% of the recovery costmap is occupied. Everything off the "
+      "road should be, so the road layer was never filled -- the lanelet map has no "
+      "subtype=road lanelets, and costmap_generator leaves the grid free everywhere "
+      "without saying so. Recovery cannot keep the robot on the road with this grid, so "
+      "it will not drive.",
+      episode_id_, 100.0 * grid_occupied_fraction_);
+    transition(State::ABORT, "recovery costmap has no road boundary; refusing to drive");
     return;
   }
 
@@ -1038,10 +992,6 @@ void StuckRecoverySupervisorNode::step_recovery()
     transition(State::ABORT, "emergency code raised during recovery");
     return;
   }
-  if (reverse_distance_m_ > param_.max_reverse_distance_m) {
-    transition(State::ABORT, "reverse budget exceeded");
-    return;
-  }
   if ((now - state_since_).seconds() > param_.recovery_timeout_sec) {
     transition(State::ABORT, "recovery timed out");
     return;
@@ -1116,31 +1066,14 @@ void StuckRecoverySupervisorNode::step_recovery()
     last_valid_plan_ = now;
   } else if ((now - last_valid_plan_).seconds() > param_.goal_retry_sec) {
     if (start_blocked_) {
-      // No goal can help: freespace rejects the START pose because the robot's own
-      // footprint is inside the inflated obstacle.  Backing off is the only move.
-      begin_backoff("start pose is inside an obstacle; freespace cannot plan from here");
+      // Freespace rejects the START pose: the robot's own footprint is already inside the
+      // inflated obstacle.  A retreat used to be the answer, and backing out of it is
+      // exactly the behaviour that had to go.  No goal can help from this pose.
+      transition(
+        State::ABORT, "start pose is inside an obstacle; freespace cannot plan from here");
       return;
     }
-    ++failed_goal_tries_;
-    const int limit = std::max(1, param_.backoff_after_failed_goals);
-    if (failed_goal_tries_ >= limit) {
-      failed_goal_tries_ = 0;
-      begin_backoff(
-        "freespace failed " + std::to_string(limit) + " goal attempts in a row");
-      return;
-    }
-    if (goal_index_ + 1 < goal_candidates_.size()) {
-      ++goal_index_;
-    } else {
-      goal_index_ = 0;  // wrap: the grid moves with the robot, so retry from the front
-    }
-    RCLCPP_WARN(
-      get_logger(),
-      "[episode %u] no plan for %.1f s (%d/%d before backing off) -> goal candidate %zu/%zu",
-      episode_id_, param_.goal_retry_sec, failed_goal_tries_, limit, goal_index_ + 1,
-      goal_candidates_.size());
-    last_valid_plan_ = now;
-    publish_current_goal();
+    reject_plan_and_try_next_goal("freespace produced no usable plan for this goal");
     return;
   }
   if (odom_ && !reference_path_.empty()) {
@@ -1210,191 +1143,8 @@ void StuckRecoverySupervisorNode::step_recovery()
     return;
   }
 
-  // One direction guard: swapping to a forward lane-driving trajectory while the
-  // robot is still rolling backwards means flipping gear under motion.  Freespace
-  // already stops at every cusp, so the wait is at most one segment.
-  if (current_recovery_segment_is_reverse() && !is_stopped_) {
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 1000,
-      "[episode %u] corridor clear, finishing the reverse segment before handing back",
-      episode_id_);
-    return;
-  }
-
   cooldown_until_ = now + rclcpp::Duration::from_seconds(param_.cooldown_sec);
   transition(State::COOLDOWN, "corridor ahead is clear again");
-}
-
-void StuckRecoverySupervisorNode::begin_backoff(const std::string & why)
-{
-  if (!odom_) {
-    transition(State::ABORT, "no odometry: " + why);
-    return;
-  }
-
-  // Retreating is the response to being stuck in the same place, not to falling a little
-  // short.  If the robot has covered ground since the last retreat -- it edged past part
-  // of the obstacle, or merely paused for AEB -- then the manoeuvre IS working, and
-  // backing off would discard that and start over.  Replan from here instead.
-  const double progress = distance2d(pose_at_last_backoff_, odom_->pose.pose);
-  if (progress >= param_.backoff_progress_reset_m) {
-    pose_at_last_backoff_ = odom_->pose.pose;
-    failed_goal_tries_ = 0;
-    replan_attempts_ = 0;
-    goal_index_ = 0;
-    RCLCPP_INFO(
-      get_logger(),
-      "[episode %u] moved %.2f m since the last retreat -- replanning from here instead of "
-      "backing off again (%s)",
-      episode_id_, progress, why.c_str());
-    force_freespace_replan("progress made; retrying from the new pose");
-    return;
-  }
-
-  if (total_reverse_distance_m_ >= param_.max_total_reverse_distance_m) {
-    transition(
-      State::ABORT,
-      "cumulative reverse budget exhausted (" +
-        std::to_string(total_reverse_distance_m_) +
-        " m without reaching the goal) -- an advancing obstacle may be pushing the robot "
-        "back; this needs an operator: " + why);
-    return;
-  }
-  if (reverse_distance_m_ >= param_.max_reverse_distance_m) {
-    transition(State::ABORT, "reverse budget exhausted: " + why);
-    return;
-  }
-  const auto nearest = find_nearest_index(reference_path_, odom_->pose.pose);
-  if (!nearest || *nearest == 0) {
-    transition(State::ABORT, "nothing behind us to retreat along: " + why);
-    return;
-  }
-
-  backoff_start_pose_ = odom_->pose.pose;
-  pose_at_last_backoff_ = odom_->pose.pose;
-  // Give back exactly as much ground as we worked through in the candidate list.
-  const double wanted =
-    std::max(1, param_.backoff_after_failed_goals) * param_.goal_check_interval_m;
-  backoff_target_m_ = std::min(
-    std::min(wanted, 5.0), param_.max_reverse_distance_m - reverse_distance_m_);
-
-  // Pin the end index now.  Deriving it from the robot's current position on every
-  // tick made the target recede as fast as the robot approached it.
-  backoff_end_index_ = 0;
-  double arc = 0.0;
-  for (size_t k = *nearest; k-- > 0;) {
-    arc += distance2d(reference_path_[k + 1], reference_path_[k]);
-    if (arc >= backoff_target_m_) {
-      backoff_end_index_ = k;
-      break;
-    }
-  }
-
-  RCLCPP_WARN(
-    get_logger(), "[episode %u] backing off %.2f m at %.2f m/s -- %s", episode_id_,
-    backoff_target_m_, param_.backoff_speed_mps, why.c_str());
-  transition(State::BACKOFF, why);
-}
-
-void StuckRecoverySupervisorNode::step_backoff()
-{
-  const auto now = this->now();
-
-  if (!is_operational() || emergency_code_ != 0) {
-    transition(State::ABORT, "left autonomous mode or emergency during backoff");
-    return;
-  }
-  if (reverse_distance_m_ > param_.max_reverse_distance_m) {
-    transition(State::ABORT, "reverse budget exceeded while backing off");
-    return;
-  }
-  if (total_reverse_distance_m_ > param_.max_total_reverse_distance_m) {
-    transition(State::ABORT, "cumulative reverse budget exceeded while backing off");
-    return;
-  }
-  if ((now - episode_since_).seconds() > param_.max_episode_duration_sec) {
-    transition(State::ABORT, "episode watchdog expired while backing off");
-    return;
-  }
-
-  // If something is behind the robot it simply will not move, and none of the other
-  // exits fire: distance travelled stays near zero, so the reverse budget never grows
-  // either.  Bound it by the time the retreat should physically take, with generous
-  // slack for the crawl speed and the smoother's ramp.
-  const double expected_sec =
-    backoff_target_m_ / std::max(0.05, param_.backoff_speed_mps) * 3.0 + 5.0;
-  if ((now - state_since_).seconds() > expected_sec) {
-    transition(
-      State::BLOCKED,
-      "could not retreat -- moved " +
-        std::to_string(odom_ ? distance2d(backoff_start_pose_, odom_->pose.pose) : 0.0) +
-        " m of " + std::to_string(backoff_target_m_) + " m; something may be behind");
-    return;
-  }
-
-  // Primary exit: freespace found something.  This has to be checked before anything
-  // else -- the whole point of retreating is to reach a pose it can plan from, so the
-  // moment it succeeds we stop retreating and follow that plan, whether or not the
-  // retreat step had finished.
-  if (freespace_plan_is_valid()) {
-    last_valid_plan_ = now;
-    spent_since_ = now;
-    failed_goal_tries_ = 0;
-    RCLCPP_INFO(
-      get_logger(), "[episode %u] freespace found a plan while backing off; following it",
-      episode_id_);
-    transition(State::RECOVERY, "freespace produced a valid plan");
-    return;
-  }
-
-  // The corridor may clear while we retreat (a pedestrian walking on, say) -- in that
-  // case there is nothing left to recover from.
-  size_t from = 0;
-  if (odom_) {
-    if (const auto nearest = find_nearest_index(reference_path_, odom_->pose.pose)) {
-      from = *nearest;
-    }
-  }
-  last_sweep_ = sweep(from);
-  corridor_clear_ = last_sweep_.valid && last_sweep_.clear;
-  if (
-    corridor_clear_ && (now - clear_since_).seconds() >= param_.clear_hold_sec &&
-    rejoined_reference_path()) {
-    cooldown_until_ = now + rclcpp::Duration::from_seconds(param_.cooldown_sec);
-    transition(State::COOLDOWN, "corridor cleared while backing off");
-    return;
-  }
-  if (!corridor_clear_) {
-    clear_since_ = now;
-  }
-
-  const double moved = odom_ ? distance2d(backoff_start_pose_, odom_->pose.pose) : 0.0;
-  const double to_go =
-    (odom_ && backoff_end_index_ < reference_path_.size())
-      ? distance2d(reference_path_[backoff_end_index_], odom_->pose.pose)
-      : 0.0;
-  // Safety exit: done as soon as we are within tolerance of the target, measured both
-  // ways -- distance actually travelled, and distance still to run to the pinned end.
-  const double tol = param_.backoff_reach_tolerance_m;
-  const bool reached = moved >= (backoff_target_m_ - tol) || to_go <= tol;
-  if (!reached) {
-    return;  // keep retreating; the trajectory is published by relay_recovery_trajectory
-  }
-
-  // Retreat step done.  Freespace only replans once the vehicle has actually stopped,
-  // so wait for that before handing back -- otherwise it just tells us it is waiting.
-  if (!is_stopped_) {
-    return;
-  }
-
-  goal_index_ = 0;
-  failed_goal_tries_ = 0;
-  last_valid_plan_ = now;
-  publish_current_goal();
-  RCLCPP_INFO(
-    get_logger(), "[episode %u] backed off %.2f m (%.2f m total); replanning from here",
-    episode_id_, moved, reverse_distance_m_);
-  transition(State::RECOVERY, "retreated a step; letting freespace try again");
 }
 
 std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_candidates() const
@@ -1571,62 +1321,6 @@ bool StuckRecoverySupervisorNode::freespace_plan_is_valid()
   return false;
 }
 
-autoware_planning_msgs::msg::Trajectory StuckRecoverySupervisorNode::build_backoff_trajectory()
-  const
-{
-  autoware_planning_msgs::msg::Trajectory traj;
-  traj.header.frame_id = "map";
-  traj.header.stamp = this->now();
-  if (!odom_ || reference_path_.size() < 2) {
-    return traj;
-  }
-
-  const auto nearest = find_nearest_index(reference_path_, odom_->pose.pose);
-  if (!nearest || *nearest == 0) {
-    return traj;  // nothing behind us to retreat along
-  }
-
-  // Vehicle heading: on a reversed route the stored path yaw is the travel direction,
-  // so correct it back into the vehicle's own frame first.
-  const bool mirror = path_yaw_opposes_ego();
-  // Runs to the pinned end index, so the trajectory shortens as the robot approaches
-  // and terminates with a zero-velocity point -- which is what makes it stop there.
-  const size_t end_index = std::min(backoff_end_index_, *nearest);
-
-  for (size_t k = *nearest + 1; k-- > end_index;) {
-    autoware_planning_msgs::msg::TrajectoryPoint point;
-    point.pose = reference_path_[k];
-    double yaw = tf2::getYaw(point.pose.orientation);
-    if (mirror) {
-      yaw += M_PI;
-      point.pose.orientation.x = 0.0;
-      point.pose.orientation.y = 0.0;
-      point.pose.orientation.z = std::sin(yaw * 0.5);
-      point.pose.orientation.w = std::cos(yaw * 0.5);
-    }
-
-    // Sign relative to the vehicle heading, not to the path: retreating along a
-    // forward route is reverse gear, but retreating along an already-reversed route is
-    // forward gear.  One consistent sign for the whole trajectory, which is what the
-    // MPC's single is_forward_shift flag requires.
-    const size_t ref = (k == 0) ? 0 : k - 1;  // direction of retreat at this point
-    const double dx = reference_path_[ref].position.x - reference_path_[k].position.x;
-    const double dy = reference_path_[ref].position.y - reference_path_[k].position.y;
-    const double sign = (dx * std::cos(yaw) + dy * std::sin(yaw)) > 0.0 ? 1.0 : -1.0;
-    point.longitudinal_velocity_mps =
-      static_cast<float>(sign * param_.backoff_speed_mps);
-    traj.points.push_back(point);
-    if (k == 0) {
-      break;
-    }
-  }
-
-  if (!traj.points.empty()) {
-    traj.points.back().longitudinal_velocity_mps = 0.0f;  // stop at the end of the step
-  }
-  return traj;
-}
-
 void StuckRecoverySupervisorNode::relay_recovery_trajectory()
 {
   // Single publisher on the topic scenario_selector reads.  Freespace publishes to its
@@ -1634,9 +1328,7 @@ void StuckRecoverySupervisorNode::relay_recovery_trajectory()
   // splits its plan at every direction cusp and waits for the robot to stop there,
   // which is the only reason the MPC can follow a Reeds-Shepp path at all.
   autoware_planning_msgs::msg::Trajectory traj;
-  if (state_ == State::BACKOFF) {
-    traj = build_backoff_trajectory();
-  } else if (state_ == State::RECOVERY && freespace_trajectory_) {
+  if (state_ == State::RECOVERY && freespace_trajectory_) {
     traj = *freespace_trajectory_;
   } else {
     return;
@@ -1645,15 +1337,28 @@ void StuckRecoverySupervisorNode::relay_recovery_trajectory()
     return;
   }
 
+  // Two refusals before anything is driven.  Both reject the plan WHOLE rather than
+  // trimming it: a plan that goes the wrong way, or off the road, is not a plan to drive
+  // part of.
+  if (!plan_follows_mission_direction(traj) || !plan_stays_inside_road(traj)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 1000, "[episode %u] refusing the freespace plan: %s",
+      episode_id_, aeb_reason_.c_str());
+    // Publish it stopped rather than publishing nothing.  This scenario owns the
+    // trajectory while it is armed, and going silent leaves the controller holding
+    // whatever it had last -- a refusal has to read as "stop", not as "no opinion".
+    for (auto & point : traj.points) {
+      point.longitudinal_velocity_mps = 0.0f;
+    }
+    pub_recovery_traj_->publish(traj);
+    reject_plan_and_try_next_goal(aeb_reason_);
+    return;
+  }
+
   clamp_recovery_speed(traj);
 
-  // Emergency brake, applied to EVERYTHING this scenario drives -- the relayed freespace
-  // plan and the backoff retreat alike.
-  //
-  // It has to cover the retreat too.  While this scenario drives, the
-  // motion_velocity_planner stop modules are bypassed entirely, and backing up is the
-  // one thing here the robot does towards ground it cannot see; a reverse with nothing
-  // watching it is the worst case this feature can produce.
+  // Emergency brake.  While this scenario drives, the motion_velocity_planner stop
+  // modules are bypassed entirely, so nothing else in planning is watching.
   if (recovery_path_is_blocked(traj)) {
     // Zero the velocities but keep the geometry, so the controller still has a reference
     // to hold position against rather than losing its trajectory entirely.
@@ -1819,7 +1524,7 @@ void StuckRecoverySupervisorNode::step_replan()
   }
 
   replan_attempts_ = 0;
-  begin_backoff("replanning from this pose keeps failing");
+  reject_plan_and_try_next_goal("replanning from this pose keeps failing");
 }
 
 void StuckRecoverySupervisorNode::step_blocked()
@@ -1880,7 +1585,7 @@ void StuckRecoverySupervisorNode::step_abort()
   // but observed motion is stronger evidence that it is over.  Releasing only on measured
   // movement keeps the "needs a human" property for a robot that genuinely cannot move,
   // without leaving the watchdog dead for the rest of the session once it demonstrably
-  // can.  (Seen in practice: the gear was left in REVERSE after a backoff, forward
+  // can.  (Seen in practice: the gear was left in REVERSE after a manoeuvre, forward
   // commands did nothing, MECHANICAL latched, and the feature stayed dead.)
   if (abort_was_mechanical_) {
     if (is_stopped_) {
@@ -1942,13 +1647,9 @@ bool StuckRecoverySupervisorNode::capture_reference_path()
     return false;
   }
 
-  // Keep a stretch BEHIND ego too: that is the geometry the backoff retreats along.
-  size_t begin = *nearest;
-  double back = 0.0;
-  while (begin > 0 && back < param_.backoff_lookback_m) {
-    back += distance2d(poses[begin - 1], poses[begin]);
-    --begin;
-  }
+  // The path starts at the robot.  It used to keep a stretch behind ego as well, which
+  // was only ever the geometry the retreat reversed along; nothing reverses any more.
+  const size_t begin = *nearest;
 
   // Keep everything ahead of us, out to max_goal_search_distance_m: goal candidates
   // are searched along here all the way towards the real mission goal.  The corridor
@@ -2058,6 +1759,113 @@ bool StuckRecoverySupervisorNode::advance_past_passed_goals()
     ++goal_index_;
   }
   return goal_index_ < goal_candidates_.size();
+}
+
+double StuckRecoverySupervisorNode::mission_travel_sign() const
+{
+  // The mission runs in one motion mode from start to goal: forward motion drives the
+  // robot nose-first, reverse motion drives it backwards along the route the whole way.
+  // path_yaw_opposes_ego() already answers which one is in force, and it is the same
+  // answer the corridor sweep and the escape goals are built from -- so both modes go
+  // through identical code from here on.
+  return path_yaw_opposes_ego() ? -1.0 : 1.0;
+}
+
+bool StuckRecoverySupervisorNode::plan_follows_mission_direction(
+  const autoware_planning_msgs::msg::Trajectory & traj)
+{
+  // Recovery may only carry the robot the way its mission is already going.
+  //
+  // Driving against it is the failure this feature kept producing: while the obstacle
+  // closed in, the robot gave ground and gave ground again.  Deleting the retreat state
+  // removed one way in; this closes the other, because freespace is free to answer with a
+  // plan that sets off against the mission, and relaying that is the same behaviour by a
+  // different route.  A plan that changes direction part way is refused for the same
+  // reason -- half of it travels the wrong way.
+  const double want = mission_travel_sign();
+  int seen = 0;
+  for (const auto & point : traj.points) {
+    const double v = point.longitudinal_velocity_mps;
+    if (std::abs(v) < 1e-3) {
+      continue;  // the trailing stop point, and any pause, belong to neither direction
+    }
+    const int sign = v > 0.0 ? 1 : -1;
+    if (seen != 0 && sign != seen) {
+      aeb_reason_ = "plan changes direction part way through";
+      return false;
+    }
+    seen = sign;
+  }
+  if (seen == 0) {
+    return true;  // nothing but stop points; nothing to drive the wrong way
+  }
+  if (static_cast<double>(seen) * want < 0.0) {
+    aeb_reason_ = std::string("plan travels against the mission, which is in ") +
+                  (want > 0.0 ? "forward" : "reverse") + " motion";
+    return false;
+  }
+  return true;
+}
+
+bool StuckRecoverySupervisorNode::plan_stays_inside_road(
+  const autoware_planning_msgs::msg::Trajectory & traj)
+{
+  // Every pose of the plan, footprint and all, has to sit on drivable ground.
+  //
+  // The recovery costmap paints everything outside the road lanelets as occupied --
+  // fill_polygon_areas() lays down grid_max_value and carves the road polygons out of it
+  // -- so this one test covers both "drives into something" and "leaves the road".  Cells
+  // outside the grid window count as blocked too, which keeps the plan inside the part of
+  // the world we can actually see.
+  //
+  // The whole plan is judged, not just the braking distance: a plan that leaves the road
+  // five metres out is not a plan to drive carefully, it is the wrong plan.
+  if (!costmap_is_fresh()) {
+    return true;  // the brake already refuses to drive on a stale grid; do not double-report
+  }
+  double arc = 0.0;
+  for (size_t i = 0; i < traj.points.size(); ++i) {
+    if (i > 0) {
+      arc += distance2d(traj.points[i - 1].pose, traj.points[i].pose);
+    }
+    if (!footprint_is_free_with_margin(
+          traj.points[i].pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)) {
+      std::ostringstream why;
+      why << "plan leaves the drivable area " << std::fixed << std::setprecision(2) << arc
+          << " m along it, at (" << traj.points[i].pose.position.x << ", "
+          << traj.points[i].pose.position.y << ")";
+      aeb_reason_ = why.str();
+      return false;
+    }
+  }
+  return true;
+}
+
+void StuckRecoverySupervisorNode::reject_plan_and_try_next_goal(const std::string & why)
+{
+  // What replaced the retreat.  When a plan cannot be used, the robot does not give
+  // ground to buy a better starting position -- it aims at the next escape goal further
+  // along the path, and when there are none left it stops.
+  RCLCPP_WARN(
+    get_logger(), "[episode %u] rejecting goal %zu/%zu: %s", episode_id_, goal_index_ + 1,
+    goal_candidates_.size(), why.c_str());
+
+  // Drop the plan, NOT the candidate list.  discard_recovery_state() clears the
+  // candidates too, and calling it here sent the first rejection straight to ABORT with
+  // thirteen goals still untried.
+  freespace_trajectory_.reset();
+  freespace_traj_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+  recovery_trajectory_.reset();
+  ++goal_index_;
+  if (!advance_past_passed_goals() || !publish_current_goal()) {
+    transition(State::ABORT, "no usable escape goal left: " + why);
+    return;
+  }
+  last_valid_plan_ = this->now();
+  spent_since_ = this->now();
+  RCLCPP_INFO(
+    get_logger(), "[episode %u] trying escape goal %zu/%zu instead", episode_id_,
+    goal_index_ + 1, goal_candidates_.size());
 }
 
 bool StuckRecoverySupervisorNode::recovery_path_is_blocked(
@@ -2330,21 +2138,6 @@ void StuckRecoverySupervisorNode::publish_recovery_route(const geometry_msgs::ms
     goal.position.x, goal.position.y);
 }
 
-bool StuckRecoverySupervisorNode::current_recovery_segment_is_reverse() const
-{
-  if (!recovery_trajectory_ || recovery_trajectory_->points.empty()) {
-    return false;
-  }
-  // freespace_planner publishes one single-direction partial trajectory at a time,
-  // so the sign of any point in it describes the whole current segment.
-  for (const auto & point : recovery_trajectory_->points) {
-    if (std::abs(point.longitudinal_velocity_mps) > 1e-3) {
-      return point.longitudinal_velocity_mps < 0.0;
-    }
-  }
-  return false;
-}
-
 // ---------------------------------------------------------------------------
 // Output
 // ---------------------------------------------------------------------------
@@ -2360,8 +2153,10 @@ void StuckRecoverySupervisorNode::publish_outputs()
   state_msg.attempts = attempts_;
   state_msg.elapsed_in_state_s = static_cast<float>((now - state_since_).seconds());
   state_msg.elapsed_in_episode_s = static_cast<float>((now - episode_since_).seconds());
-  state_msg.reverse_distance_m = static_cast<float>(reverse_distance_m_);
-  state_msg.total_reverse_distance_m = static_cast<float>(total_reverse_distance_m_);
+  // Both fields are kept at zero: the reverse budget they reported is gone, but the
+  // fields stay so bags recorded before the removal still decode.
+  state_msg.reverse_distance_m = 0.0f;
+  state_msg.total_reverse_distance_m = 0.0f;
   state_msg.goal_index = static_cast<uint16_t>(goal_index_);
   state_msg.goal_candidates = static_cast<uint16_t>(goal_candidates_.size());
   state_msg.abort_reason = abort_reason_;
@@ -2505,8 +2300,6 @@ void StuckRecoverySupervisorNode::on_diagnostics(
   stat.add("free_width_m", last_sweep_.free_width_m);
   stat.add("chosen_side", side_name(last_sweep_.best_side));
   stat.add("required_width_m", last_sweep_.required_width_m);
-  stat.add("reverse_distance_m", reverse_distance_m_);
-  stat.add("total_reverse_distance_m", total_reverse_distance_m_);
   stat.add("abort_reason", abort_reason_);
 
   switch (state_) {
@@ -2517,7 +2310,6 @@ void StuckRecoverySupervisorNode::on_diagnostics(
     case State::SUSPECT:
     case State::PROBE:
     case State::RECOVERY:
-    case State::BACKOFF:
     case State::REPLAN:
       stat.summary(
         diagnostic_msgs::msg::DiagnosticStatus::WARN, "stuck handling: " + state_name(state_));

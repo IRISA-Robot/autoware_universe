@@ -75,11 +75,10 @@ enum class State : int32_t {
   BLOCKED = 4,
   COOLDOWN = 5,
   ABORT = 6,
-  // Freespace cannot plan from where the robot is standing -- usually because its own
-  // footprint is inside the inflated obstacle.  Retreat a step along the path we came
-  // from, then let freespace try again from further back.  Alternating BACKOFF and
-  // RECOVERY is what lets the robot shuffle back and forth until it gets past.
-  BACKOFF = 7,
+  // 7 was BACKOFF, a blind retreat along the path the robot came from.  It is gone:
+  // it drove the robot backwards against its own mission direction for as long as the
+  // obstacle kept coming, and that is the behaviour this feature must not have.  The
+  // number stays reserved so bags recorded before the removal still decode.
   // The robot stopped past the live part of freespace's plan, so the nearest point to
   // it already has zero velocity.  Nothing restarts on its own from there: the smoother
   // reads target_vel = 0, and freespace does not consider a replan necessary because
@@ -178,49 +177,35 @@ private:
     // Occupancy value at which the BRAKE considers a cell solid.  Must match the
     // recovery freespace planner's obstacle_threshold: braking on cells the planner
     // ignores means overruling a plan it just validated on the same grid, which is a
-    // deadlock, not a safety net.
+    // deadlock, not a safety net.  Also used by the drivable-area test.
     int aeb_occupancy_threshold{100};
     // A brake that has been on this long is not protecting against a passing hazard --
     // the plan is no longer drivable, so replan instead of holding until the episode
     // times out.  That deadlock is exactly what a whole 60 s episode was lost to.
     double aeb_hold_replan_sec{3.0};
-    double max_reverse_distance_m{10.0};
-    // Cumulative reverse budget across episodes.  The per-episode limit above cannot
-    // bound an obstacle that keeps advancing on the robot: every new episode hands out a
-    // fresh allowance, so the robot could retreat indefinitely.  This one is cleared only
-    // by real forward progress toward the goal, so "retreat without ever getting
-    // anywhere" terminates.
-    double max_total_reverse_distance_m{15.0};
-    double total_reverse_reset_progress_m{5.0};
     double max_lateral_excursion_m{2.0};
+    // Sanity check on the recovery grid, not a precise measurement.  costmap_generator
+    // paints the whole window occupied and carves the road lanelets out of it, so a real
+    // grid is mostly wall -- 60% occupied when measured on the robot.  A map with no
+    // subtype=road lanelets makes it return early and leave the layer free everywhere,
+    // silently, and then "stay on the road" guarantees nothing.  Anything below this is
+    // taken as that failure rather than as a very open road.
+    double min_occupied_fraction{0.05};
 
-    // Backoff: retreat along the path we came from at a crawl.  Stepped rather than
-    // continuous, because freespace only replans once the vehicle has stopped
-    // (freespace_planner_node.cpp: "Waiting for the vehicle to stop ...").
-    // Hard speed ceiling for EVERYTHING this scenario drives -- the relayed freespace
-    // plan as much as the backoff.  Applied in the relay because the supervisor is the
-    // single publisher there, so it cannot be bypassed; the external velocity-limit
-    // channel is no good for this since it can only ever lower a limit, and measurements
-    // showed the trajectory reaching control at anything from 0.250 to 0.303 m/s.
+    // Hard speed ceiling for everything this scenario drives.  Applied in the relay
+    // because the supervisor is the single publisher there, so it cannot be bypassed;
+    // the external velocity-limit channel is no good for this since it can only ever
+    // lower a limit, and measurements showed the trajectory reaching control at anything
+    // from 0.250 to 0.303 m/s.
     double recovery_speed_limit_mps{0.278};
     // Must stay above the smoother's stop_dist_to_prohibit_engage (0.2 m).  Purely for
     // the warning below -- it explains a robot that refuses to move for no visible
     // reason, which is otherwise a very expensive thing to work out.
     double min_engageable_stop_distance_m{0.3};
-    double backoff_speed_mps{0.278};
-    // Retreat is triggered after this many failed goal attempts, and its distance is
-    // this count x goal_check_interval_m -- i.e. the robot gives back exactly as much
-    // ground as it worked through in the candidate list, then tries again from there.
-    int backoff_after_failed_goals{2};
-    // The retreat counts as done once the robot is within this of the target, rather
-    // than demanding it land exactly: a crawl through the smoother never stops on the
-    // millimetre, and waiting for that is how a retreat hangs.
-    double backoff_reach_tolerance_m{0.3};
-    double backoff_lookback_m{15.0};
     // How long to wait for a usable plan before moving on to the next goal candidate.
     double goal_retry_sec{4.0};
     // Forced-replan cycle: how long to wait for freespace to come back with a plan, and
-    // how many times to ask before falling back to retreating.
+    // how many times to ask before giving up on this goal candidate.
     double replan_wait_sec{5.0};
     // The plan must look spent for THIS long, continuously, before a replan is forced.
     // Evaluating it instantaneously caused a RECOVERY <-> REPLAN oscillation: freespace
@@ -229,12 +214,6 @@ private:
     // plan it had just produced.  The dwell also gives the robot time to actually drive
     // the segment before we conclude it cannot.
     double spent_hold_sec{2.0};
-    // If the robot has covered at least this much ground since the last retreat, the
-    // manoeuvre is making progress and the right response to a failure is to replan from
-    // here -- NOT to retreat again and throw that progress away.  Without this, coming up
-    // a little short of clearing the obstacle, or a brief AEB stop, restarted the whole
-    // manoeuvre from the beginning.
-    double backoff_progress_reset_m{0.5};
     // A freespace plan is only trusted if it arrived AFTER this episode's route was
     // published, and recently.  Both matter: /planning/recovery/route is transient_local
     // (it has to be -- freespace subscribes latched), so a goal from a previous episode
@@ -309,7 +288,6 @@ private:
   void step_blocked();
   void step_cooldown();
   void step_abort();
-  void step_backoff();
   void step_replan();
   void force_freespace_replan(const std::string & why);
   /// True when the robot is stopped and there is no usable velocity left ahead of it in
@@ -318,15 +296,11 @@ private:
   /// plan_is_spent() held continuously for spent_hold_sec, and long enough after entering
   /// the state that the robot had a fair chance to drive.  Only this may force a replan.
   bool plan_is_spent_confirmed();
-  void begin_backoff(const std::string & why);
   void transition(State next, const std::string & reason);
 
   // Detection helpers
   void update_motion();
   void classify_stop();
-  /// Track the closest approach to the goal, and clear the cumulative reverse budget when
-  /// the robot has genuinely advanced.
-  void update_goal_progress();
   bool is_operational() const;
   bool is_stuck_candidate() const;
 
@@ -359,12 +333,28 @@ private:
   bool rejoined_reference_path() const;
   /// Would following this plan drive into something the costmap now shows?
   bool recovery_path_is_blocked(const autoware_planning_msgs::msg::Trajectory & traj);
+  /// Direction the MISSION travels in, in the robot's own frame: +1 when the robot drives
+  /// nose-first (forward motion mode), -1 when it drives backwards along the route
+  /// (reverse motion mode).  One definition, used everywhere, so both motion modes go
+  /// through identical code.
+  double mission_travel_sign() const;
+  /// Does this plan move the robot the way the mission is going?  A plan that travels
+  /// against the mission -- or that changes direction part way -- is refused: driving it
+  /// is the "robot keeps retreating while the obstacle closes in" behaviour, whichever
+  /// motion mode the mission is in.
+  bool plan_follows_mission_direction(const autoware_planning_msgs::msg::Trajectory & traj);
+  /// Every pose of the plan, footprint and all, inside the drivable area of the recovery
+  /// costmap.  Outside the road lanelets is occupied there, so this is also the guarantee
+  /// that recovery never steers the robot off the road.
+  bool plan_stays_inside_road(const autoware_planning_msgs::msg::Trajectory & traj);
+  /// Give up on the current escape goal and take the next one still ahead; ABORT when the
+  /// list is exhausted.  This is what replaced the retreat.
+  void reject_plan_and_try_next_goal(const std::string & why);
   /// Is the pose inside the recovery costmap window at all?  Used only to explain, in
   /// the log, why candidates were skipped.
   bool pose_is_on_grid(const geometry_msgs::msg::Pose & pose) const;
   void publish_recovery_arming(bool active);
   void publish_recovery_route(const geometry_msgs::msg::Pose & goal);
-  bool current_recovery_segment_is_reverse() const;
   /// Ordered escape-goal candidates, nearest usable first.
   std::vector<geometry_msgs::msg::Pose> collect_goal_candidates() const;
   bool publish_current_goal();
@@ -375,11 +365,8 @@ private:
   /// list and the relayed trajectory.  Called whenever the scenario is left or a new
   /// route is published, so nothing from one episode can act in another.
   void discard_recovery_state();
-  /// Reverse trajectory back along the path we came from, at backoff_speed_mps.
-  autoware_planning_msgs::msg::Trajectory build_backoff_trajectory() const;
   void relay_recovery_trajectory();
-  /// Hard-limit every point's speed magnitude, keeping its sign.  Applies to the
-  /// relayed freespace plan and to the backoff alike.
+  /// Hard-limit every point's speed magnitude, keeping its sign.
   void clamp_recovery_speed(autoware_planning_msgs::msg::Trajectory & traj) const;
 
 
@@ -417,38 +404,28 @@ private:
   rclcpp::Time aeb_hold_since_{0, 0, RCL_ROS_TIME};
   bool aeb_holding_{false};
   std::string aeb_reason_;
+  /// Fraction of the last recovery grid that is occupied.  A real grid is mostly wall,
+  /// because everything off the road is painted occupied; a nearly empty one means the
+  /// road layer was never filled.  See the check in step_probe().
+  double grid_occupied_fraction_{0.0};
   uint16_t attempts_{0};
 
   geometry_msgs::msg::Pose entry_pose_{};
   geometry_msgs::msg::Pose last_pose_{};
   bool has_last_pose_{false};
   double progress_since_entry_m_{0.0};
-  double reverse_distance_m_{0.0};
-  double total_reverse_distance_m_{0.0};
-  /// Closest the robot has ever been to the goal.  Progress is measured against this, so
-  /// that reversing and re-approaching the same spot does not count as getting anywhere.
-  double best_remaining_to_goal_m_{std::numeric_limits<double>::max()};
 
   std::vector<geometry_msgs::msg::Pose> reference_path_{};
   std::optional<geometry_msgs::msg::Pose> escape_goal_{};
   std::vector<geometry_msgs::msg::Pose> goal_candidates_{};
   size_t goal_index_{0};
   rclcpp::Time last_valid_plan_{0, 0, RCL_ROS_TIME};
-  geometry_msgs::msg::Pose backoff_start_pose_{};
-  double backoff_target_m_{0.0};
-  /// Index in reference_path_ the retreat ends at.  Pinned once when the backoff
-  /// begins: recomputing it from the moving robot each tick made the end point run
-  /// away ahead of it, so the robot reversed forever instead of stopping.
-  size_t backoff_end_index_{0};
   int failed_goal_tries_{0};
   int replan_attempts_{0};
   bool start_blocked_{false};
   bool abort_was_mechanical_{false};
   rclcpp::Time abort_clear_since_{0, 0, RCL_ROS_TIME};
   rclcpp::Time spent_since_{0, 0, RCL_ROS_TIME};
-  /// Where the robot was when the last retreat began (or where the episode started).
-  /// Distance from here is what "progress since the last retreat" means.
-  geometry_msgs::msg::Pose pose_at_last_backoff_{};
   CorridorResult last_sweep_{};
 
   uint8_t stop_source_{0};
@@ -525,7 +502,7 @@ private:
   /// with an RViz Pose display or echoed straight from the command line.
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_escape_goal_{};
   /// The recovery trajectory scenario_selector consumes.  The supervisor is the single
-  /// publisher here: it relays freespace's plan, or its own backoff trajectory.
+  /// publisher here, and it only ever relays freespace's plan.
   rclcpp::Publisher<autoware_planning_msgs::msg::Trajectory>::SharedPtr pub_recovery_traj_{};
 
   rclcpp::Service<autoware_stuck_recovery_msgs::srv::ForceRecovery>::SharedPtr srv_force_{};

@@ -56,10 +56,11 @@
         <remap from="~/input/occupancy_grid" to="costmap_generator/occupancy_grid"/>
         <remap from="~/input/odometry" to="/localization/kinematic_state"/>
         <!-- Freespace publishes to its OWN topic; the supervisor is the single
-             publisher on /planning/recovery/trajectory, relaying this verbatim or
-             substituting its backoff trajectory.  Verbatim matters: freespace already
-             splits its plan at every direction cusp and waits for the robot to stop
-             there, which is the only reason the MPC can follow a Reeds-Shepp path. -->
+             publisher on /planning/recovery/trajectory, and relays this verbatim once it
+             has checked that the plan goes the way the mission is going and stays on the
+             road.  Verbatim matters: freespace already splits its plan at every direction
+             cusp and waits for the robot to stop there, which is the only reason the MPC
+             can follow such a path at all. -->
         <remap from="~/output/trajectory" to="/planning/recovery/freespace_trajectory"/>
         <remap from="is_completed" to="/planning/recovery/is_completed"/>
         <param from="$(var vehicle_param_file)"/>

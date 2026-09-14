@@ -93,10 +93,9 @@
     # the state flip between Recovery and LaneDriving forever, obstacle never passed.
     rejoin_lateral_tolerance_m: 0.5
 
-    # Recovery's own emergency brake, applied to the relayed freespace plan AND to the
-    # backoff retreat.  While this scenario drives, the motion_velocity_planner stop
-    # modules are bypassed entirely, so nothing else in planning is watching -- and
-    # backing up is the one thing here the robot does towards ground it cannot see.
+    # Recovery's own emergency brake.  While this scenario drives, the
+    # motion_velocity_planner stop modules are bypassed entirely, so nothing else in
+    # planning is watching what the robot drives into.
     #
     # It stops for whatever the recovery costmap knows: obstacles from objects and
     # pointcloud, and the lanelet boundary itself (everything outside the road area is
@@ -122,48 +121,28 @@
     # A brake held this long is not a passing hazard -- the plan is not drivable.
     # Replan instead of holding until the episode times out.
     aeb_hold_replan_sec: 3.0
-    # Reversing a long way is fine as long as it gets the robot past the obstacle; this
-    # is a runaway stop, not a shaping knob.  Hard-clamped to 20 m in the node.
-    max_reverse_distance_m: 10.0
-
-    # Cumulative reverse budget ACROSS episodes.  max_reverse_distance_m above is reset on
-    # every episode, so on its own it cannot bound an obstacle that keeps advancing on the
-    # robot: it retreats 10 m, recovers, the obstacle closes in again, the new episode hands
-    # out a fresh 10 m, and the total is unbounded.  This one is cleared only once the robot
-    # has genuinely closed on the goal by total_reverse_reset_progress_m, so "retreating
-    # without ever getting anywhere" terminates and hands over to an operator.
-    max_total_reverse_distance_m: 15.0
-    total_reverse_reset_progress_m: 5.0
     max_lateral_excursion_m: 2.0
 
-    # --- backoff -----------------------------------------------------------
-    # When freespace cannot plan from where the robot stands -- typically because its
-    # own footprint is inside the inflated obstacle, which no choice of goal can fix --
-    # the robot retreats along the path it came from at a crawl, then lets freespace try
-    # again from further back.  Alternating BACKOFF and RECOVERY is what lets it shuffle
-    # back and forth until it gets past.
-    #
-    # Stepped rather than continuous on purpose: freespace_planner only replans once the
-    # vehicle has actually stopped ("Waiting for the vehicle to stop before generating a
-    # new trajectory"), so retreating without pausing would never produce a new plan.
-    # Hard ceiling for everything this scenario drives -- the relayed freespace plan as
-    # much as the backoff.  Enforced in the supervisor's relay, which is the single
-    # publisher of the recovery trajectory, so nothing downstream can raise it.
-    recovery_speed_limit_mps: 0.278   # 1 km/h
-    backoff_speed_mps: 0.278          # 1 km/h, same crawl
-    # Retreat is triggered after this many failed goal attempts, and covers that count
-    # x goal_check_interval_m -- the robot gives back exactly the ground it worked
-    # through in the candidate list, stops, and tries the goals again from there.
-    backoff_after_failed_goals: 2
-    # The retreat is considered finished once the robot is within this of the target,
-    # instead of demanding it land exactly -- a 1 km/h crawl through the velocity
-    # smoother never stops on the millimetre, and insisting on that is how a retreat
-    # hangs in BACKOFF forever.
-    backoff_reach_tolerance_m: 0.3
-    backoff_lookback_m: 15.0   # how much path behind ego to keep as retreat geometry
+    # Sanity check on the recovery grid.  costmap_generator paints the whole window
+    # occupied and carves the road lanelets out of it, so a real grid is mostly wall --
+    # 60% occupied when measured on the robot.  A map with no subtype=road lanelets makes
+    # it return early and leave the layer free EVERYWHERE, silently, and then every
+    # "is this on drivable ground" test answers yes anywhere.  Below this fraction the
+    # grid is treated as broken and recovery refuses to drive rather than trusting it.
+    min_occupied_fraction: 0.05
 
-    # How long to wait for a usable plan before trying the next goal candidate.  A goal
-    # is only abandoned after this; the robot backs off only once every candidate failed.
+    # There is no reverse budget, and no retreat for it to bound.  Recovery refuses any
+    # plan that travels against the mission's motion mode, so "the obstacle closes in and
+    # the robot keeps giving ground" cannot happen in the first place.
+
+    # Hard ceiling for everything this scenario drives.  Enforced in the supervisor's
+    # relay, which is the single publisher of the recovery trajectory, so nothing
+    # downstream can raise it.
+    recovery_speed_limit_mps: 0.278   # 1 km/h
+
+    # How long to wait for a usable plan before trying the next goal candidate.  When the
+    # candidates run out the robot stops and waits for an operator -- it does not give
+    # ground to buy itself a better starting position.
     goal_retry_sec: 2.0   # [TEST] shortened from 4.0
 
     # Forced replan.  When the robot stops past the live part of freespace's plan, the
@@ -173,18 +152,12 @@
     # is still well within th_course_out_distance_m).  Re-publishing the route makes it
     # reset and plan afresh from where the robot actually is.
     replan_wait_sec: 5.0        # freespace only plans once the vehicle has stopped
-    max_replan_attempts: 3      # then fall back to retreating
+    max_replan_attempts: 3      # then move on to the next goal candidate
     # The plan must look spent for this long, continuously, before a replan is forced.
     # Judging it instantly produced a RECOVERY <-> REPLAN oscillation: a single short
     # partial from freespace was enough to trigger a forced replan, and that republishes
     # the route -- which makes freespace reset() and discard the plan it had just made.
     spent_hold_sec: 2.0
-    # Retreating is the answer to being stuck in the same place, not to falling a little
-    # short.  If the robot has covered at least this much since the last retreat -- it
-    # edged past part of the obstacle, or just paused for AEB -- the manoeuvre is working,
-    # so replan from where it is instead of backing off and starting the whole thing over.
-    backoff_progress_reset_m: 0.5
-
     # A freespace plan is only acted on if it arrived AFTER this episode's goal was
     # published, and within this long.  /planning/recovery/route has to be
     # transient_local (freespace subscribes latched), so a goal from a previous episode
@@ -248,7 +221,7 @@
     topic_occupancy_grid: "/planning/recovery/costmap_generator/occupancy_grid"
     topic_recovery_trajectory: "/planning/recovery/trajectory"
     # freespace publishes here; the supervisor is the single publisher on
-    # topic_out_recovery_trajectory, relaying freespace verbatim or its own backoff plan.
+    # topic_out_recovery_trajectory, relaying freespace's plan verbatim.
     topic_freespace_trajectory: "/planning/recovery/freespace_trajectory"
     topic_recovery_is_completed: "/planning/recovery/is_completed"
     topic_road_crossing_state: "/planning/road_crossing/fsm_state"
