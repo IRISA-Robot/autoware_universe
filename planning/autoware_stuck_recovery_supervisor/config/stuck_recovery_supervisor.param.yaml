@@ -93,6 +93,25 @@
     # the state flip between Recovery and LaneDriving forever, obstacle never passed.
     rejoin_lateral_tolerance_m: 0.5
 
+    # --- TRANSIT: the handover state -----------------------------------------
+    # Every road back to lane driving runs through TRANSIT, where the robot drives the
+    # REFERENCE path at the recovery crawl until it actually points along it.
+    #
+    # Measured on the robot: recovery handed back at 0.067 m of lateral error -- well
+    # inside the tolerance above -- while pointing 57 degrees away from the path.  Lane
+    # driving then accelerated, and a robot at 57 degrees to its path leaves it: 1.41 m
+    # off two seconds later.  Lateral distance alone was never enough; heading is the
+    # thing that was missing.
+    #
+    # The gate is |wrapped(heading - path heading)| <= this, held continuously for
+    # transit_hold_sec, so a robot swinging THROUGH alignment does not hand back mid-swing.
+    # The lateral tolerance above still applies as well: being aimed correctly while
+    # standing a metre off the path is not being back on it either.
+    transit_yaw_tolerance_rad: 0.26   # 15 deg
+    transit_hold_sec: 1.0
+    # If it cannot line up in this long it is not going to. Stop rather than crawl forever.
+    transit_timeout_sec: 30.0
+
     # Recovery's own emergency brake.  While this scenario drives, the
     # motion_velocity_planner stop modules are bypassed entirely, so nothing else in
     # planning is watching what the robot drives into.

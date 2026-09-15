@@ -89,6 +89,14 @@ enum class State : int32_t {
   // Re-publishing the route forces freespace to reset and plan afresh from where the
   // robot actually is.
   REPLAN = 8,
+  // Every road back to lane driving runs through here.  Recovery used to hand over the
+  // moment the corridor read clear and the robot was near the path -- and near the path is
+  // not the same as pointing along it.  Measured on the robot: handed back at 0.067 m of
+  // lateral error, comfortably inside tolerance, but 57 degrees of heading error; lane
+  // driving then accelerated and the robot was 1.41 m off the path two seconds later.
+  // TRANSIT drives the reference path itself, at the recovery crawl, until the robot is
+  // actually pointing the way the path goes.
+  TRANSIT = 9,
 };
 
 /// How far the supervisor is allowed to go.  Set from the `mode` parameter so the
@@ -165,6 +173,14 @@ private:
     // itself -- still saw the obstacle and stopped again.  That disagreement is what made
     // the state flip between Recovery and LaneDriving indefinitely.
     double rejoin_lateral_tolerance_m{0.5};
+
+    // TRANSIT: the handover state.  Exit is on HEADING, because heading is what the old
+    // lateral-only gate missed.
+    double transit_yaw_tolerance_rad{0.26};  // 15 deg
+    // Held continuously, so a robot swinging through alignment does not hand back mid-swing.
+    double transit_hold_sec{1.0};
+    // If it cannot line up in this long it is not going to; stop rather than crawl forever.
+    double transit_timeout_sec{30.0};
 
     // Recovery's own emergency brake.  The relayed plan was computed against an older
     // costmap; if the world has since put something in it, stop rather than drive it.
@@ -315,6 +331,13 @@ private:
   void step_cooldown();
   void step_abort();
   void step_replan();
+  /// Drive the reference path at the recovery crawl until the robot points along it.
+  void step_transit();
+  /// Trajectory along the reference path from the robot, at recovery_speed_limit_mps,
+  /// signed by the mission's direction of travel.
+  autoware_planning_msgs::msg::Trajectory build_transit_trajectory() const;
+  /// Signed heading error between the robot and the reference path's direction of travel.
+  std::optional<double> heading_error_to_reference() const;
   void force_freespace_replan(const std::string & why);
   /// True when the robot is stopped and there is no usable velocity left ahead of it in
   /// the plan being relayed -- i.e. the plan is spent and only a replan can help.
@@ -430,6 +453,8 @@ private:
   rclcpp::Time stopped_since_{0, 0, RCL_ROS_TIME};
   rclcpp::Time commanded_but_still_since_{0, 0, RCL_ROS_TIME};
   rclcpp::Time clear_since_{0, 0, RCL_ROS_TIME};
+  /// When the heading last came inside transit_yaw_tolerance_rad.
+  rclcpp::Time transit_aligned_since_{0, 0, RCL_ROS_TIME};
   rclcpp::Time cooldown_until_{0, 0, RCL_ROS_TIME};
   bool is_stopped_{false};
   bool commanded_but_still_{false};

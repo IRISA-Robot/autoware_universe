@@ -17,6 +17,10 @@ int32 ABORT=6
 # The number stays reserved so bags recorded before the removal still decode.
 int32 BACKOFF_REMOVED=7
 int32 REPLAN=8
+# Every road back to lane driving runs through here: drive the reference path at the
+# recovery crawl until the robot actually points along it.  Handing back on lateral
+# distance alone let the robot leave at 57 degrees of heading error and drive off the path.
+int32 TRANSIT=9
 
 int32  state
 string state_name

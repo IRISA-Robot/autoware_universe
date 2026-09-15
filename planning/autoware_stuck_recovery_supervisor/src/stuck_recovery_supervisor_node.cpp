@@ -15,6 +15,7 @@
 #include "autoware/stuck_recovery_supervisor/stuck_recovery_supervisor_node.hpp"
 
 #include <autoware/motion_utils/resample/resample.hpp>
+#include <autoware_utils/math/normalization.hpp>
 #include <autoware_lanelet2_extension/utility/utilities.hpp>
 
 #include <autoware_vehicle_info_utils/vehicle_info_utils.hpp>
@@ -64,6 +65,8 @@ std::string state_name(State state)
       return "ABORT";
     case State::REPLAN:
       return "REPLAN";
+    case State::TRANSIT:
+      return "TRANSIT";
   }
   return "UNKNOWN";
 }
@@ -149,6 +152,10 @@ void StuckRecoverySupervisorNode::load_parameters()
   p.goal_shape_margin_m = declare_parameter<double>("goal_shape_margin_m", 0.2);
   p.recovery_timeout_sec = declare_parameter<double>("recovery_timeout_sec", 60.0);
   p.clear_hold_sec = declare_parameter<double>("clear_hold_sec", 1.0);
+  p.transit_yaw_tolerance_rad =
+    declare_parameter<double>("transit_yaw_tolerance_rad", 0.26);
+  p.transit_hold_sec = declare_parameter<double>("transit_hold_sec", 1.0);
+  p.transit_timeout_sec = declare_parameter<double>("transit_timeout_sec", 30.0);
   p.rejoin_lateral_tolerance_m =
     declare_parameter<double>("rejoin_lateral_tolerance_m", 0.5);
   p.aeb_lookahead_m = declare_parameter<double>("aeb_lookahead_m", 1.5);
@@ -482,6 +489,9 @@ void StuckRecoverySupervisorNode::on_timer()
     case State::REPLAN:
       step_replan();
       break;
+    case State::TRANSIT:
+      step_transit();
+      break;
   }
 
   // Arming is derived from the state rather than latched, so that any exit path --
@@ -489,12 +499,15 @@ void StuckRecoverySupervisorNode::on_timer()
   // alive because that is how we notice the blockage going away.
   const bool arm_costmap =
     mode_ >= Mode::PROBE_ONLY && (state_ == State::PROBE || state_ == State::RECOVERY ||
-                                  state_ == State::BLOCKED || state_ == State::REPLAN);
+                                  state_ == State::BLOCKED || state_ == State::REPLAN ||
+                                  state_ == State::TRANSIT);
   publish_recovery_arming(arm_costmap);
 
   std_msgs::msg::Bool force;
+  // TRANSIT drives the robot too, so the scenario has to stay switched over for it.
   force.data =
-    (mode_ == Mode::RECOVERY && (state_ == State::RECOVERY || state_ == State::REPLAN));
+    (mode_ == Mode::RECOVERY &&
+     (state_ == State::RECOVERY || state_ == State::REPLAN || state_ == State::TRANSIT));
   pub_force_recovery_->publish(force);
 
   relay_recovery_trajectory();
@@ -770,6 +783,14 @@ void StuckRecoverySupervisorNode::transition(State next, const std::string & rea
   state_ = next;
   state_since_ = this->now();
   aeb_holding_ = false;
+  if (next == State::TRANSIT) {
+    // The manoeuvre is over; only the line-up remains.  Drop the freespace plan so a stale
+    // one can never be relayed here, and start the hold from now rather than from whatever
+    // the last alignment was.
+    freespace_trajectory_.reset();
+    freespace_traj_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    transit_aligned_since_ = this->now();
+  }
   if (next == State::COOLDOWN || next == State::BLOCKED || next == State::ABORT) {
     // The scenario is no longer driving; drop the plan and goal so that re-arming later
     // cannot resurrect them.
@@ -1079,7 +1100,7 @@ void StuckRecoverySupervisorNode::step_recovery()
     RCLCPP_INFO(
       get_logger(), "[episode %u] escape goal passed and none left ahead", episode_id_);
     cooldown_until_ = now + rclcpp::Duration::from_seconds(param_.cooldown_sec);
-    transition(State::COOLDOWN, "escape goal passed; manoeuvre complete");
+    transition(State::TRANSIT, "escape goal passed; lining up before handing back");
     return;
   }
 
@@ -1170,7 +1191,7 @@ void StuckRecoverySupervisorNode::step_recovery()
   }
 
   cooldown_until_ = now + rclcpp::Duration::from_seconds(param_.cooldown_sec);
-  transition(State::COOLDOWN, "corridor ahead is clear again");
+  transition(State::TRANSIT, "corridor ahead is clear; lining up before handing back");
 }
 
 std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_candidates() const
@@ -1354,7 +1375,9 @@ void StuckRecoverySupervisorNode::relay_recovery_trajectory()
   // splits its plan at every direction cusp and waits for the robot to stop there,
   // which is the only reason the MPC can follow a Reeds-Shepp path at all.
   autoware_planning_msgs::msg::Trajectory traj;
-  if (state_ == State::RECOVERY && freespace_trajectory_) {
+  if (state_ == State::TRANSIT) {
+    traj = build_transit_trajectory();
+  } else if (state_ == State::RECOVERY && freespace_trajectory_) {
     traj = *freespace_trajectory_;
   } else {
     return;
@@ -1496,12 +1519,12 @@ void StuckRecoverySupervisorNode::force_freespace_replan(const std::string & why
       RCLCPP_INFO(
         get_logger(), "[episode %u] every escape goal is behind the robot -- manoeuvre done (%s)",
         episode_id_, why.c_str());
-      transition(State::COOLDOWN, "drove past the last escape goal");
+      transition(State::TRANSIT, "drove past the last escape goal; lining up");
       return;
     }
     if (!publish_current_goal()) {
       if (rejoined_reference_path()) {
-        transition(State::COOLDOWN, "no escape goal ahead of the robot is left");
+        transition(State::TRANSIT, "no escape goal left ahead; lining up");
       } else {
         transition(State::ABORT, "no escape goal left and the robot is off the path");
       }
@@ -1553,6 +1576,121 @@ void StuckRecoverySupervisorNode::step_replan()
 
   replan_attempts_ = 0;
   reject_plan_and_try_next_goal("replanning from this pose keeps failing");
+}
+
+std::optional<double> StuckRecoverySupervisorNode::heading_error_to_reference() const
+{
+  if (!odom_ || reference_path_.size() < 2) {
+    return std::nullopt;
+  }
+  const auto nearest = find_nearest_index(reference_path_, odom_->pose.pose);
+  if (!nearest) {
+    return std::nullopt;
+  }
+  // Against the DIRECTION OF TRAVEL, not the raw path yaw: in reverse motion the robot
+  // faces away from the way it is going, and comparing against the path yaw there would
+  // read a perfectly aligned robot as 180 degrees out.
+  const double ref_yaw = tf2::getYaw(reference_path_[*nearest].orientation) +
+                         (path_yaw_opposes_ego() ? M_PI : 0.0);
+  return autoware_utils::normalize_radian(tf2::getYaw(odom_->pose.pose.orientation) - ref_yaw);
+}
+
+autoware_planning_msgs::msg::Trajectory StuckRecoverySupervisorNode::build_transit_trajectory()
+  const
+{
+  autoware_planning_msgs::msg::Trajectory traj;
+  traj.header.frame_id = "map";
+  traj.header.stamp = this->now();
+  if (!odom_ || reference_path_.size() < 2) {
+    return traj;
+  }
+  const auto nearest = find_nearest_index(reference_path_, odom_->pose.pose);
+  if (!nearest) {
+    return traj;
+  }
+
+  // The reference path itself, from the robot forward -- the path lane driving is about to
+  // resume on.  Driving it here, at the recovery crawl, is what turns the handover from a
+  // step change into something the robot can follow.
+  const double sign = mission_travel_sign();
+  const bool mirror = path_yaw_opposes_ego();
+  double arc = 0.0;
+  for (size_t i = *nearest; i < reference_path_.size(); ++i) {
+    if (i > *nearest) {
+      arc += distance2d(reference_path_[i - 1], reference_path_[i]);
+    }
+    if (arc > param_.max_goal_search_distance_m) {
+      break;
+    }
+    autoware_planning_msgs::msg::TrajectoryPoint point;
+    point.pose = reference_path_[i];
+    if (mirror) {
+      // Hand the controller the vehicle's own heading, as the escape goals are given.
+      const double yaw = tf2::getYaw(point.pose.orientation) + M_PI;
+      point.pose.orientation.x = 0.0;
+      point.pose.orientation.y = 0.0;
+      point.pose.orientation.z = std::sin(yaw * 0.5);
+      point.pose.orientation.w = std::cos(yaw * 0.5);
+    }
+    point.longitudinal_velocity_mps =
+      static_cast<float>(sign * param_.recovery_speed_limit_mps);
+    traj.points.push_back(point);
+  }
+  if (!traj.points.empty()) {
+    traj.points.back().longitudinal_velocity_mps = 0.0f;
+  }
+  return traj;
+}
+
+void StuckRecoverySupervisorNode::step_transit()
+{
+  const auto now = this->now();
+
+  if (!is_operational() || emergency_code_ != 0) {
+    transition(State::ABORT, "left autonomous mode or emergency while lining up");
+    return;
+  }
+  if ((now - state_since_).seconds() > param_.transit_timeout_sec) {
+    transition(State::ABORT, "could not line up with the path in time");
+    return;
+  }
+  if ((now - episode_since_).seconds() > param_.max_episode_duration_sec) {
+    transition(State::ABORT, "episode watchdog expired while lining up");
+    return;
+  }
+
+  const auto yaw_error = heading_error_to_reference();
+  if (!yaw_error) {
+    transition(State::ABORT, "no reference path to line up with");
+    return;
+  }
+
+  const double offset = lateral_offset_from_path();
+  const bool aligned = std::abs(*yaw_error) <= param_.transit_yaw_tolerance_rad &&
+                       offset <= param_.rejoin_lateral_tolerance_m;
+  if (!aligned) {
+    transit_aligned_since_ = now;
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "[episode %u] lining up before handing back: heading %.1f deg (need %.1f), %.2f m off the "
+      "path (need %.2f)",
+      episode_id_, *yaw_error * 180.0 / M_PI, param_.transit_yaw_tolerance_rad * 180.0 / M_PI,
+      offset, param_.rejoin_lateral_tolerance_m);
+    return;
+  }
+
+  // Held, not instantaneous: a robot swinging through alignment would otherwise hand back
+  // mid-swing, which is the failure this state exists to prevent.
+  if ((now - transit_aligned_since_).seconds() < param_.transit_hold_sec) {
+    return;
+  }
+
+  RCLCPP_INFO(
+    get_logger(),
+    "[episode %u] lined up: heading %.1f deg, %.2f m off the path -- handing back to lane driving",
+    episode_id_, *yaw_error * 180.0 / M_PI, offset);
+  cooldown_until_ = now + rclcpp::Duration::from_seconds(param_.cooldown_sec);
+  transition(State::COOLDOWN, "lined up with the path");
 }
 
 void StuckRecoverySupervisorNode::step_blocked()
@@ -2572,6 +2710,7 @@ void StuckRecoverySupervisorNode::on_diagnostics(
     case State::PROBE:
     case State::RECOVERY:
     case State::REPLAN:
+    case State::TRANSIT:
       stat.summary(
         diagnostic_msgs::msg::DiagnosticStatus::WARN, "stuck handling: " + state_name(state_));
       break;
