@@ -18,6 +18,7 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/tools/car_pose.cpp
   src/tools/unknown_pose.cpp
   src/tools/delete_all_objects.cpp
+  src/tools/delete_nearest_object.cpp
 )
 
 target_link_libraries(${PROJECT_NAME}

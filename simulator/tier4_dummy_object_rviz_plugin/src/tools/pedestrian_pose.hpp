@@ -65,6 +65,19 @@ public:
   [[nodiscard]] DummyObject createObjectMsg() const override;
 };
 
+/// The same pedestrian, but walking.
+///
+/// Velocity was always a property of the pedestrian tool; what was missing was a way to
+/// drop a walking one without first editing that property, and then editing it back to
+/// drop a standing one.  Building a scenario means placing several of each, so the two
+/// live as separate buttons -- exactly as the car and the bus already do.
+class PedestrianMovingInitialPoseTool : public PedestrianInitialPoseTool
+{
+public:
+  PedestrianMovingInitialPoseTool();
+  void onInitialize() override;
+};
+
 }  // namespace rviz_plugins
 
 #endif  // TOOLS__PEDESTRIAN_POSE_HPP_

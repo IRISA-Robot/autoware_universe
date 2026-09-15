@@ -19,6 +19,16 @@
          type="rviz_plugins::UnknownInitialPoseTool"
          base_class_type="rviz_common::Tool">
   </class>
+  <class name="rviz_plugins/PedestrianMovingInitialPoseTool"
+         type="rviz_plugins::PedestrianMovingInitialPoseTool"
+         base_class_type="rviz_common::Tool">
+    <description>A pedestrian that walks, for building scenarios without editing the velocity property each time.</description>
+  </class>
+  <class name="rviz_plugins/DeleteNearestObjectTool"
+         type="rviz_plugins::DeleteNearestObjectTool"
+         base_class_type="rviz_common::Tool">
+    <description>Delete the single dummy object nearest the click, leaving the rest of the scene alone.</description>
+  </class>
   <class name="rviz_plugins/DeleteAllObjectsTool"
          type="rviz_plugins::DeleteAllObjectsTool"
          base_class_type="rviz_common::Tool">

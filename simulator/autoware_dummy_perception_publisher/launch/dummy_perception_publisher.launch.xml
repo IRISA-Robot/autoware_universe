@@ -45,6 +45,10 @@
         <param name="enable_ray_tracing" value="false"/>
         <param name="use_object_recognition" value="$(var use_object_recognition)"/>
         <param name="use_base_link_z" value="$(var use_base_link_z)"/>
+        <!-- Ground truth carries each dummy object's own uuid, which is the key the
+             single-object delete is addressed by.  The rviz Delete Nearest Object tool
+             picks from this topic, so without it that tool has nothing to pick from. -->
+        <param name="publish_ground_truth" value="true"/>
       </node>
     </group>
 

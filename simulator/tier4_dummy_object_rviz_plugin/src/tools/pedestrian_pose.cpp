@@ -144,7 +144,24 @@ DummyObject PedestrianInitialPoseTool::createObjectMsg() const
 
   return object;
 }
+PedestrianMovingInitialPoseTool::PedestrianMovingInitialPoseTool()
+: PedestrianInitialPoseTool()
+{
+  // A brisk walk.  It is only the default -- the Velocity property is still there to edit
+  // per placement, which is what makes a scenario of several pedestrians at different
+  // speeds possible without switching tools.
+  // 'k' is the car, 'l' the standing pedestrian, 'm' is rviz's own Move Camera.
+  shortcut_key_ = 'j';
+  velocity_->setFloat(1.4);
+}
+
+void PedestrianMovingInitialPoseTool::onInitialize()
+{
+  PedestrianInitialPoseTool::onInitialize();
+  setName("2D Dummy Pedestrian (moving)");
+}
 }  // end namespace rviz_plugins
 
 #include <pluginlib/class_list_macros.hpp>
 PLUGINLIB_EXPORT_CLASS(rviz_plugins::PedestrianInitialPoseTool, rviz_common::Tool)
+PLUGINLIB_EXPORT_CLASS(rviz_plugins::PedestrianMovingInitialPoseTool, rviz_common::Tool)
