@@ -155,6 +155,8 @@ void StuckRecoverySupervisorNode::load_parameters()
   p.aeb_occupancy_threshold =
     static_cast<int>(declare_parameter<int64_t>("aeb_occupancy_threshold", 100));
   p.aeb_hold_replan_sec = declare_parameter<double>("aeb_hold_replan_sec", 3.0);
+  p.containment_grace_m = declare_parameter<double>("containment_grace_m", 2.0);
+  p.publish_footprint_markers = declare_parameter<bool>("publish_footprint_markers", true);
   p.max_lateral_excursion_m = declare_parameter<double>("max_lateral_excursion_m", 2.0);
   p.min_occupied_fraction = declare_parameter<double>("min_occupied_fraction", 0.05);
 
@@ -1355,6 +1357,8 @@ void StuckRecoverySupervisorNode::relay_recovery_trajectory()
     return;
   }
 
+  record_footprint_debug(traj);
+
   clamp_recovery_speed(traj);
 
   // Emergency brake.  While this scenario drives, the motion_velocity_planner stop
@@ -1820,23 +1824,39 @@ bool StuckRecoverySupervisorNode::plan_stays_inside_road(
   //
   // The whole plan is judged, not just the braking distance: a plan that leaves the road
   // five metres out is not a plan to drive carefully, it is the wrong plan.
+  //
+  // But the START is not the plan's fault.  Recovery is often called precisely because the
+  // robot has ended up half off the road, so its own footprint reads blocked and so does
+  // the first stretch of any plan that digs it out.  Judging those points refuses every
+  // possible plan: on the robot, ten goal candidates in a row were rejected at the very
+  // same coordinate -- the robot's own position, 0.00 m along each plan -- while the
+  // corridor beside it was 3 m wide and clear.  So an opening run of blocked points is
+  // tolerated, up to containment_grace_m; once the plan has reached clear ground, any
+  // later violation is real and refuses the plan.
   if (!costmap_is_fresh()) {
     return true;  // the brake already refuses to drive on a stale grid; do not double-report
   }
   double arc = 0.0;
+  bool reached_clear_ground = false;
   for (size_t i = 0; i < traj.points.size(); ++i) {
     if (i > 0) {
       arc += distance2d(traj.points[i - 1].pose, traj.points[i].pose);
     }
-    if (!footprint_is_free_with_margin(
+    if (footprint_is_free_with_margin(
           traj.points[i].pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)) {
-      std::ostringstream why;
-      why << "plan leaves the drivable area " << std::fixed << std::setprecision(2) << arc
-          << " m along it, at (" << traj.points[i].pose.position.x << ", "
-          << traj.points[i].pose.position.y << ")";
-      aeb_reason_ = why.str();
-      return false;
+      reached_clear_ground = true;
+      continue;
     }
+    if (!reached_clear_ground && arc <= param_.containment_grace_m) {
+      continue;  // still extracting the robot from where it already stands
+    }
+    std::ostringstream why;
+    why << "plan leaves the drivable area " << std::fixed << std::setprecision(2) << arc
+        << " m along it, at (" << traj.points[i].pose.position.x << ", "
+        << traj.points[i].pose.position.y << ")"
+        << (reached_clear_ground ? "" : " and never reaches clear ground");
+    aeb_reason_ = why.str();
+    return false;
   }
   return true;
 }
@@ -1898,8 +1918,18 @@ bool StuckRecoverySupervisorNode::recovery_path_is_blocked(
   // (a) The plan itself.  A freespace path has been seen running straight through
   // occupied cells -- whether the costmap moved under it or the search produced it that
   // way, driving it is not acceptable either way.
+  //
+  // With one exception, the same one the drivable-area test makes: the ground the robot is
+  // ALREADY standing on is not something braking can fix.  Recovery is often called
+  // because the robot has ended up half off the road, and then the opening stretch of
+  // every plan reads blocked.  Braking there holds the robot in the hole it is trying to
+  // climb out of -- measured on the robot as an endless RECOVERY -> REPLAN cycle with the
+  // brake on throughout.  So an opening blocked run is tolerated up to
+  // containment_grace_m; the moment the plan touches clear ground, everything after it is
+  // judged, which is what the brake is actually for: something new in the way.
   double arc = 0.0;
   double travel_sign = 0.0;
+  bool reached_clear_ground = false;
   for (auto it = nearest; it != traj.points.end(); ++it) {
     if (it != nearest) {
       arc += distance2d(std::prev(it)->pose, it->pose);
@@ -1907,22 +1937,29 @@ bool StuckRecoverySupervisorNode::recovery_path_is_blocked(
     if (travel_sign == 0.0 && std::abs(it->longitudinal_velocity_mps) > 1e-3) {
       travel_sign = it->longitudinal_velocity_mps > 0.0 ? 1.0 : -1.0;
     }
-    if (arc < param_.aeb_skip_ahead_m) {
-      continue;  // the robot is already here; the planner accepted this clearance
-    }
     if (arc > param_.aeb_lookahead_m) {
       break;
     }
-    if (!footprint_is_free_with_margin(it->pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)) {
-      // Say exactly where, so a false brake can be checked against the costmap in rviz
-      // instead of argued about.
-      std::ostringstream why;
-      why << "plan is blocked " << std::fixed << std::setprecision(2) << arc << " m along it, at ("
-          << it->pose.position.x << ", " << it->pose.position.y << "), footprint margin "
-          << param_.aeb_margin_m << " m, threshold " << param_.aeb_occupancy_threshold;
-      aeb_reason_ = why.str();
-      return true;
+    const bool free =
+      footprint_is_free_with_margin(it->pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold);
+    if (free) {
+      reached_clear_ground = true;
+      continue;
     }
+    if (arc < param_.aeb_skip_ahead_m) {
+      continue;  // the robot is already here; the planner accepted this clearance
+    }
+    if (!reached_clear_ground && arc <= param_.containment_grace_m) {
+      continue;  // still climbing out of where the robot already stands
+    }
+    // Say exactly where, so a false brake can be checked against the costmap in rviz
+    // instead of argued about.
+    std::ostringstream why;
+    why << "plan is blocked " << std::fixed << std::setprecision(2) << arc << " m along it, at ("
+        << it->pose.position.x << ", " << it->pose.position.y << "), footprint margin "
+        << param_.aeb_margin_m << " m, threshold " << param_.aeb_occupancy_threshold;
+    aeb_reason_ = why.str();
+    return true;
   }
 
   // (b) Is the robot still ON the plan?  (a) only vouches for the path, so if tracking
@@ -2201,6 +2238,130 @@ void StuckRecoverySupervisorNode::publish_outputs()
   pub_diagnosis_->publish(diag);
 }
 
+void StuckRecoverySupervisorNode::record_footprint_debug(
+  const autoware_planning_msgs::msg::Trajectory & traj)
+{
+  footprint_debug_.clear();
+  if (!param_.publish_footprint_markers || !costmap_is_fresh()) {
+    return;
+  }
+  // Same walk and the same grace rule the drivable-area test applies, so what appears in
+  // rviz is the check's own answer and not a second opinion that could disagree with it.
+  double arc = 0.0;
+  bool reached_clear_ground = false;
+  for (size_t i = 0; i < traj.points.size(); ++i) {
+    if (i > 0) {
+      arc += distance2d(traj.points[i - 1].pose, traj.points[i].pose);
+    }
+    const auto & pose = traj.points[i].pose;
+    FootprintVerdict verdict = FootprintVerdict::FREE;
+    if (footprint_is_free_with_margin(
+          pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)) {
+      reached_clear_ground = true;
+    } else if (!reached_clear_ground && arc <= param_.containment_grace_m) {
+      verdict = FootprintVerdict::GRACED;
+    } else {
+      verdict = FootprintVerdict::BLOCKING;
+    }
+    footprint_debug_.emplace_back(pose, verdict);
+  }
+}
+
+void StuckRecoverySupervisorNode::append_footprint_markers(
+  visualization_msgs::msg::MarkerArray & markers, const rclcpp::Time & now) const
+{
+  // One closed rectangle per tested pose: the vehicle outline grown by the margin the
+  // test used, which is the box the occupancy lookup actually covers.
+  const auto box = [&](const geometry_msgs::msg::Pose & pose, double margin) {
+    const double yaw = tf2::getYaw(pose.orientation);
+    const double c = std::cos(yaw);
+    const double sn = std::sin(yaw);
+    const double half_w = vehicle_width_m_ * 0.5 + margin;
+    const double front = base_to_front_m_ + margin;
+    const double rear = base_to_rear_m_ + margin;
+    const double lon[5] = {front, front, -rear, -rear, front};
+    const double lat[5] = {half_w, -half_w, -half_w, half_w, half_w};
+    std::vector<geometry_msgs::msg::Point> pts;
+    for (int k = 0; k < 5; ++k) {
+      geometry_msgs::msg::Point pt;
+      pt.x = pose.position.x + c * lon[k] - sn * lat[k];
+      pt.y = pose.position.y + sn * lon[k] + c * lat[k];
+      pt.z = pose.position.z;
+      pts.push_back(pt);
+    }
+    return pts;
+  };
+
+  auto make = [&](const std::string & ns, int id, const std::vector<geometry_msgs::msg::Point> & pts,
+                  float r, float g, float b, float a, double width) {
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = "map";
+    m.header.stamp = now;
+    m.ns = ns;
+    m.id = id;
+    m.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    m.action = visualization_msgs::msg::Marker::ADD;
+    m.pose.orientation.w = 1.0;
+    m.scale.x = width;
+    m.color.r = r;
+    m.color.g = g;
+    m.color.b = b;
+    m.color.a = a;
+    m.points = pts;
+    return m;
+  };
+
+  // Clear the previous frame's boxes: fewer boxes this tick would otherwise leave stale
+  // ones on screen, which is worse than no drawing at all.
+  visualization_msgs::msg::Marker wipe;
+  wipe.header.frame_id = "map";
+  wipe.header.stamp = now;
+  wipe.ns = "stuck_recovery_plan_footprints";
+  wipe.action = visualization_msgs::msg::Marker::DELETEALL;
+  markers.markers.push_back(wipe);
+
+  int id = 0;
+  for (const auto & [pose, verdict] : footprint_debug_) {
+    switch (verdict) {
+      case FootprintVerdict::FREE:
+        markers.markers.push_back(
+          make("stuck_recovery_plan_footprints", id++, box(pose, param_.aeb_margin_m), 0.2f, 0.9f,
+               0.3f, 0.5f, 0.03));
+        break;
+      case FootprintVerdict::GRACED:
+        // Blocked, but this is the ground the robot already stands on -- drawn so it is
+        // obvious the check saw it and deliberately let it pass.
+        markers.markers.push_back(
+          make("stuck_recovery_plan_footprints", id++, box(pose, param_.aeb_margin_m), 1.0f, 0.7f,
+               0.0f, 0.9f, 0.05));
+        break;
+      case FootprintVerdict::BLOCKING:
+        markers.markers.push_back(
+          make("stuck_recovery_plan_footprints", id++, box(pose, param_.aeb_margin_m), 1.0f, 0.1f,
+               0.1f, 1.0f, 0.08));
+        break;
+    }
+  }
+
+  // The robot's own box, tested the same way.  This is the one that refused ten goals in a
+  // row, so it is worth seeing on its own rather than buried among the plan's boxes.
+  if (odom_ && costmap_is_fresh()) {
+    const bool ego_free = footprint_is_free_with_margin(
+      odom_->pose.pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold);
+    markers.markers.push_back(make(
+      "stuck_recovery_ego_footprint", 0, box(odom_->pose.pose, param_.aeb_margin_m),
+      ego_free ? 0.2f : 1.0f, ego_free ? 0.9f : 0.4f, ego_free ? 1.0f : 0.0f, 1.0f, 0.06));
+  }
+
+  // The escape goal, grown by the margin GOAL PLACEMENT uses -- a different, larger margin
+  // than the brake's, which is why a goal can be rejected on ground the brake would accept.
+  if (escape_goal_) {
+    markers.markers.push_back(make(
+      "stuck_recovery_goal_footprint", 0, box(*escape_goal_, param_.goal_shape_margin_m), 0.2f,
+      0.4f, 1.0f, 0.8f, 0.05));
+  }
+}
+
 void StuckRecoverySupervisorNode::publish_markers()
 {
   visualization_msgs::msg::MarkerArray markers;
@@ -2277,6 +2438,10 @@ void StuckRecoverySupervisorNode::publish_markers()
     goal.color.g = 0.4f;
     goal.color.b = 1.0f;
     markers.markers.push_back(goal);
+  }
+
+  if (param_.publish_footprint_markers) {
+    append_footprint_markers(markers, now);
   }
 
   pub_markers_->publish(markers);

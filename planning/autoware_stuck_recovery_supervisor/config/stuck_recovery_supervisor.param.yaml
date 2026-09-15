@@ -121,6 +121,25 @@
     # A brake held this long is not a passing hazard -- the plan is not drivable.
     # Replan instead of holding until the episode times out.
     aeb_hold_replan_sec: 3.0
+
+    # How much of a plan may begin on ground the costmap calls blocked before the plan is
+    # refused outright.  Recovery is often called precisely BECAUSE the robot has ended up
+    # half off the road: its own footprint then reads blocked, and so does the first stretch
+    # of any plan that digs it out.  Judging those points refuses every possible plan --
+    # measured on the robot, ten goal candidates in a row were all rejected at the very same
+    # coordinate, the robot's own position at 0.00 m along each plan, while the corridor
+    # beside it was 3 m wide and clear.  Past this distance the plan has had its chance to
+    # reach clear ground, and anything still blocked is a plan going where it must not.
+    containment_grace_m: 2.0
+
+    # Draw, in rviz, the very footprint boxes the checks above evaluate: green where the
+    # test passed, amber for the opening run that containment_grace_m deliberately let
+    # through, red where a box actually refused the plan.  The robot's own box and the
+    # escape goal's box are drawn too, the latter with the larger margin goal placement
+    # uses -- which is why a goal can be rejected on ground the brake would accept.
+    # It costs almost nothing and turns "why did it brake, the obstacle was far away" into
+    # something you can look at.
+    publish_footprint_markers: true
     max_lateral_excursion_m: 2.0
 
     # Sanity check on the recovery grid.  costmap_generator paints the whole window

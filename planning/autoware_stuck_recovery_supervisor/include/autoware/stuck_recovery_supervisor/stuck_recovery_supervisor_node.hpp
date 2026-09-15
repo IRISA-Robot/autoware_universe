@@ -48,6 +48,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace autoware::stuck_recovery_supervisor
@@ -183,6 +184,19 @@ private:
     // the plan is no longer drivable, so replan instead of holding until the episode
     // times out.  That deadlock is exactly what a whole 60 s episode was lost to.
     double aeb_hold_replan_sec{3.0};
+    // How much of a plan may start on ground the costmap calls blocked before the plan is
+    // refused.  Recovery is often called precisely because the robot has ended up half off
+    // the road, so its own footprint reads blocked and so do the first metre or so of any
+    // plan that digs it out.  Judging those points would refuse every possible plan --
+    // which is what happened: ten goal candidates in a row were all rejected at the same
+    // point, the robot's own position.  Past this distance the plan has had its chance to
+    // reach clear ground, and anything still blocked is a plan going somewhere it must not.
+    double containment_grace_m{2.0};
+    // Draw, in rviz, the very footprint boxes these checks evaluate.  Cheap, and it turns
+    // "why did it brake, the obstacle was far away" from an argument into something you
+    // can look at -- the answer that time was that the box under the robot itself was on
+    // blocked ground, which no amount of staring at the obstacle would have revealed.
+    bool publish_footprint_markers{true};
     double max_lateral_excursion_m{2.0};
     // Sanity check on the recovery grid, not a precise measurement.  costmap_generator
     // paints the whole window occupied and carves the road lanelets out of it, so a real
@@ -373,6 +387,13 @@ private:
   // Output
   void publish_outputs();
   void publish_markers();
+  /// Verdict for one footprint box, in the order the checks apply them.
+  enum class FootprintVerdict { FREE, GRACED, BLOCKING };
+  /// Record what each footprint test along the plan decided, so the markers show the
+  /// checks' own answers rather than a second opinion computed separately.
+  void record_footprint_debug(const autoware_planning_msgs::msg::Trajectory & traj);
+  void append_footprint_markers(
+    visualization_msgs::msg::MarkerArray & markers, const rclcpp::Time & now) const;
   void on_diagnostics(diagnostic_updater::DiagnosticStatusWrapper & stat);
   void on_force_recovery(
     const autoware_stuck_recovery_msgs::srv::ForceRecovery::Request::SharedPtr request,
@@ -427,6 +448,8 @@ private:
   rclcpp::Time abort_clear_since_{0, 0, RCL_ROS_TIME};
   rclcpp::Time spent_since_{0, 0, RCL_ROS_TIME};
   CorridorResult last_sweep_{};
+  /// Footprint boxes from the last relay, with the verdict each one got.
+  std::vector<std::pair<geometry_msgs::msg::Pose, FootprintVerdict>> footprint_debug_{};
 
   uint8_t stop_source_{0};
   std::string stop_source_module_{};
