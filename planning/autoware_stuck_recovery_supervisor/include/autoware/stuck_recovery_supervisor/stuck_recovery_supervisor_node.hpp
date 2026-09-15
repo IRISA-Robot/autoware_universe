@@ -18,6 +18,7 @@
 #include "autoware/stuck_recovery_supervisor/corridor_checker.hpp"
 
 #include <diagnostic_updater/diagnostic_updater.hpp>
+#include <autoware/route_handler/route_handler.hpp>
 #include <rclcpp/rclcpp.hpp>
 
 #include <autoware_adapi_v1_msgs/msg/operation_mode_state.hpp>
@@ -37,6 +38,7 @@
 #include <geometry_msgs/msg/pose.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
+#include <autoware_map_msgs/msg/lanelet_map_bin.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/int16.hpp>
@@ -197,6 +199,16 @@ private:
     // can look at -- the answer that time was that the box under the robot itself was on
     // blocked ground, which no amount of staring at the obstacle would have revealed.
     bool publish_footprint_markers{true};
+
+    // Where the reference path comes from.
+    //
+    // "centerline" rebuilds it from the lanelet map through the route handler, so it
+    // carries the prefer_lateral_ratio bias and is recomputed rather than inherited.
+    // "trajectory" freezes whatever lane driving last published, which means recovery
+    // reasons about a path that already has an avoidance shift baked into it -- the very
+    // shift that was being driven when the robot got stuck.
+    std::string reference_path_source{"centerline"};
+    std::string topic_map{"/map/vector_map"};
     double max_lateral_excursion_m{2.0};
     // Sanity check on the recovery grid, not a precise measurement.  costmap_generator
     // paints the whole window occupied and carves the road lanelets out of it, so a real
@@ -320,6 +332,12 @@ private:
 
   // Recovery helpers
   bool capture_reference_path();
+  /// Reference path from the lanelet centerline, biased by prefer_lateral_ratio.  Returns
+  /// false when the map or route are not available yet, so the caller can fall back.
+  bool capture_reference_path_from_centerline();
+  /// Reference path copied from the last lane-driving trajectory.  The original behaviour,
+  /// kept as the fallback for when the map is not up yet.
+  bool capture_reference_path_from_trajectory();
   std::optional<geometry_msgs::msg::Pose> compute_escape_goal() const;
   CorridorResult sweep(size_t from_index) const;
   /// Is the recovery costmap present AND recent?  A stale grid is worse than none.
@@ -465,6 +483,10 @@ private:
   autoware_vehicle_msgs::msg::VelocityReport::ConstSharedPtr velocity_{};
   autoware_control_msgs::msg::Control::ConstSharedPtr control_cmd_{};
   autoware_planning_msgs::msg::Trajectory::ConstSharedPtr trajectory_{};
+  rclcpp::Subscription<autoware_map_msgs::msg::LaneletMapBin>::SharedPtr sub_map_{};
+  autoware::route_handler::RouteHandler route_handler_{};
+  bool map_ready_{false};
+  bool route_handler_ready_{false};
   autoware_planning_msgs::msg::LaneletRoute::ConstSharedPtr route_{};
   autoware_adapi_v1_msgs::msg::RouteState::ConstSharedPtr route_state_{};
   autoware_adapi_v1_msgs::msg::OperationModeState::ConstSharedPtr operation_mode_{};

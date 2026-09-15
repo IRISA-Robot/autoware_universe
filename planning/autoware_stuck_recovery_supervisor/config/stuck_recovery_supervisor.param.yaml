@@ -140,6 +140,24 @@
     # It costs almost nothing and turns "why did it brake, the obstacle was far away" into
     # something you can look at.
     publish_footprint_markers: true
+
+    # Where the reference path comes from -- the path the corridor is swept along and the
+    # escape goals are placed on.
+    #
+    # "centerline" rebuilds it from the lanelet map through the route handler, so it is
+    # recomputed each episode and carries the prefer_lateral_ratio bias that defines where
+    # in the lane this robot belongs.
+    #
+    # "trajectory" is the original behaviour: freeze whatever lane driving last published.
+    # The trouble with that is the frozen trajectory already has an avoidance shift baked
+    # into it -- the very shift that was being driven when the robot got stuck -- so the
+    # corridor sweep and the goal placement end up reasoning about a path that is itself
+    # part of the problem.
+    #
+    # Falls back to "trajectory" automatically, with a warning, while the map or route are
+    # not available yet.
+    reference_path_source: "centerline"
+    topic_map: "/map/vector_map"
     max_lateral_excursion_m: 2.0
 
     # Sanity check on the recovery grid.  costmap_generator paints the whole window

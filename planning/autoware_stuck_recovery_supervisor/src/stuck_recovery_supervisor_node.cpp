@@ -14,6 +14,9 @@
 
 #include "autoware/stuck_recovery_supervisor/stuck_recovery_supervisor_node.hpp"
 
+#include <autoware/motion_utils/resample/resample.hpp>
+#include <autoware_lanelet2_extension/utility/utilities.hpp>
+
 #include <autoware_vehicle_info_utils/vehicle_info_utils.hpp>
 #include <tf2/utils.h>
 // See corridor_checker.cpp: tf2::getYaw needs the fromMsg definition from here, and
@@ -157,6 +160,9 @@ void StuckRecoverySupervisorNode::load_parameters()
   p.aeb_hold_replan_sec = declare_parameter<double>("aeb_hold_replan_sec", 3.0);
   p.containment_grace_m = declare_parameter<double>("containment_grace_m", 2.0);
   p.publish_footprint_markers = declare_parameter<bool>("publish_footprint_markers", true);
+  p.reference_path_source =
+    declare_parameter<std::string>("reference_path_source", p.reference_path_source);
+  p.topic_map = declare_parameter<std::string>("topic_map", p.topic_map);
   p.max_lateral_excursion_m = declare_parameter<double>("max_lateral_excursion_m", 2.0);
   p.min_occupied_fraction = declare_parameter<double>("min_occupied_fraction", 0.05);
 
@@ -297,9 +303,27 @@ void StuckRecoverySupervisorNode::setup_interfaces()
     [this](const autoware_planning_msgs::msg::Trajectory::ConstSharedPtr msg) {
       trajectory_ = msg;
     });
+  sub_map_ = create_subscription<autoware_map_msgs::msg::LaneletMapBin>(
+    param_.topic_map, rclcpp::QoS{1}.transient_local(),
+    [this](const autoware_map_msgs::msg::LaneletMapBin::ConstSharedPtr msg) {
+      route_handler_.setMap(*msg);
+      map_ready_ = true;
+      // The route may well have arrived first; it could not be fed then, so feed it now.
+      if (route_) {
+        route_handler_.setRoute(*route_);
+        route_handler_ready_ = true;
+      }
+    });
   sub_route_ = create_subscription<autoware_planning_msgs::msg::LaneletRoute>(
     param_.topic_route, latched,
-    [this](const autoware_planning_msgs::msg::LaneletRoute::ConstSharedPtr msg) { route_ = msg; });
+    [this](const autoware_planning_msgs::msg::LaneletRoute::ConstSharedPtr msg) {
+      route_ = msg;
+      // The handler needs both halves; feeding the route before the map throws.
+      if (map_ready_) {
+        route_handler_.setRoute(*msg);
+        route_handler_ready_ = true;
+      }
+    });
   sub_route_state_ = create_subscription<autoware_adapi_v1_msgs::msg::RouteState>(
     param_.topic_route_state, latched,
     [this](const autoware_adapi_v1_msgs::msg::RouteState::ConstSharedPtr msg) {
@@ -1634,6 +1658,78 @@ void StuckRecoverySupervisorNode::step_abort()
 // Recovery helpers
 // ---------------------------------------------------------------------------
 bool StuckRecoverySupervisorNode::capture_reference_path()
+{
+  reference_path_.clear();
+
+  // Prefer the map.  The trajectory lane driving last published already has the avoidance
+  // shift baked into it -- the very shift the robot was driving when it got stuck -- so
+  // measuring the corridor and placing escape goals against it means reasoning about a
+  // path that is itself part of the problem.  The centerline is recomputed from the map
+  // each time, and carries the prefer_lateral_ratio bias that defines where in the lane
+  // this robot is supposed to be.
+  if (param_.reference_path_source == "centerline" && capture_reference_path_from_centerline()) {
+    return true;
+  }
+  if (param_.reference_path_source == "centerline") {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "no centerline available yet (map %s, route %s); falling back to the last lane-driving "
+      "trajectory for the reference path",
+      map_ready_ ? "ready" : "missing", route_handler_ready_ ? "ready" : "missing");
+  }
+  return capture_reference_path_from_trajectory();
+}
+
+bool StuckRecoverySupervisorNode::capture_reference_path_from_centerline()
+{
+  if (!odom_ || !map_ready_ || !route_handler_ready_) {
+    return false;
+  }
+
+  lanelet::ConstLanelet current_lane;
+  if (!route_handler_.getClosestLaneletWithinRoute(odom_->pose.pose, &current_lane)) {
+    return false;
+  }
+
+  // Reach far enough ahead for the goal search, and a little behind so the arc coordinate
+  // of the robot is not pinned to the very first point.
+  const double forward = param_.max_goal_search_distance_m + 10.0;
+  const auto lanes =
+    route_handler_.getLaneletSequence(current_lane, odom_->pose.pose, 5.0, forward);
+  if (lanes.empty()) {
+    return false;
+  }
+
+  const auto arc = lanelet::utils::getArcCoordinates(lanes, odom_->pose.pose);
+  const auto raw = route_handler_.getCenterLinePath(
+    lanes, std::max(0.0, arc.length), arc.length + param_.max_goal_search_distance_m);
+  if (raw.points.size() < 2) {
+    return false;
+  }
+
+  // Resample before use.  The map's centerline comes back coarse -- measured at 6 points
+  // over 30 m, i.e. 5 m apart -- and everything downstream walks this path point by point:
+  // the corridor sweep samples a station per point, and the goal search steps along it
+  // looking for the first fit.  At 5 m spacing both would be nearly blind compared to the
+  // trajectory this replaced, which arrived already dense.
+  const auto path = autoware::motion_utils::resamplePath(raw, param_.probe_step_m);
+  if (path.points.size() < 2) {
+    return false;
+  }
+
+  reference_path_.reserve(path.points.size());
+  for (const auto & point : path.points) {
+    reference_path_.push_back(point.point.pose);
+  }
+  RCLCPP_INFO_THROTTLE(
+    get_logger(), *get_clock(), 5000,
+    "[episode %u] reference path rebuilt from the lanelet centerline: %zu points over %.1f m "
+    "(resampled from %zu)",
+    episode_id_, reference_path_.size(), param_.max_goal_search_distance_m, raw.points.size());
+  return reference_path_.size() >= 2;
+}
+
+bool StuckRecoverySupervisorNode::capture_reference_path_from_trajectory()
 {
   reference_path_.clear();
   if (!trajectory_ || trajectory_->points.empty() || !odom_) {
