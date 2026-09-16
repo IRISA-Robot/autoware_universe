@@ -702,8 +702,14 @@ void StaticObstacleAvoidanceModule::fillEgoStatus(
   if (isOutputPathLocked()) {
     data.safe_shift_line.clear();
     data.candidate_path = helper_->getPreviousSplineShiftPath();
-    RCLCPP_DEBUG_THROTTLE(
-      getLogger(), *clock_, 500, "this module is locked now. keep current path.");
+    // [STALE-PATH-VISIBILITY 2026-09-14] Logged at DEBUG until now, i.e. invisible on /rosout,
+    // even though it freezes the module's output for as long as the lock is held. It is a
+    // legitimate state, not a fault -- but "the path is not updating" must always be explainable
+    // from the default log level.
+    RCLCPP_INFO_THROTTLE(
+      getLogger(), *clock_, 5000,
+      "[STALE-PATH] output path is locked by another module -- keeping the current path "
+      "unchanged, including any existing shift.");
     return;
   }
 
@@ -1510,11 +1516,34 @@ void StaticObstacleAvoidanceModule::updatePathShifter(const AvoidLineArray & shi
     return;
   }
 
+  // [STALE-PATH-VISIBILITY 2026-09-14] Both early-returns below leave path_shifter_ exactly as it
+  // was, so the module keeps publishing the previously registered -- possibly displaced -- path.
+  // That is correct per-cycle behaviour, but until now it was completely silent, which made a
+  // path frozen here indistinguishable from a path that is merely unchanged because nothing needs
+  // to change. Every way this module can keep an old shift in force should say so.
+  const auto registered_count = path_shifter_.getShiftLines().size();
+
   if (shift_lines.empty()) {
+    if (registered_count > 0) {
+      RCLCPP_WARN_THROTTLE(
+        getLogger(), *clock_, 2000,
+        "[STALE-PATH] no new shift line was generated this cycle, so the %zu already-registered "
+        "shift line(s) stay in force and the published path keeps its current displacement "
+        "(base offset %.2f m). If this repeats while ego is stopped, the generator is producing "
+        "no candidate at all -- look for an 'addReturnShiftLine SUPPRESSED' warning above, which "
+        "names the gate responsible.",
+        registered_count, path_shifter_.getBaseOffset());
+    }
     return;
   }
 
   if (!isActivated()) {
+    RCLCPP_WARN_THROTTLE(
+      getLogger(), *clock_, 2000,
+      "[STALE-PATH] %zu new shift line(s) are ready but the module is not activated (RTC approval "
+      "pending), so the %zu registered shift line(s) stay in force and the published path is "
+      "unchanged.",
+      shift_lines.size(), registered_count);
     return;
   }
 
