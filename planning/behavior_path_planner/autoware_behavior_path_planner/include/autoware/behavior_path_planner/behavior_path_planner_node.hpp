@@ -128,6 +128,10 @@ private:
 
   std::shared_ptr<PlannerData> planner_data_;
   Scenario::ConstSharedPtr current_scenario_{nullptr};
+  /// True while this node is actually planning, i.e. the scenario is LANEDRIVING.  run()
+  /// returns early in every other scenario, so the modules keep whatever state they had
+  /// when they were last called -- see the reset in run() for why that matters.
+  bool was_lane_driving_{false};
   LaneletMapBin::ConstSharedPtr map_ptr_{nullptr};
   LaneletRoute::ConstSharedPtr route_ptr_{nullptr};
   bool has_received_map_{false};

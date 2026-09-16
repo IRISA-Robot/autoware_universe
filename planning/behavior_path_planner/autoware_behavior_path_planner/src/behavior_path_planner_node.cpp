@@ -325,9 +325,36 @@ void BehaviorPathPlannerNode::run()
   RCLCPP_DEBUG(get_logger(), "----- BehaviorPathPlannerNode start -----");
 
   // behavior_path_planner runs only in LANE DRIVING scenario.
-  if (current_scenario_->current_scenario != Scenario::LANEDRIVING) {
+  const bool is_lane_driving = current_scenario_->current_scenario == Scenario::LANEDRIVING;
+  if (!is_lane_driving) {
+    was_lane_driving_ = false;
     return;
   }
+
+  // [SCENARIO-REENTRY 2026-09-15] Another scenario has been driving the robot since we last
+  // ran, and this early return is the whole of our "pause": no module is told it stopped, and
+  // none is told it started again.  Every module therefore resumes holding state it computed
+  // against an ego pose that no longer exists -- most damagingly static_obstacle_avoidance,
+  // whose registered shift lines survive the gap and are immediately re-asserted against the
+  // displaced ego.  Measured live 2026-09-15 after a stuck-recovery manoeuvre: zero avoidance
+  // activity for the whole RECOVERY scenario, then on the first LANEDRIVING cycle a -1.10 m
+  // registered shift reappeared and the published path left the centreline with a 4.87 1/m
+  // curvature spike where that shift was spliced in.
+  //
+  // This is the same "route jump" argument the reset below already makes -- the modules should
+  // not have to care -- applied to an ego jump instead of a route jump, so it uses the same
+  // two calls.
+  //
+  // isHandlerReady() keeps this off the very first cycle of all: there the route has not been
+  // handed to the route handler yet (setRoute is below), so there is no state to reset and
+  // resetCurrentRouteLanelet would have nothing to resolve against.
+  if (!was_lane_driving_ && planner_data_->route_handler->isHandlerReady()) {
+    RCLCPP_INFO(
+      get_logger(), "Scenario returned to LANEDRIVING from elsewhere. Resetting modules.");
+    planner_manager_->reset();
+    planner_manager_->resetCurrentRouteLanelet(planner_data_);
+  }
+  was_lane_driving_ = true;
 
   // check for map update
   LaneletMapBin::ConstSharedPtr map_ptr{nullptr};

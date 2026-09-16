@@ -102,7 +102,16 @@ void PlannerManager::configureModuleSlot(
 // This is a temporary process until motion planning can take the terminal pose into account
 bool keep_input_points(const std::vector<std::shared_ptr<SceneModuleStatus>> & statuses)
 {
-  const std::vector<std::string> target_modules = {"goal_planner", "avoidance"};
+  // reverse_lane_follow is here for the same reason the other two are: it places points
+  // that the uniform resample below would destroy.  It densifies the last few metres of the
+  // goal approach to 0.5 m (goal_decel_ramp_resample_interval_m) and pins an exact point on
+  // the goal itself -- and then run() resampled the whole path at output_path_interval
+  // (2.0 m) and threw all of that away.  Measured live with the goal 4.37 m off: 18 points
+  // out of the module, 8 points published, only about three of them ahead of the robot, and
+  // the stages below splined that coarse polyline into curvature of 3.68 1/m -- a 0.27 m
+  // radius, well inside the robot's 0.60 m minimum turning radius.
+  const std::vector<std::string> target_modules = {
+    "goal_planner", "avoidance", "reverse_lane_follow"};
 
   const auto target_status = ModuleStatus::RUNNING;
 
