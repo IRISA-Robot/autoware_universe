@@ -20,6 +20,8 @@
 #include "autoware/behavior_path_static_obstacle_avoidance_module/helper.hpp"
 #include "autoware/behavior_path_static_obstacle_avoidance_module/type_alias.hpp"
 
+#include <rclcpp/time.hpp>
+
 #include <memory>
 #include <optional>
 #include <utility>
@@ -63,7 +65,30 @@ public:
     base_offset_ = 0.0;
     raw_.clear();
     raw_registered_.clear();
+    stationary_since_ = std::nullopt;
   }
+
+  /**
+   * @brief has ego been standing still long enough that a "wait until ego passes it" hold can
+   *        never resolve on its own?
+   * @details Several gates in addReturnShiftLine() refuse to generate the return-to-centre shift
+   *          while some object is still ahead, on the reasoning that ego will drive past it and
+   *          the gate will clear by itself within a few cycles. That reasoning silently assumes
+   *          ego keeps moving. When ego is stopped -- and it is typically stopped BECAUSE the
+   *          frozen shifted path is clipping something -- the object stays ahead forever, no
+   *          return shift is ever generated, so AvoidancePlanningData::new_shift_line stays
+   *          empty, updatePathShifter() early-returns, and the registered shift lines are never
+   *          replaced. The displaced path then persists indefinitely and only a new goal pose
+   *          clears it. This predicate bounds those gates: past the grace period the suppression
+   *          is released and a return candidate is generated again.
+   *
+   *          Releasing the suppression does NOT force a manoeuvre. The generated return shift is
+   *          still a CANDIDATE; it has to pass isValidShiftLine(), isSafePath() and fillEgoStatus()
+   *          like any other. That is the whole point: suppressing at generation time hides the
+   *          situation from the safety machinery that exists to judge it, whereas generating the
+   *          candidate lets that machinery decide -- and gives the module a way out.
+   */
+  bool isEgoStuckStationary() const;
 
   AvoidLineArray generate(const AvoidancePlanningData & data, DebugData & debug) const;
 
@@ -275,6 +300,11 @@ private:
   AvoidLineArray raw_registered_;
 
   double base_offset_{0.0};
+
+  // [STATIONARY-BOUND 2026-09-14] when ego's speed last dropped below the stationary threshold,
+  // in the clock of the odometry stamps. std::nullopt while ego is moving. Updated once per
+  // cycle by update(); see isEgoStuckStationary().
+  std::optional<rclcpp::Time> stationary_since_;
 };
 
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance

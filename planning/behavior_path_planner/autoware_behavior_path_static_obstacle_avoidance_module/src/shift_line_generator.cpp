@@ -73,6 +73,22 @@ AvoidLine fill(const AvoidLine & line1, const AvoidLine & line2, const UUID id)
   return ret;
 }
 
+// [STATIONARY-BOUND 2026-09-14] "ego is not making progress" gate shared by the
+// addReturnShiftLine() suppressions. See ShiftLineGenerator::isEgoStuckStationary().
+constexpr double kStationarySpeedThreshold = 0.1;  // [m/s]
+constexpr double kStationaryGraceSeconds = 2.0;    // [s] ~20 planning cycles at 10 Hz
+
+rclcpp::Logger generatorLogger()
+{
+  return rclcpp::get_logger("static_obstacle_avoidance_shift_line_generator");
+}
+
+rclcpp::Clock & generatorClock()
+{
+  static rclcpp::Clock clock{RCL_ROS_TIME};
+  return clock;
+}
+
 AvoidLineArray toArray(const AvoidOutlines & outlines)
 {
   AvoidLineArray ret{};
@@ -90,8 +106,31 @@ AvoidLineArray toArray(const AvoidOutlines & outlines)
 }
 }  // namespace
 
+bool ShiftLineGenerator::isEgoStuckStationary() const
+{
+  if (!stationary_since_.has_value() || data_ == nullptr || data_->self_odometry == nullptr) {
+    return false;
+  }
+  const auto now = rclcpp::Time(data_->self_odometry->header.stamp);
+  const auto stopped_for = (now - stationary_since_.value()).seconds();
+  return stopped_for > kStationaryGraceSeconds;
+}
+
 void ShiftLineGenerator::update(AvoidancePlanningData & data, DebugData & debug)
 {
+  /**
+   * STEP0: Track how long ego has been standing still.
+   * Measured in the odometry's own clock so this behaves identically under sim time.
+   */
+  if (data_ != nullptr && data_->self_odometry != nullptr) {
+    const auto speed = std::abs(data_->self_odometry->twist.twist.linear.x);
+    if (speed >= kStationarySpeedThreshold) {
+      stationary_since_ = std::nullopt;
+    } else if (!stationary_since_.has_value()) {
+      stationary_since_ = rclcpp::Time(data_->self_odometry->header.stamp);
+    }
+  }
+
   /**
    * STEP1: Update registered shift line.
    */
@@ -424,6 +463,11 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
       }
     }
 
+    // [RETIRE-BEHIND-EGO 2026-09-15] Set when this object's avoid line turned out to be
+    // kinematically impossible (the BUG-A-RESCUE rescue below failed) AND the object is
+    // already behind ego.  Read by the outline dispatch at the end of this loop body.
+    bool unrescuable_behind_ego = false;
+
     // calculate feasible shift length based on behavior policy
     const auto feasible_shift_profile = get_shift_profile(o, desire_shift_length);
     if (!feasible_shift_profile.has_value()) {
@@ -582,13 +626,21 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
             al_avoid.end_shift_length);
           al_avoid.end_longitudinal = rescued.value();
         } else {
+          // Not simply longitudinal < 0: base_link can be past the object's nearest point
+          // while the robot's rear is still alongside it, and collapsing the shift there
+          // would steer the tail into the object.  getRearConstantDistance() is the module's
+          // own "fully passed" measure -- longitudinal_margin + base_link2rear + the object's
+          // own length -- and is what al_return below uses to place the return shift's start.
+          // Using it here keeps the retire decision and the return geometry consistent.
+          unrescuable_behind_ego = (o.longitudinal + helper_->getRearConstantDistance(o)) < 0.0;
           RCLCPP_WARN_THROTTLE(
             logger, steady_clock, 500,
             "[BUG-A-RESCUE] id=%s close-range candidate NOT rescuable: min_transition=%.3f "
             "but object is at longitudinal=%.3f -- genuine kinematic infeasibility, not "
-            "rescuing.",
+            "rescuing.%s",
             autoware_utils::to_hex_string(o.object.object_id).c_str(), min_transition_distance,
-            o.longitudinal);
+            o.longitudinal,
+            unrescuable_behind_ego ? "  Object is behind ego: retiring it this cycle." : "");
         }
       }
 
@@ -648,7 +700,20 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
       outlines.emplace_back(al_avoid, std::nullopt);
     } else if (is_valid_shift_line(al_avoid) && is_valid_shift_line(al_return)) {
       outlines.emplace_back(al_avoid, al_return);
-    } else if (!is_approved(o)) {
+    } else if (!is_approved(o) || unrescuable_behind_ego) {
+      // [RETIRE-BEHIND-EGO 2026-09-15] The `is_approved(o)` escape used to be unconditional:
+      // an object with an already-registered shift fell through to `o.is_avoidable = true`
+      // WITHOUT emitting any outline.  That is right while the object is still ahead -- the
+      // registered shift is what is currently avoiding it -- but it is a trap once ego has
+      // driven past it and the avoid line has become kinematically impossible.  Measured
+      // live 2026-09-15: object 5.59 m BEHIND ego (inside the 10 m
+      // detection_area.backward_distance, so still a target), desire_shift_length -1.184 m,
+      // rescue refused every cycle.  No outline was produced, so [STALE-PATH] kept the
+      // registered -1.10 m shift in force, and the object also kept satisfying every
+      // "an object still needs avoiding" predicate downstream.  grow_streak reached 3117
+      // consecutive cycles with nothing changing.  An object ego has already passed, whose
+      // shift cannot be built at all, has no claim on the path: retire it and let the
+      // registered return shift play out.
       o.info = ObjectInfo::INVALID_SHIFT_LINE;
       continue;
     }
@@ -1160,7 +1225,46 @@ AvoidOutlines ShiftLineGenerator::applyFillGapProcess(
   for (auto & outline : ret) {
     if (outline.middle_lines.empty()) {
       if (outline.return_line.has_value()) {
-        const auto new_line = fill(outline.avoid_line, outline.return_line.value(), generate_uuid());
+        // [FILL-GAP-ROOM 2026-09-16] Give the connector room instead of losing it.
+        //
+        // The connector bridges the avoid line's end to the return line's start, so its own end
+        // IS the return line's start.  Widening the connector therefore always overlaps a
+        // neighbour -- forwards into the return line, backwards into the avoid line -- which is
+        // why the code below could only ever drop it.  Measured 2026-09-16: 83 NON-FLAT drops in
+        // one session, each losing a real shift transition of up to 0.6 m and leaving a step in
+        // the shift profile that the smoother and MPT then amplified.
+        //
+        // The one direction that is both lossless and safe is to delay the RETURN: push the
+        // return line's start later until the connector spans more than one index.  The robot
+        // then stays shifted slightly longer, which increases clearance to the object rather
+        // than reducing it -- the opposite trade from every other option here.
+        //
+        // Only attempted when the transition is real (non-flat).  A flat connector carries no
+        // transition, PathShifter propagates the prior shift through any uncovered stretch, and
+        // dropping it stays lossless -- so it is left exactly as it was.
+        auto & return_line = outline.return_line.value();
+        auto new_line = fill(outline.avoid_line, return_line, generate_uuid());
+        const auto decision = utils::static_obstacle_avoidance::evaluateFillGapShiftLine(new_line);
+        if (!decision.keep && !decision.is_flat) {
+          const auto & points = data.reference_path.points;
+          const auto & arcs = data.arclength_from_ego;
+          const size_t wanted_end = new_line.start_idx + 2;
+          if (wanted_end < points.size() && wanted_end < arcs.size()) {
+            utils::static_obstacle_avoidance::setEndData(
+              new_line, new_line.end_shift_length, points.at(wanted_end).point.pose, wanted_end,
+              arcs.at(wanted_end));
+            utils::static_obstacle_avoidance::setStartData(
+              return_line, new_line.end_shift_length, points.at(wanted_end).point.pose, wanted_end,
+              arcs.at(wanted_end));
+            RCLCPP_WARN_THROTTLE(
+              rclcpp::get_logger("static_obstacle_avoidance_shift_line_generator"),
+              generatorClock(), 1000,
+              "[FILL-GAP-ROOM] connector spanned only %zu index; delayed the return start to "
+              "index %zu so the %.3f m transition survives instead of being dropped",
+              new_line.end_idx > new_line.start_idx ? new_line.end_idx - new_line.start_idx : 0,
+              wanted_end, new_line.end_shift_length - new_line.start_shift_length);
+          }
+        }
         pushIndexGapSafeFillLine(new_line, outline.middle_lines, debug.step1_filled_shift_line);
       } else {
         outline.middle_lines.push_back(outline.avoid_line);
@@ -1470,8 +1574,24 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
                parameters_->object_check_goal_distance;
       });
     if (has_object_near_goal) {
-      RCLCPP_DEBUG(rclcpp::get_logger(""), "object near goal exists so skip adding return shift");
-      return ret;
+      // [STALE-PATH-VISIBILITY 2026-09-14] This used to log at DEBUG *and* on an empty logger
+      // name, so it never reached /rosout and could not be attributed to this module even with
+      // debug enabled -- yet it silently freezes the shifted path exactly like the gates below.
+      // Bounded by isEgoStuckStationary() for the same reason as those gates.
+      if (!isEgoStuckStationary()) {
+        RCLCPP_WARN_THROTTLE(
+          generatorLogger(), generatorClock(), 2000,
+          "[AVOID-DEBUG] addReturnShiftLine SUPPRESSED (object-near-goal): an object sits within "
+          "%.1f m of the goal -- holding the current shift instead of returning to centreline.",
+          parameters_->object_check_goal_distance);
+        return ret;
+      }
+      RCLCPP_WARN_THROTTLE(
+        generatorLogger(), generatorClock(), 2000,
+        "[AVOID-DEBUG] addReturnShiftLine RELEASED (object-near-goal): ego has been stationary "
+        "for more than %.1f s, so waiting to pass the object cannot resolve this. Generating the "
+        "return candidate; the usual validity/safety gates still decide whether it is used.",
+        kStationaryGraceSeconds);
     }
   }
 
@@ -1479,8 +1599,27 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
     data.target_objects.begin(), data.target_objects.end(),
     [](const auto & o) { return !o.is_avoidable && o.longitudinal > 0.0; });
 
+  // [STATIONARY-BOUND 2026-09-14] Same shape, same failure mode, as the multi-obj-hold gate
+  // below -- and until now it returned completely silently, so a path frozen by THIS gate was
+  // indistinguishable from one frozen by any other. An unavoidable object ahead is in fact the
+  // most likely way to reach the deadlock: ego stops for it (obstacle_stop), which makes it
+  // permanently "ahead", which permanently suppresses the return shift, which keeps ego stopped.
   if (exist_unavoidable_object) {
-    return ret;
+    if (!isEgoStuckStationary()) {
+      RCLCPP_WARN_THROTTLE(
+        generatorLogger(), generatorClock(), 2000,
+        "[AVOID-DEBUG] addReturnShiftLine SUPPRESSED (unavoidable-object): an unavoidable target "
+        "object is still ahead of ego -- holding the current shift instead of returning to "
+        "centreline.");
+      return ret;
+    }
+    RCLCPP_WARN_THROTTLE(
+      generatorLogger(), generatorClock(), 2000,
+      "[AVOID-DEBUG] addReturnShiftLine RELEASED (unavoidable-object): ego has been stationary "
+      "for more than %.1f s with an unavoidable object ahead, so it can never be passed and this "
+      "hold can never clear on its own. Generating the return candidate; the usual "
+      "validity/safety gates still decide whether it is used.",
+      kStationaryGraceSeconds);
   }
 
   // [MULTI-OBJ-HOLD fix 2026-09-04] The check above only guards against *unavoidable* objects
@@ -1502,14 +1641,35 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
   const auto exist_object_still_ahead =
     utils::static_obstacle_avoidance::existsUnclearedAvoidanceObjectAhead(data.target_objects);
 
+  // [STATIONARY-BOUND 2026-09-14] The hold above is justified by "this is a per-cycle
+  // recomputation ... once ego has genuinely passed every currently-detected object ... the very
+  // next cycle sees no object ahead". That reasoning is sound only while ego is MOVING; it is the
+  // forward motion that eventually clears the predicate. Stopped, it is self-sustaining, and it
+  // is the most common way this module deadlocks: the frozen shifted path clips something,
+  // downstream obstacle_stop halts ego, ego therefore never passes the object, the object stays
+  // ahead, the return shift is never generated, new_shift_line stays empty, updatePathShifter()
+  // early-returns, and the displaced path persists until a new goal pose is set.
+  //
+  // Note also how blunt the predicate is: existsUnclearedAvoidanceObjectAhead() is satisfied by
+  // ANY target object with longitudinal > 0 -- avoidable or not, 2 m or 30 m away, related to the
+  // current shift or not. The object that keeps this hold alive is frequently the very one the
+  // frozen path is driving into, in which case holding the shift for its sake is backwards.
+  //
+  // Bound it by ego's progress rather than removing it: while ego moves, behaviour is unchanged.
   if (exist_object_still_ahead) {
-    static auto logger = rclcpp::get_logger("static_obstacle_avoidance_shift_line_generator");
-    static rclcpp::Clock steady_clock{RCL_ROS_TIME};
+    if (!isEgoStuckStationary()) {
+      RCLCPP_WARN_THROTTLE(
+        generatorLogger(), generatorClock(), 500,
+        "[AVOID-DEBUG] addReturnShiftLine SUPPRESSED (multi-obj-hold): another target object is "
+        "still ahead of ego -- holding current shift instead of collapsing to centerline.");
+      return ret;
+    }
     RCLCPP_WARN_THROTTLE(
-      logger, steady_clock, 500,
-      "[AVOID-DEBUG] addReturnShiftLine SUPPRESSED (multi-obj-hold): another target object is "
-      "still ahead of ego -- holding current shift instead of collapsing to centerline.");
-    return ret;
+      generatorLogger(), generatorClock(), 2000,
+      "[AVOID-DEBUG] addReturnShiftLine RELEASED (multi-obj-hold): ego has been stationary for "
+      "more than %.1f s, so 'wait until ego passes the object' can never resolve. Generating the "
+      "return candidate; the usual validity/safety gates still decide whether it is used.",
+      kStationaryGraceSeconds);
   }
 
   if (last_.has_value()) {

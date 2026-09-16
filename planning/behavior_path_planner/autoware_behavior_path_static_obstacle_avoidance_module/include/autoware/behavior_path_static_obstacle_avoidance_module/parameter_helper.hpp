@@ -412,6 +412,8 @@ AvoidanceParameters getParameter(rclcpp::Node * node)
   // constraints (lateral)
   {
     const std::string ns = "avoidance.constraints.lateral.";
+    p.shift_curvature_ratio =
+      get_or_declare_parameter<double>(*node, ns + "shift_curvature_ratio");
     p.velocity_map = get_or_declare_parameter<std::vector<double>>(*node, ns + "velocity");
     p.lateral_max_accel_map =
       get_or_declare_parameter<std::vector<double>>(*node, ns + "max_accel_values");

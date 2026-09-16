@@ -402,6 +402,12 @@ struct AvoidanceParameters
   std::string path_generation_method{"shift_line_base"};
 
   // target velocity matrix
+  // [STEERABLE-SHIFT 2026-09-16] Fraction of the vehicle's own steering capability a
+  // lateral shift may use.  1.0 would let a shift consume the entire turning circle,
+  // leaving nothing for the road's own curvature; below ~0.2 avoidance will decline
+  // almost everything and stop instead.  See AvoidanceHelper::getSteerableShiftDistance().
+  double shift_curvature_ratio{0.5};
+
   std::vector<double> velocity_map;
 
   // Minimum lateral jerk limitation map for avoidance maneuver.

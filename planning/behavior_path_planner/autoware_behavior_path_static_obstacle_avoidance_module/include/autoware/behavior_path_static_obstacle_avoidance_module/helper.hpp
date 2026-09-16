@@ -24,6 +24,7 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <string>
@@ -148,11 +149,58 @@ public:
       shift_length, nominal_jerk, nominal_speed);
   }
 
+  /// Shortest longitudinal distance in which `shift_length` can actually be STEERED,
+  /// independent of how slowly the robot is moving.
+  ///
+  /// [STEERABLE-SHIFT 2026-09-16] calc_longitudinal_dist_from_jerk() is
+  ///     4 * (0.5 * |lateral| / jerk)^(1/3) * velocity
+  /// -- linear in velocity, and with no notion of steering at all.  As speed falls the
+  /// distance it demands falls with it, so at low speed it will happily declare a large
+  /// shift feasible in almost no distance.  Measured on this robot: a 1.5 m shift was
+  /// called feasible in 0.32 m (velocity_map.front() = 0.2 m/s, jerk 3.0), which is a
+  /// 78-degree path angle -- impossible for anything with wheels.
+  ///
+  /// What followed was not a slightly tight path but a broken one.  The shift line's
+  /// start and end landed on ADJACENT path indices, PathShifter requires a gap of more
+  /// than one, so the transition was dropped entirely ("[FILL-GAP-INDEX-FIX] dropping
+  /// NON-FLAT gap-fill connector (start_idx=36 end_idx=37 start_shift=0.000
+  /// end_shift=1.500)", 625 times in one session).  A dropped transition is a STEP: the
+  /// published path jumped 0.86 m sideways in 0.65 m of travel, and the smoother and MPT
+  /// amplified that into 2.81 1/m -- a 0.36 m radius, inside this robot's own 0.60 m
+  /// minimum turning radius.
+  ///
+  /// The bound below comes from the geometry instead.  A lateral shift L over
+  /// longitudinal distance D has peak curvature L*pi^2/(2*D^2) for the usual
+  /// raised-cosine profile, so holding that under the curvature budget gives
+  ///     D >= pi * sqrt(L / (2 * k_budget))
+  /// with k_budget a configurable fraction of 1 / R_min, and R_min taken from the
+  /// vehicle's own wheel base and steering limit.  It does not depend on speed, which is
+  /// the entire point: the same shift is equally hard to steer at 0.2 m/s and at 1.4 m/s.
+  double getSteerableShiftDistance(const double shift_length) const
+  {
+    const auto & vehicle = data_->parameters.vehicle_info;
+    const double steer = std::abs(vehicle.max_steer_angle_rad);
+    const double wheel_base = vehicle.wheel_base_m;
+    if (steer < 1.0e-3 || wheel_base < 1.0e-3) {
+      return 0.0;  // no usable steering model; leave the jerk bound to speak alone
+    }
+    const double radius_min = wheel_base / std::tan(steer);
+    const double curvature_budget = parameters_->shift_curvature_ratio / radius_min;
+    if (curvature_budget < 1.0e-6) {
+      return 0.0;
+    }
+    return M_PI * std::sqrt(std::abs(shift_length) / (2.0 * curvature_budget));
+  }
+
   double getMinAvoidanceDistance(const double shift_length) const
   {
     const auto & p = parameters_;
-    return autoware::motion_utils::calc_longitudinal_dist_from_jerk(
+    const auto from_jerk = autoware::motion_utils::calc_longitudinal_dist_from_jerk(
       shift_length, p->lateral_max_jerk_map.front(), p->velocity_map.front());
+    // Whichever is longer.  This is the ONE definition of "shortest distance this shift
+    // can be done in" -- every caller, from the close-range rescue to the stoppability
+    // judgement, inherits the correction from here.
+    return std::max(from_jerk, getSteerableShiftDistance(shift_length));
   }
 
   double getMaxAvoidanceDistance(const double shift_length) const

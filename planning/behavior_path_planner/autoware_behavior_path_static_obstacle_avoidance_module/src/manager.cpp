@@ -174,6 +174,13 @@ void StaticObstacleAvoidanceModuleManager::updateModuleParams(
       parameters, ns + "soft_drivable_bound_margin", p->soft_drivable_bound_margin);
     update_param<double>(
       parameters, ns + "hard_drivable_bound_margin", p->hard_drivable_bound_margin);
+    // [PARAM-TUNABLE 2026-09-14] This one was declared in parameter_helper.hpp but never wired
+    // up here, so `ros2 param set` on it reported success while AvoidanceParameters kept the
+    // launch-time value -- a parameter that looks tunable and silently is not. It gates
+    // return-to-lane approval (AvoidanceHelper::isReady), which makes it exactly the knob you
+    // want to try live when the module refuses to come back to the lane.
+    update_param<double>(
+      parameters, ns + "ratio_for_return_shift_approval", p->ratio_for_return_shift_approval);
   }
 
   {
