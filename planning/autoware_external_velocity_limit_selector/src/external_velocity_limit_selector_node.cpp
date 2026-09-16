@@ -140,6 +140,14 @@ ExternalVelocityLimitSelectorNode::ExternalVelocityLimitSelectorNode(
   // Params
   param_listener_ = std::make_shared<::external_velocity_limit_selector::ParamListener>(
     this->get_node_parameters_interface());
+
+  // [ZERO-LIMIT-AT-BOOT 2026-09-15] hardest_limit_ is default-constructed, i.e. max_velocity
+  // 0.0, and until now nothing seeded it: it only ever got a real value inside
+  // updateVelocityLimit(), which runs when a limit is set or cleared.  Publishing it before
+  // then hands velocity_smoother a 0 m/s external limit, which zeroes every point of the
+  // trajectory -- a robot that will not move, with a perfectly good path.  Seed it with the
+  // same default updateVelocityLimit() would produce for an empty table.
+  updateVelocityLimit();
 }
 
 void ExternalVelocityLimitSelectorNode::onVelocityLimitFromAPI(
@@ -227,8 +235,25 @@ void ExternalVelocityLimitSelectorNode::setVelocityLimitFromInternal(
 void ExternalVelocityLimitSelectorNode::clearVelocityLimit(const std::string & sender)
 {
   if (velocity_limit_table_.empty()) {
-    RCLCPP_WARN(get_logger(), "no velocity limit has been set from internal.");
-    return;
+    // [ZERO-LIMIT-AT-BOOT 2026-09-15] This used to `return` here -- skipping
+    // updateVelocityLimit() -- while the caller went on to publish getCurrentVelocityLimit()
+    // regardless.  With nothing ever set, that published a default-constructed VelocityLimit:
+    // max_velocity 0.0, stamp 0.  velocity_smoother took it as a hard 0 m/s external limit and
+    // zeroed the whole trajectory, so the robot stood still on a healthy path with no message
+    // anywhere naming a reason.
+    //
+    // Observed 2026-09-15: a node that sends one clear at start-up (to drop a limit a previous
+    // instance of itself may have left behind, which is the correct thing for it to do) was
+    // enough to trigger this, because its clear was the first message on the topic.  Any sender
+    // that clears before it sets can do the same.
+    //
+    // Erasing from an empty table is a no-op, so just fall through: updateVelocityLimit() then
+    // produces the default limit and the clear means what it says.
+    RCLCPP_WARN(
+      get_logger(),
+      "velocity limit cleared by '%s' but nothing has been set; falling back to the default "
+      "limit.",
+      sender.c_str());
   }
 
   velocity_limit_table_.erase(sender);

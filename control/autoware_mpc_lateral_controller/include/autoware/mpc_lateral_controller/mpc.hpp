@@ -32,6 +32,7 @@
 
 #include <deque>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -226,6 +227,34 @@ private:
   double m_yaw_error_prev = 0.0;       // Previous heading error for derivative calculation.
 
   bool m_is_forward_shift = true;  // Flag indicating if the shift is in the forward direction.
+
+  // [REFERENCE-JUMP 2026-09-16] Continuity memory for the nearest-point search.
+  //
+  // findFirstNearestIndexWithSoftConstraints() scans the whole trajectory from index 0 and
+  // returns the closest point inside the FIRST contiguous run that is within both
+  // ego_nearest_dist_threshold (3 m) and ego_nearest_yaw_threshold (60 deg).  It has no
+  // memory, so which run qualifies can change between one cycle and the next -- and on a
+  // path that curls back near itself, the run that qualifies may be one the robot already
+  // passed, or the opposite side of a tight bend.
+  //
+  // Observed on the robot mid-recovery: in a single 0.51 s cycle the reported errors went
+  // lateral +0.06 -> -0.63 m and yaw -0.02 -> -1.08 rad, while the reference curvature
+  // flipped -0.71 -> +0.67.  At 0.30 m/s the vehicle can move at most 0.153 m and rotate at
+  // most 14.6 deg in that time, so the reference had teleported, not the robot -- and the
+  // MPC steered hard for it.  The yaw errors around the flip (61.2-61.8 deg) sat just past
+  // the 60 deg threshold, which is what let the qualifying run move.  Raw and smoothed
+  // reference curvature were identical to four decimals throughout, so there was no noise
+  // in the path: the geometry was clean, the selection was not.
+  //
+  // The invariant used here needs no tuning and no knowledge of the path's shape: the
+  // reference point and the robot travel along the same path, so between two cycles the
+  // reference cannot move much further than the robot did.
+  std::optional<geometry_msgs::msg::Pose> m_prev_nearest_pose{std::nullopt};
+  std::optional<geometry_msgs::msg::Pose> m_prev_ego_pose{std::nullopt};
+  // How many consecutive candidates have been rejected as teleports.  Bounded, so a robot
+  // that genuinely IS somewhere else can still re-acquire instead of steering to a stale
+  // reference for ever.
+  int m_nearest_jump_rejections = 0;
 
   rclcpp::Publisher<Trajectory>::SharedPtr m_debug_frenet_predicted_trajectory_pub;
   rclcpp::Publisher<Trajectory>::SharedPtr m_debug_resampled_reference_trajectory_pub;
@@ -433,6 +462,13 @@ public:
   bool m_use_steer_prediction;  // Flag to use predicted steer instead of measured steer.
   double ego_nearest_dist_threshold = 3.0;  // Threshold for nearest index search based on distance.
   double ego_nearest_yaw_threshold = M_PI_2;  // Threshold for nearest index search based on yaw.
+  // Slack on top of the distance the robot actually travelled, before a change of reference
+  // point is called a teleport.  Covers resampling, trajectory replacement and honest
+  // re-interpolation; well under the ~0.6 m jumps the failure produced.
+  double nearest_jump_tolerance = 0.3;
+  // After this many consecutive rejections the jump is accepted, so the controller can
+  // re-acquire if the robot really has been displaced (a manual push, a localisation jump).
+  int nearest_jump_max_rejections = 20;
 
   bool m_use_delayed_initial_state =
     true;  // Flag to use x0_delayed as initial state for predicted trajectory

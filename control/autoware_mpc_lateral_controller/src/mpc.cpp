@@ -18,6 +18,7 @@
 #include "autoware/motion_utils/trajectory/trajectory.hpp"
 #include "autoware/mpc_lateral_controller/mpc_utils.hpp"
 #include "autoware_utils/math/unit_conversion.hpp"
+#include "autoware_utils_geometry/geometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 
 #include <fmt/format.h>
@@ -396,6 +397,48 @@ std::pair<ResultWithReason, MPCData> MPC::getData(
         ego_nearest_dist_threshold, ego_nearest_yaw_threshold)) {
     return {ResultWithReason{false, "error in calculating nearest pose"}, MPCData{}};
   }
+
+  // [REFERENCE-JUMP 2026-09-16] Reject a reference point that teleported.  See the comment
+  // on m_prev_nearest_pose for the measurement this comes from.
+  //
+  // The reference point and the robot move along the same path, so between two cycles the
+  // reference cannot advance much further than the robot did.  Anything beyond that is the
+  // nearest-point search having re-latched onto a different stretch -- behind the robot, or
+  // the far side of a bend -- and steering to it swings the wheel hard for no reason the
+  // path justifies.
+  //
+  // On rejection the search is redone from where the reference was last cycle rather than
+  // from the ego pose, which keeps it on the same stretch.  Note this only ever CONSTRAINS
+  // the choice; it never invents a pose, and it gives up after
+  // nearest_jump_max_rejections so a robot that has genuinely been displaced can re-acquire.
+  if (m_prev_nearest_pose && m_prev_ego_pose) {
+    const double ego_travelled =
+      autoware_utils_geometry::calc_distance2d(m_prev_ego_pose->position, current_pose.position);
+    const double reference_moved = autoware_utils_geometry::calc_distance2d(
+      m_prev_nearest_pose->position, data.nearest_pose.position);
+    const double allowed = ego_travelled + nearest_jump_tolerance;
+    if (reference_moved > allowed && m_nearest_jump_rejections < nearest_jump_max_rejections) {
+      ++m_nearest_jump_rejections;
+      MPCData retry;
+      if (MPCUtils::calcNearestPoseInterp(
+            traj, *m_prev_nearest_pose, &(retry.nearest_pose), &(retry.nearest_idx),
+            &(retry.nearest_time), ego_nearest_dist_threshold, ego_nearest_yaw_threshold)) {
+        RCLCPP_WARN_THROTTLE(
+          m_logger, *m_clock, 1000,
+          "[REFERENCE-JUMP] the nearest-point search moved the reference %.2f m while the robot "
+          "moved %.2f m (allowed %.2f m); holding the previous stretch instead (rejection %d/%d)",
+          reference_moved, ego_travelled, allowed, m_nearest_jump_rejections,
+          nearest_jump_max_rejections);
+        data.nearest_pose = retry.nearest_pose;
+        data.nearest_idx = retry.nearest_idx;
+        data.nearest_time = retry.nearest_time;
+      }
+    } else {
+      m_nearest_jump_rejections = 0;
+    }
+  }
+  m_prev_nearest_pose = data.nearest_pose;
+  m_prev_ego_pose = current_pose;
 
   // get data
   data.steer = static_cast<double>(current_steer.steering_tire_angle);
