@@ -22,6 +22,7 @@
 
 #include "autoware_control_msgs/msg/control.hpp"
 #include "autoware_map_msgs/msg/lanelet_map_bin.hpp"
+#include "autoware_planning_msgs/msg/lanelet_route.hpp"
 #include "autoware_planning_msgs/msg/trajectory.hpp"
 #include "autoware_vehicle_msgs/msg/control_mode_report.hpp"
 #include "autoware_vehicle_msgs/msg/engage.hpp"
@@ -52,6 +53,7 @@
 #include <tf2_ros/transform_listener.h>
 
 #include <memory>
+#include <set>
 #include <random>
 #include <string>
 #include <variant>
@@ -62,6 +64,7 @@ namespace autoware::simulator::simple_planning_simulator
 
 using autoware_control_msgs::msg::Control;
 using autoware_map_msgs::msg::LaneletMapBin;
+using autoware_planning_msgs::msg::LaneletRoute;
 using autoware_planning_msgs::msg::Trajectory;
 using autoware_vehicle_msgs::msg::ControlModeReport;
 using autoware_vehicle_msgs::msg::Engage;
@@ -146,6 +149,7 @@ private:
   rclcpp::Subscription<HazardLightsCommand>::SharedPtr sub_hazard_lights_cmd_;
   rclcpp::Subscription<Control>::SharedPtr sub_manual_ackermann_cmd_;
   rclcpp::Subscription<LaneletMapBin>::SharedPtr sub_map_;
+  rclcpp::Subscription<LaneletRoute>::SharedPtr sub_route_;
   rclcpp::Subscription<PoseWithCovarianceStamped>::SharedPtr sub_init_pose_;
   rclcpp::Subscription<TwistStamped>::SharedPtr sub_init_twist_;
   rclcpp::Subscription<Trajectory>::SharedPtr sub_trajectory_;
@@ -167,7 +171,15 @@ private:
   rcl_interfaces::msg::SetParametersResult on_parameter(
     const std::vector<rclcpp::Parameter> & parameters);
 
+  /// Lanelets calculate_ego_pitch() picks the ground plane from.  Every road lanelet in
+  /// the map until a route arrives, then only the route's own lanelets -- see
+  /// rebuild_road_lanelets().
   lanelet::ConstLanelets road_lanelets_;
+  /// Every road lanelet in the map, kept so the route filter can be reapplied when the
+  /// route changes without re-parsing the map.
+  lanelet::ConstLanelets all_road_lanelets_;
+  /// Ids of the lanelets the mission route uses.  Empty means "no route yet".
+  std::set<lanelet::Id> route_lanelet_ids_;
 
   /* tf */
   tf2_ros::Buffer tf_buffer_;
@@ -252,6 +264,13 @@ private:
    * @brief subscribe lanelet map
    */
   void on_map(const LaneletMapBin::ConstSharedPtr msg);
+
+  /// Narrow the lanelets calculate_ego_pitch() may pick from to the ones the mission
+  /// route actually drives through.
+  void on_route(const LaneletRoute::ConstSharedPtr msg);
+
+  /// Rebuild road_lanelets_ from the map and, when a route is known, that route.
+  void rebuild_road_lanelets();
 
   /**
    * @brief set initial pose for simulation with received message

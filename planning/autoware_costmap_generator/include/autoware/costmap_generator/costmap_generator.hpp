@@ -62,6 +62,7 @@
 #include <autoware_internal_planning_msgs/msg/scenario.hpp>
 #include <autoware_map_msgs/msg/lanelet_map_bin.hpp>
 #include <autoware_perception_msgs/msg/predicted_objects.hpp>
+#include <autoware_planning_msgs/msg/lanelet_route.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 #include <grid_map_msgs/msg/grid_map.h>
@@ -71,6 +72,7 @@
 #include <tf2_ros/transform_listener.h>
 
 #include <memory>
+#include <set>
 #include <vector>
 
 class TestCostmapGenerator;
@@ -90,6 +92,9 @@ private:
   geometry_msgs::msg::PoseStamped::ConstSharedPtr current_pose_;
 
   lanelet::LaneletMapPtr lanelet_map_;
+  /// Ids of the lanelets the mission route actually uses.  Empty means "no route seen
+  /// yet"; see rebuild_primitives_polygons() for what that falls back to.
+  std::set<lanelet::Id> route_lanelet_ids_;
   PredictedObjects::ConstSharedPtr objects_;
   sensor_msgs::msg::PointCloud2::ConstSharedPtr points_;
 
@@ -103,6 +108,8 @@ private:
     pub_processing_time_ms_;
 
   rclcpp::Subscription<autoware_map_msgs::msg::LaneletMapBin>::SharedPtr sub_lanelet_bin_map_;
+  /// Only created when wayarea_from_route is true.
+  rclcpp::Subscription<autoware_planning_msgs::msg::LaneletRoute>::SharedPtr sub_route_;
   autoware_utils::InterProcessPollingSubscriber<sensor_msgs::msg::PointCloud2> sub_points_{
     this, "~/input/points_no_ground", autoware_utils::single_depth_sensor_qos()};
   autoware_utils::InterProcessPollingSubscriber<PredictedObjects> sub_objects_{
@@ -136,6 +143,14 @@ private:
   /// \brief callback for loading lanelet2 map
   void onLaneletMapBin(const autoware_map_msgs::msg::LaneletMapBin::ConstSharedPtr msg);
 
+  /// \brief callback for the mission route, used to narrow the free area to the
+  ///        lanelets the route actually drives through
+  void onRoute(const autoware_planning_msgs::msg::LaneletRoute::ConstSharedPtr msg);
+
+  /// \brief rebuild primitives_polygons_ from the map and, when wayarea_from_route is
+  ///        on, the current route.  Called whenever either of those two changes.
+  void rebuild_primitives_polygons();
+
   void update_data();
 
   void set_current_pose();
@@ -163,9 +178,13 @@ private:
   /// \brief fill a vector with road area polygons
   /// \param [in] lanelet_map input lanelet map
   /// \param [out] area_polygons polygon vector to fill
+  /// \param [in] keep_ids when non-empty, only lanelets whose id is in this set are
+  ///        emitted.  Everything the costmap does not name as road area ends up as
+  ///        wall, so this is how the free area gets narrowed to the route.
   static void loadRoadAreasFromLaneletMap(
     const lanelet::LaneletMapPtr lanelet_map,
-    std::vector<geometry_msgs::msg::Polygon> & area_polygons);
+    std::vector<geometry_msgs::msg::Polygon> & area_polygons,
+    const std::set<lanelet::Id> & keep_ids = {});
 
   /// \brief fill a vector with parking-area polygons
   /// \param [in] lanelet_map input lanelet map

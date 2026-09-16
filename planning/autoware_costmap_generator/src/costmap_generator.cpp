@@ -61,6 +61,7 @@
 #include <lanelet2_core/geometry/Polygon.h>
 
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -168,6 +169,15 @@ CostmapGenerator::CostmapGenerator(const rclcpp::NodeOptions & node_options)
     "~/input/vector_map", rclcpp::QoS{1}.transient_local(),
     std::bind(&CostmapGenerator::onLaneletMapBin, this, std::placeholders::_1));
 
+  // Route subscriber.  Only needed -- and only subscribed -- when the free area is to be
+  // narrowed to the lanelets the route uses, so the default configuration keeps exactly
+  // the topics it had before.
+  if (param_->use_wayarea && param_->wayarea_from_route) {
+    sub_route_ = this->create_subscription<autoware_planning_msgs::msg::LaneletRoute>(
+      "~/input/route", rclcpp::QoS{1}.transient_local(),
+      std::bind(&CostmapGenerator::onRoute, this, std::placeholders::_1));
+  }
+
   // Publishers
   pub_costmap_ = this->create_publisher<grid_map_msgs::msg::GridMap>("~/output/grid_map", 1);
   pub_occupancy_grid_ =
@@ -190,7 +200,7 @@ CostmapGenerator::CostmapGenerator(const rclcpp::NodeOptions & node_options)
 
 void CostmapGenerator::loadRoadAreasFromLaneletMap(
   const lanelet::LaneletMapPtr lanelet_map,
-  std::vector<geometry_msgs::msg::Polygon> & area_polygons)
+  std::vector<geometry_msgs::msg::Polygon> & area_polygons, const std::set<lanelet::Id> & keep_ids)
 {
   // use all lanelets in map of subtype road to give way area
   lanelet::ConstLanelets all_lanelets = lanelet::utils::query::laneletLayer(lanelet_map);
@@ -198,6 +208,10 @@ void CostmapGenerator::loadRoadAreasFromLaneletMap(
 
   // convert lanelets to polygons and put into area_points array
   for (const auto & ll : road_lanelets) {
+    // An empty keep_ids means "no filtering", which is the stock behaviour.
+    if (!keep_ids.empty() && keep_ids.count(ll.id()) == 0) {
+      continue;
+    }
     geometry_msgs::msg::Polygon poly;
     geometry_msgs::msg::Point32 pt;
     for (const auto & p : ll.polygon3d().basicPolygon()) {
@@ -238,8 +252,61 @@ void CostmapGenerator::onLaneletMapBin(
   lanelet_map_ = std::make_shared<lanelet::LaneletMap>();
   lanelet::utils::conversion::fromBinMsg(*msg, lanelet_map_);
 
+  rebuild_primitives_polygons();
+}
+
+void CostmapGenerator::onRoute(const autoware_planning_msgs::msg::LaneletRoute::ConstSharedPtr msg)
+{
+  std::set<lanelet::Id> ids;
+  for (const auto & segment : msg->segments) {
+    // Every primitive of the segment, not just the preferred one: the alternatives are
+    // lanelets the robot is allowed to be in, and leaving them out would put a wall
+    // alongside the robot the moment it sat in a non-preferred lane.
+    for (const auto & primitive : segment.primitives) {
+      ids.insert(static_cast<lanelet::Id>(primitive.id));
+    }
+  }
+
+  if (ids.empty()) {
+    // A route with no segments carries no free area at all.  Ignoring it leaves the
+    // previous one standing, which is strictly better than walling the robot in.
+    RCLCPP_WARN(get_logger(), "route has no segments; keeping the previous road area");
+    return;
+  }
+
+  if (ids == route_lanelet_ids_) {
+    return;
+  }
+
+  route_lanelet_ids_ = std::move(ids);
+  rebuild_primitives_polygons();
+}
+
+void CostmapGenerator::rebuild_primitives_polygons()
+{
+  if (!lanelet_map_) {
+    return;
+  }
+
+  primitives_polygons_.clear();
+
   if (param_->use_wayarea) {
-    loadRoadAreasFromLaneletMap(lanelet_map_, primitives_polygons_);
+    if (param_->wayarea_from_route && route_lanelet_ids_.empty()) {
+      // No route yet.  Falling back to every road lanelet keeps the node usable during
+      // start-up; the alternative -- an all-wall grid -- looks exactly like a robot
+      // boxed in for no reason, which this stack has produced once already.
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "wayarea_from_route is on but no route has arrived yet; using every road lanelet");
+      loadRoadAreasFromLaneletMap(lanelet_map_, primitives_polygons_);
+    } else if (param_->wayarea_from_route) {
+      loadRoadAreasFromLaneletMap(lanelet_map_, primitives_polygons_, route_lanelet_ids_);
+      RCLCPP_INFO(
+        get_logger(), "road area restricted to the %zu lanelet(s) the route uses",
+        route_lanelet_ids_.size());
+    } else {
+      loadRoadAreasFromLaneletMap(lanelet_map_, primitives_polygons_);
+    }
   }
 
   if (param_->use_parkinglot) {

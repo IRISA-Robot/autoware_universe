@@ -3,6 +3,7 @@
   <arg name="input_points_no_ground" default="~/input/points_no_ground"/>
   <arg name="input_lanelet_map" default="~/input/vector_map"/>
   <arg name="input_scenario" default="~/input/scenario"/>
+  <arg name="input_route" default="~/input/route"/>
   <arg name="output_grid_map" default="~/output/grid_map"/>
   <arg name="output_occupancy_grid" default="~/output/occupancy_grid"/>
 
@@ -13,6 +14,7 @@
     <remap from="~/input/points_no_ground" to="$(var input_points_no_ground)"/>
     <remap from="~/input/vector_map" to="$(var input_lanelet_map)"/>
     <remap from="~/input/scenario" to="$(var input_scenario)"/>
+    <remap from="~/input/route" to="$(var input_route)"/>
     <remap from="~/output/grid_map" to="$(var output_grid_map)"/>
     <remap from="~/output/occupancy_grid" to="$(var output_occupancy_grid)"/>
 

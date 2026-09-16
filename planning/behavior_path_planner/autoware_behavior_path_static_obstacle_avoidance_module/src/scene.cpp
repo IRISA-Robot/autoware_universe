@@ -806,7 +806,6 @@ void StaticObstacleAvoidanceModule::fillEgoStatus(
         kRearmEgoSpeedThreshold, kRearmClearanceMargin);
 
       if (should_rearm) {
-        clearHoldState();
         data.yield_required = false;
         data.safe_shift_line = data.new_shift_line;
         RCLCPP_WARN_THROTTLE(
@@ -820,62 +819,6 @@ void StaticObstacleAvoidanceModule::fillEgoStatus(
         return;
       }
 
-      // NOTE (2026-09-14, hold-escape): everything above assumes ego keeps moving forward --
-      // that is the mechanism by which the recomputed candidate is supposed to become safe on a
-      // later cycle ("as ego keeps moving forward the return trigger naturally pushes out").
-      // When ego is stopped (typically by downstream obstacle_stop reacting to the very clip this
-      // branch refuses to replan around), that assumption breaks and the hold becomes
-      // self-sustaining: nothing in the inputs can change, so the same hold is re-taken forever.
-      // shouldRearmHeldShiftLine() is not an escape either -- it only fires for a strictly
-      // LARGER, same-side shift, whereas the common real-world recovery (the blocking object
-      // moved away) produces a SMALLER shift, an opposite-side shift, or no candidate at all.
-      //
-      // Escape hatch: while ego is (near-)stationary -- so abandoning the plan cannot cause a
-      // lateral transient -- give up the hold if either
-      //   (1) the object that triggered the hold is no longer among the target objects, or
-      //   (2) the hold has been continuously active for longer than the timeout.
-      // Escaping requests a yield, which makes plan() call removeRegisteredShiftLines(): combined
-      // with the stationary-ego relaxation of that function's base-offset guard, that genuinely
-      // clears path_shifter_/generator_ and unlocks the module, so the next cycle replans from
-      // scratch instead of requiring a new goal pose.
-      constexpr double kMaxHoldDuration = 3.0;      // [s] continuous hold before giving up
-      constexpr double kHoldContinuityGap = 0.5;    // [s] gap that counts as "hold was released"
-
-      const auto now = clock_->now();
-      const auto hold_is_continuous =
-        hold_last_seen_time_.has_value() &&
-        (now - hold_last_seen_time_.value()).seconds() < kHoldContinuityGap;
-      if (!hold_is_continuous || !hold_started_time_.has_value()) {
-        hold_started_time_ = now;
-        hold_trigger_object_id_ =
-          data.stop_target_object
-            ? std::optional<UUID>(data.stop_target_object.value().object.object_id)
-            : std::nullopt;
-      }
-      hold_last_seen_time_ = now;
-
-      const auto hold_duration = (now - hold_started_time_.value()).seconds();
-      const auto trigger_object_gone =
-        hold_trigger_object_id_.has_value() &&
-        std::none_of(
-          data.target_objects.begin(), data.target_objects.end(), [this](const auto & o) {
-            return o.object.object_id == hold_trigger_object_id_.value();
-          });
-      const auto ego_is_stationary = ego_speed < kRearmEgoSpeedThreshold;
-
-      if (ego_is_stationary && (trigger_object_gone || hold_duration > kMaxHoldDuration)) {
-        RCLCPP_WARN(
-          getLogger(),
-          "[HOLD-ESCAPE] abandoning held shift plan after %.1fs of continuous hold with ego "
-          "stationary (v=%.3f, trigger_object_gone=%s). Requesting yield so the registered shift "
-          "lines are cleared and the module can replan from scratch.",
-          hold_duration, ego_speed, (trigger_object_gone ? "true" : "false"));
-        clearHoldState();
-        data.yield_required = true;
-        data.safe_shift_line = data.new_shift_line;
-        return;
-      }
-
       data.yield_required = false;
       data.safe_shift_line.clear();
       RCLCPP_WARN_THROTTLE(
@@ -883,9 +826,9 @@ void StaticObstacleAvoidanceModule::fillEgoStatus(
         "unsafe (likely early return-to-lane) and could not transit yield status; "
         "holding current registered shift plan instead of committing the unsafe candidate. "
         "[HOLD-REARM] not applied: registered=%.3f desired=%.3f has_new_candidate=%s "
-        "ego_speed=%.3f hold_duration=%.1f",
+        "ego_speed=%.3f",
         registered_end_shift_length, desired_end_shift_length,
-        (has_new_candidate ? "true" : "false"), ego_speed, hold_duration);
+        (has_new_candidate ? "true" : "false"), ego_speed);
       return;
     }
 
@@ -1958,7 +1901,6 @@ void StaticObstacleAvoidanceModule::initVariables()
   resetPathReference();
   arrived_path_end_ = false;
   ignore_signal_ids_.clear();
-  clearHoldState();
 }
 
 void StaticObstacleAvoidanceModule::initRTCStatus()

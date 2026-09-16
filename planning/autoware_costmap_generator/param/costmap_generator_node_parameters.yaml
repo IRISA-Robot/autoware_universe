@@ -17,6 +17,13 @@ costmap_generator_node:
   use_parkinglot:
     type: bool
     description: Whether using parkinglot from ~input/vector_map or not
+  wayarea_from_route:
+    type: bool
+    default_value: false
+    description: >
+      If true, only the lanelets used by the route on ~input/route count as road area;
+      every other road lanelet becomes wall.  Requires use_wayarea.  Until a route
+      arrives the node falls back to every road lanelet.
   costmap_frame:
     type: string
     description: Created costmap's coordinate

@@ -38,6 +38,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -118,6 +119,9 @@ SimplePlanningSimulator::SimplePlanningSimulator(const rclcpp::NodeOptions & opt
   sub_map_ = create_subscription<LaneletMapBin>(
     "input/vector_map", rclcpp::QoS(10).transient_local(),
     std::bind(&SimplePlanningSimulator::on_map, this, _1));
+  sub_route_ = create_subscription<LaneletRoute>(
+    "input/route", rclcpp::QoS(1).transient_local(),
+    std::bind(&SimplePlanningSimulator::on_route, this, _1));
   sub_init_pose_ = create_subscription<PoseWithCovarianceStamped>(
     "input/initialpose", QoS{1}, std::bind(&SimplePlanningSimulator::on_initialpose, this, _1));
   sub_init_twist_ = create_subscription<TwistStamped>(
@@ -544,7 +548,73 @@ void SimplePlanningSimulator::on_map(const LaneletMapBin::ConstSharedPtr msg)
     *msg, lanelet_map_ptr, &traffic_rules_ptr, &routing_graph_ptr);
 
   lanelet::ConstLanelets all_lanelets = lanelet::utils::query::laneletLayer(lanelet_map_ptr);
-  road_lanelets_ = lanelet::utils::query::roadLanelets(all_lanelets);
+  all_road_lanelets_ = lanelet::utils::query::roadLanelets(all_lanelets);
+  rebuild_road_lanelets();
+}
+
+void SimplePlanningSimulator::on_route(const LaneletRoute::ConstSharedPtr msg)
+{
+  std::set<lanelet::Id> ids;
+  for (const auto & segment : msg->segments) {
+    // Every primitive of the segment, not just the preferred one: the alternatives are
+    // lanelets the vehicle is legitimately allowed to be in.
+    for (const auto & primitive : segment.primitives) {
+      ids.insert(static_cast<lanelet::Id>(primitive.id));
+    }
+  }
+  if (ids.empty() || ids == route_lanelet_ids_) {
+    return;
+  }
+  route_lanelet_ids_ = std::move(ids);
+  rebuild_road_lanelets();
+}
+
+void SimplePlanningSimulator::rebuild_road_lanelets()
+{
+  // [ROUTE-PITCH 2026-09-15] calculate_ego_pitch() asks for "the closest lanelet within
+  // 2 m" and takes the ground plane -- the slope gravity is then applied along -- from
+  // whichever one that is.  On this map several lanelets overlap: measured at ego
+  // (-19.90, 34.17), SIX contain the point (109, 137, 161, 196, 206, 223), with
+  // centerline headings of 56.5, 137.0, 82.4, -41.5, -33.6 and -123.5 degrees and
+  // different z gradients.  Which one wins is then close to arbitrary, and because the
+  // pitch formula divides the horizontal run by cos(ego_yaw - lanelet_yaw), picking a
+  // lanelet the vehicle is not actually following produces a slope that has nothing to
+  // do with the ground it is driving on.  That is not a theoretical concern: it left the
+  // robot needing 0.5374 m/s^2 to hold station against a command of 0.5041, and the
+  // GEARED model clamps velocity at zero, so it sat still indefinitely.
+  //
+  // Restricting the candidates to the lanelets the route actually uses makes the choice
+  // the intended one.  Until a route arrives there is nothing to filter by, so every
+  // road lanelet stays eligible and behaviour is unchanged -- which also keeps the
+  // simulator usable with no mission loaded.
+  if (route_lanelet_ids_.empty()) {
+    road_lanelets_ = all_road_lanelets_;
+    return;
+  }
+
+  lanelet::ConstLanelets filtered;
+  for (const auto & lanelet : all_road_lanelets_) {
+    if (route_lanelet_ids_.count(lanelet.id()) > 0) {
+      filtered.push_back(lanelet);
+    }
+  }
+  if (filtered.empty()) {
+    // The route names no lanelet this map has as a road.  Falling back is the only safe
+    // answer: an empty list makes calculate_ego_pitch() return 0.0 everywhere, i.e. a
+    // perfectly flat world, which would silently hide every slope in the map.
+    RCLCPP_WARN(
+      get_logger(),
+      "route names %zu lanelet(s) but none of them is a road lanelet in this map; "
+      "keeping every road lanelet for the pitch calculation",
+      route_lanelet_ids_.size());
+    road_lanelets_ = all_road_lanelets_;
+    return;
+  }
+
+  road_lanelets_ = filtered;
+  RCLCPP_INFO(
+    get_logger(), "ego pitch will be taken from the %zu lanelet(s) the route uses",
+    road_lanelets_.size());
 }
 
 void SimplePlanningSimulator::on_initialpose(const PoseWithCovarianceStamped::ConstSharedPtr msg)
