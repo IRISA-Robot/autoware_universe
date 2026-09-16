@@ -112,6 +112,22 @@
     # If it cannot line up in this long it is not going to. Stop rather than crawl forever.
     transit_timeout_sec: 30.0
 
+    # How much of the reference path TRANSIT actually drives.  It only has to CONVERGE onto
+    # the path, not travel it -- and the reference path is the lane, which runs straight
+    # through the obstacle recovery just went around.  Measured live: driving 30 m of it put
+    # that obstacle 6.86 m into the transit path, the drivable-area test refused the whole
+    # thing, the relay published zeros, and the robot sat at 25.7 deg of heading error until
+    # the state timed out.  A few metres is all the line-up needs.
+    transit_lookahead_m: 5.0
+
+    # TRANSIT drives the reference path, but it starts from wherever the robot actually
+    # stands -- recovery's whole job is to have moved it off that path.  These two shape the
+    # join between the two.  A plan that started on the path instead deadlocked the state
+    # against its own AEB: the robot was permanently off its own plan, the AEB braked at
+    # 0.60 m, the exit needed 0.50 m, and only driving could close the gap.
+    transit_join_min_m: 1.5   # [m] shortest join, used when the robot is nearly on the path
+    transit_join_gain: 2.5    # join length per metre of lateral offset (~22 deg approach)
+
     # Recovery's own emergency brake.  While this scenario drives, the
     # motion_velocity_planner stop modules are bypassed entirely, so nothing else in
     # planning is watching what the robot drives into.
@@ -201,6 +217,17 @@
     # ground to buy itself a better starting position.
     goal_retry_sec: 2.0   # [TEST] shortened from 4.0
 
+    # Shortest distance to the plan's next stop point that the longitudinal controller
+    # will still engage on.  MUST be >= the controller's own DRIVE entry distance:
+    # pid.param.yaml drive_state_stop_dist (0.5) + drive_state_offset_stop_dist (1.0)
+    # = 1.5 m.  It was 0.3, which opened a dead band between 0.3 m and 1.5 m where the
+    # controller refuses to leave STOPPED but this node still calls the plan drivable --
+    # so nothing replans and the episode runs out its 60 s timeout with the robot
+    # standing still.  Freespace splits its plan at every direction cusp with a
+    # zero-velocity point, so short segments are normal in a Reeds-Shepp escape and land
+    # in that band easily.  If the controller values change, change this one with them.
+    min_engageable_stop_distance_m: 1.5
+
     # Forced replan.  When the robot stops past the live part of freespace's plan, the
     # nearest trajectory point to it already has zero velocity: the smoother then reads
     # target_vel = 0 and will never restart it, while freespace sees no reason to replan
@@ -237,6 +264,33 @@
     # even once the obstacle had been removed.  A mechanical stall stays latched
     # regardless -- that one needs a human.
     abort_release_sec: 5.0
+
+    # ABORT is not a dead end.  Its two normal exits -- the robot moving, or the blockage
+    # clearing -- are both unreachable for a robot frozen inside an obstacle_stop margin,
+    # which is exactly the case recovery exists for.  So while aborted the recovery
+    # costmap and freespace keep running (they do NOT move the robot; the scenario is not
+    # handed over), the last plan is re-checked against the live costmap every tick, and a
+    # fresh plan is requested this often.  The moment one is clear, goes the mission's way
+    # and stays on the road, it is driven -- straight back into RECOVERY, without redoing
+    # PROBE.
+    # [UNKNOWN-STOP 2026-09-16] A stop that no Autoware planning factor claims used to
+    # leave SUSPECT with no exit at all -- not triggerable, not legitimate, so it waited
+    # for ever (caught live at 83 s).  Now SUSPECT measures for itself with the recovery
+    # costmap instead of trusting a classification that already failed:
+    #   corridor blocked -> actionable, go to PROBE (nothing in planning claimed it, which
+    #                       is exactly the case this module exists for)
+    #   corridor clear for this long -> nothing to recover from, hand back to lane driving
+    # The hold is on the CLEAR side only: releasing a robot that is genuinely boxed in is
+    # the expensive mistake, so that direction must be sustained, while a blockage is acted
+    # on as soon as it is seen.
+    unknown_stop_clear_hold_sec: 3.0
+
+    abort_shadow_replan_sec: 3.0
+    # Last resort, only if the shadow check never finds anything: re-arm the watchdog for a
+    # completely fresh episode after this long, at most max_abort_retries times in a row.
+    # The retry budget resets the moment the robot is seen moving.
+    abort_retry_sec: 15.0
+    max_abort_retries: 3
 
     # --- stop attribution --------------------------------------------------
     # Planning factor topic suffixes; the node subscribes to

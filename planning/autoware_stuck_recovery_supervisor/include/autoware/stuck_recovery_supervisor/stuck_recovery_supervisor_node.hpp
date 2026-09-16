@@ -47,6 +47,7 @@
 
 #include <limits>
 #include <map>
+#include <array>
 #include <memory>
 #include <optional>
 #include <string>
@@ -181,6 +182,18 @@ private:
     double transit_hold_sec{1.0};
     // If it cannot line up in this long it is not going to; stop rather than crawl forever.
     double transit_timeout_sec{30.0};
+    // How much of the reference path TRANSIT actually drives.  It only has to converge onto
+    // the path, not travel it: the reference path is the lane, and the lane runs straight
+    // through the obstacle recovery just went around.  Driving 30 m of it meant the
+    // drivable-area test saw that obstacle 7 m ahead, refused the whole thing, and held the
+    // robot at zero until the state timed out.
+    double transit_lookahead_m{5.0};
+    /// Shortest join segment the transit plan may use to bring the robot from where it
+    /// actually stands onto the reference path.  A longer join is gentler; this is the
+    /// floor, and the join grows with how far off the robot is.
+    double transit_join_min_m{1.5};
+    /// Join length per metre of lateral offset.  2.5 gives roughly a 22-degree approach.
+    double transit_join_gain{2.5};
 
     // Recovery's own emergency brake.  The relayed plan was computed against an older
     // costmap; if the world has since put something in it, stop rather than drive it.
@@ -243,7 +256,13 @@ private:
     // Must stay above the smoother's stop_dist_to_prohibit_engage (0.2 m).  Purely for
     // the warning below -- it explains a robot that refuses to move for no visible
     // reason, which is otherwise a very expensive thing to work out.
-    double min_engageable_stop_distance_m{0.3};
+    /// Shortest distance to the plan's next stop point that the longitudinal controller
+    /// will still engage on.  Must be >= the controller's own DRIVE entry distance
+    /// (pid.param.yaml: drive_state_stop_dist 0.5 + drive_state_offset_stop_dist 1.0
+    /// = 1.5 m).  Setting it below that opens a dead band where the controller refuses
+    /// to move but this node still calls the plan drivable, so nothing replans and the
+    /// episode runs out its timeout with the robot standing still.
+    double min_engageable_stop_distance_m{1.5};
     // How long to wait for a usable plan before moving on to the next goal candidate.
     double goal_retry_sec{4.0};
     // Forced-replan cycle: how long to wait for freespace to come back with a plan, and
@@ -278,6 +297,23 @@ private:
     // of the session even after the obstacle had been removed.  A mechanical stall is
     // the exception: that one stays latched, because it needs a human to look at it.
     double abort_release_sec{5.0};
+    /// How long a non-mechanical ABORT may sit on a still-blocked, still-stopped robot
+    /// before the watchdog is re-armed so a fresh episode can try again.  ABORT's two
+    /// normal exits -- the robot moving, or the blockage clearing -- are both unreachable
+    /// when the robot is frozen inside an obstacle_stop margin, which is precisely the
+    /// case recovery exists for.  Without this the state is a dead end.
+    /// How often, while aborted, to ask freespace for a fresh plan from where the robot
+    /// now stands.  The previous plan is re-checked every tick regardless; this is the
+    /// rate at which a NEW one is requested.
+    /// [UNKNOWN-STOP 2026-09-16] How long the corridor must read clear, while SUSPECT is
+    /// holding an unexplained stop, before the watchdog releases back to lane driving.
+    double unknown_stop_clear_hold_sec{3.0};
+    double abort_shadow_replan_sec{3.0};
+    double abort_retry_sec{15.0};
+    /// How many such retries in a row are allowed before ABORT latches for a human.  The
+    /// counter resets the moment the robot is seen moving, so it only ever bounds a robot
+    /// that is genuinely getting nowhere.
+    int max_abort_retries{3};
 
     // classification inputs
     std::vector<std::string> pathological_factor_topics{};
@@ -341,7 +377,11 @@ private:
   void force_freespace_replan(const std::string & why);
   /// True when the robot is stopped and there is no usable velocity left ahead of it in
   /// the plan being relayed -- i.e. the plan is spent and only a replan can help.
-  bool plan_is_spent() const;
+  /// \param stop_dist_out when non-null, receives the distance from the robot to the
+  ///        plan's next stop point.  Only meaningful when one was found; left untouched
+  ///        otherwise.  This function is const, so it cannot log through the node clock
+  ///        -- the caller does that instead.
+  bool plan_is_spent(double * stop_dist_out = nullptr) const;
   /// plan_is_spent() held continuously for spent_hold_sec, and long enough after entering
   /// the state that the robot had a fair chance to drive.  Only this may force a replan.
   bool plan_is_spent_confirmed();
@@ -363,6 +403,13 @@ private:
   bool capture_reference_path_from_trajectory();
   std::optional<geometry_msgs::msg::Pose> compute_escape_goal() const;
   CorridorResult sweep(size_t from_index) const;
+  /// Sweep an arbitrary path rather than reference_path_.  The lateral mirroring is
+  /// derived from THAT path's own heading against ego, not from the reference path's.
+  CorridorResult sweep_path(
+    const std::vector<geometry_msgs::msg::Pose> & path, size_t from_index) const;
+  /// The trajectory lane driving is currently asking the robot to follow, as poses, from
+  /// the point nearest ego onward.  Empty when there is no usable trajectory.
+  std::vector<geometry_msgs::msg::Pose> followed_path() const;
   /// Is the recovery costmap present AND recent?  A stale grid is worse than none.
   bool costmap_is_fresh() const;
   /// True on a reversed route, where the path yaw is the travel direction and the
@@ -401,13 +448,22 @@ private:
   /// Every pose of the plan, footprint and all, inside the drivable area of the recovery
   /// costmap.  Outside the road lanelets is occupied there, so this is also the guarantee
   /// that recovery never steers the robot off the road.
-  bool plan_stays_inside_road(const autoware_planning_msgs::msg::Trajectory & traj);
+  /// \param first_bad_index_out when non-null and the plan is refused, receives the index
+  ///        of the first point whose footprint is not free.  Every earlier point has
+  ///        already passed the same test, so the plan is safe up to there.
+  bool plan_stays_inside_road(
+    const autoware_planning_msgs::msg::Trajectory & traj,
+    size_t * first_bad_index_out = nullptr);
   /// Give up on the current escape goal and take the next one still ahead; ABORT when the
   /// list is exhausted.  This is what replaced the retreat.
   void reject_plan_and_try_next_goal(const std::string & why);
   /// Is the pose inside the recovery costmap window at all?  Used only to explain, in
   /// the log, why candidates were skipped.
   bool pose_is_on_grid(const geometry_msgs::msg::Pose & pose) const;
+  /// Is the whole vehicle footprint at this pose still inside the costmap window?  Off the
+  /// window is "cannot see", which is a different thing from "not drivable" and must not be
+  /// judged as if it were.
+  bool footprint_within_grid(const geometry_msgs::msg::Pose & pose) const;
   void publish_recovery_arming(bool active);
   void publish_recovery_route(const geometry_msgs::msg::Pose & goal);
   /// Ordered escape-goal candidates, nearest usable first.
@@ -488,6 +544,25 @@ private:
   int replan_attempts_{0};
   bool start_blocked_{false};
   bool abort_was_mechanical_{false};
+  /// Consecutive abort retries; reset as soon as the robot is observed moving.
+  int abort_retries_{0};
+  /// uuid of the route last seen, so a genuinely new mission can be told from a
+  /// re-publication of the same one.
+  std::array<uint8_t, 16> prev_route_uuid_{};
+  bool have_route_uuid_{false};
+  /// Set by the route callback, acted on by on_timer so the reset never races the state
+  /// machine from a subscription thread.
+  bool route_changed_{false};
+  /// True once arrival has already been acted on, so it is handled once per route.
+  bool arrival_handled_{false};
+
+  /// Wipe every trace of the current episode and return to NOMINAL.  Used when the
+  /// mission itself changes underneath the state machine.
+  void reset_for_new_mission(const std::string & why);
+  /// When the last shadow replan was requested while in ABORT.
+  rclcpp::Time shadow_replan_at_{0, 0, RCL_ROS_TIME};
+  /// When the corridor last STOPPED reading clear during an unexplained SUSPECT.
+  rclcpp::Time unknown_clear_since_{0, 0, RCL_ROS_TIME};
   rclcpp::Time abort_clear_since_{0, 0, RCL_ROS_TIME};
   rclcpp::Time spent_since_{0, 0, RCL_ROS_TIME};
   CorridorResult last_sweep_{};

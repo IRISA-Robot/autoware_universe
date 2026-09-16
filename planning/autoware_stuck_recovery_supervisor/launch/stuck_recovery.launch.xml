@@ -41,6 +41,13 @@
         <remap from="~/input/vector_map" to="/map/vector_map"/>
         <!-- private scenario topic: armed by the supervisor, invisible to the rest of the stack -->
         <remap from="~/input/scenario" to="/planning/recovery/scenario"/>
+        <!-- The MISSION route, not the supervisor's synthetic one.  With
+             wayarea_from_route the free area shrinks to the lanelets this route drives
+             through, so recovery can no longer plan through a road that happens to
+             touch the grid but is not part of the mission.  The synthetic route on
+             /planning/recovery/route carries only start and goal poses and no segments,
+             so it could not serve as the filter. -->
+        <remap from="~/input/route" to="/planning/mission_planning/route"/>
         <remap from="~/output/grid_map" to="costmap_generator/grid_map"/>
         <remap from="~/output/occupancy_grid" to="costmap_generator/occupancy_grid"/>
         <param from="$(var vehicle_param_file)"/>
