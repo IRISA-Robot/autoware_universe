@@ -2446,6 +2446,30 @@ bool StuckRecoverySupervisorNode::goal_is_ahead(const geometry_msgs::msg::Pose &
   if (!odom_ || reference_path_.size() < 2) {
     return true;
   }
+
+  // [GOAL-TOO-CLOSE 2026-09-16] A goal the controller cannot drive to is not a goal.
+  //
+  // The longitudinal controller will not leave STOPPED unless the plan's next stop point
+  // is further than drive_state_stop_dist + drive_state_offset_stop_dist ahead
+  // (min_engageable_stop_distance_m mirrors that).  So once the robot is inside that
+  // distance of its escape goal, the last stretch cannot be driven -- no plan to it will
+  // ever move the robot, however many times it is replanned.
+  //
+  // Measured 2026-09-16, episode 5: the robot drove 4.49 m of its plan, arrived near the
+  // goal, and the remaining run was 1.00 m and then 0.69 m -- both under the 1.50 m engage
+  // distance.  plan_is_spent() correctly called the plan undrivable, force_freespace_replan
+  // asked for another one to a goal just as close, and RECOVERY <-> REPLAN churned until
+  // the candidate list ran out (5/5) and the episode gave up into lane driving.
+  //
+  // Treating such a goal as reached rather than ahead is what the rest of the state machine
+  // already knows how to handle: the goal-passed branch advances to the next candidate that
+  // IS drivable, looks for one that rejoins the path, or hands back through TRANSIT.  The
+  // same predicate also runs in collect_goal_candidates(), so candidates are never placed
+  // that close in the first place.
+  if (
+    distance2d(odom_->pose.pose, goal) <= param_.min_engageable_stop_distance_m) {
+    return false;
+  }
   const auto ego_idx = find_nearest_index(reference_path_, odom_->pose.pose);
   const auto goal_idx = find_nearest_index(reference_path_, goal);
   if (!ego_idx || !goal_idx) {
