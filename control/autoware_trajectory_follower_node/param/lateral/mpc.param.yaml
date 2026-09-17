@@ -75,3 +75,12 @@
       steering_offset_limit: 0.02
 
     publish_debug_trajectories: true # flag to publish predicted trajectory and resampled reference trajectory for debug purpose
+
+    # Reference-continuity guard.  Declared with no default at the call site, so these must
+    # exist in whichever copy of this file is actually loaded or the controller throws on start.
+    # See mpc.hpp for what each one bounds and where the numbers come from.
+    nearest_jump_tolerance: 0.3           # [m]
+    nearest_jump_max_rejections: 20       # [-] consecutive rejections before one jump is accepted
+    nearest_jump_yaw_tolerance: 0.35      # [rad] (= 20 deg)
+    enable_nearest_jump_yaw_check: true   # false restores the position-only behaviour
+    enable_yaw_constraint_lost_report: true  # report-only; changes no behaviour

@@ -255,6 +255,8 @@ private:
   // that genuinely IS somewhere else can still re-acquire instead of steering to a stale
   // reference for ever.
   int m_nearest_jump_rejections = 0;
+  //!< @brief how many times the nearest-point search has dropped its yaw constraint.
+  size_t m_yaw_constraint_lost_count{0};
 
   rclcpp::Publisher<Trajectory>::SharedPtr m_debug_frenet_predicted_trajectory_pub;
   rclcpp::Publisher<Trajectory>::SharedPtr m_debug_resampled_reference_trajectory_pub;
@@ -465,10 +467,40 @@ public:
   // Slack on top of the distance the robot actually travelled, before a change of reference
   // point is called a teleport.  Covers resampling, trajectory replacement and honest
   // re-interpolation; well under the ~0.6 m jumps the failure produced.
+  // Parameter: nearest_jump_tolerance.
   double nearest_jump_tolerance = 0.3;
-  // After this many consecutive rejections the jump is accepted, so the controller can
-  // re-acquire if the robot really has been displaced (a manual push, a localisation jump).
+  // After this many CONSECUTIVE rejections the jump is accepted once and the counter resets,
+  // so the controller can re-acquire if the robot really has been displaced (a manual push, a
+  // localisation jump).  At ctrl_period 0.03 s, 20 is 0.6 s of continuous holding.  Measured
+  // live: 29 of 30 rejections were isolated, but one reached 18 -- the budget is not academic.
+  // Parameter: nearest_jump_max_rejections.
   int nearest_jump_max_rejections = 20;
+  // [REFERENCE-SPIN 2026-09-17] The position test above compares only .position, so a
+  // replacement reference sitting 0.2 m away but rotated 60 degrees passed it untouched.  That
+  // is exactly what happened on 2026-09-17: the recovery supervisor swapped escape goal 2 for
+  // goal 3, freespace replanned, and 3.8 ms later the controller reported lateral_err 0.77 m
+  // and yaw_err -1.06 rad with NO reference-jump rejection logged.  So test rotation too.
+  //
+  // Budget for the default: the reference advances by roughly what the robot travels, and its
+  // yaw changes by curvature x distance.  At this vehicle's own curvature limit (1.667 1/m) and
+  // full speed (1.39 m/s), one 0.03 s cycle turns the reference about 0.07 rad.  0.35 rad is
+  // five times that, so only a gross flip trips it.
+  // Parameter: nearest_jump_yaw_tolerance.
+  double nearest_jump_yaw_tolerance = 0.35;
+  // Parameter: enable_nearest_jump_yaw_check.  Off restores the position-only behaviour without
+  // a rebuild, which matters because this guard sits on the safety path: if it ever holds a
+  // legitimately new reference (a new route, a scenario handover) the robot follows something
+  // stale, which is the same failure it exists to prevent.
+  bool enable_nearest_jump_yaw_check = true;
+  // [YAW-CONSTRAINT-LOST 2026-09-17] Report when the nearest-point search silently drops its
+  // yaw constraint.  findFirstNearestIndexWithSoftConstraints() tries distance AND yaw first;
+  // if no point satisfies both it falls through to a stage that keeps only distance, and
+  // returns whatever is geometrically nearest regardless of which way it faces.  That is a
+  // cliff, not a slope -- at 59.9 deg the reference is correctly oriented, at 60.1 deg it can
+  // be anything within 3 m -- and upstream reports it nowhere.  Counting it is the only way to
+  // know how often a rare failure actually happens.
+  // Parameter: enable_yaw_constraint_lost_report.
+  bool enable_yaw_constraint_lost_report = true;
 
   bool m_use_delayed_initial_state =
     true;  // Flag to use x0_delayed as initial state for predicted trajectory

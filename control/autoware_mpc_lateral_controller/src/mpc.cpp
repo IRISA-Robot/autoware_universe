@@ -417,7 +417,22 @@ std::pair<ResultWithReason, MPCData> MPC::getData(
     const double reference_moved = autoware_utils_geometry::calc_distance2d(
       m_prev_nearest_pose->position, data.nearest_pose.position);
     const double allowed = ego_travelled + nearest_jump_tolerance;
-    if (reference_moved > allowed && m_nearest_jump_rejections < nearest_jump_max_rejections) {
+
+    // [REFERENCE-SPIN 2026-09-17] Position alone is not enough.  A replacement reference can
+    // sit almost where the old one was and still face a completely different way -- measured
+    // on 2026-09-17, 3.8 ms after the recovery supervisor swapped escape goals: lateral_err
+    // 0.77 m, yaw_err -1.06 rad, and this guard logged nothing because the point had barely
+    // moved.  Steering to a reference rotated that far swings the wheel exactly as hard as
+    // steering to one that teleported.
+    const double reference_rotated = std::abs(normalize_radian(
+      tf2::getYaw(m_prev_nearest_pose->orientation) - tf2::getYaw(data.nearest_pose.orientation)));
+    const bool position_jumped = reference_moved > allowed;
+    const bool orientation_jumped =
+      enable_nearest_jump_yaw_check && reference_rotated > nearest_jump_yaw_tolerance;
+
+    if (
+      (position_jumped || orientation_jumped) &&
+      m_nearest_jump_rejections < nearest_jump_max_rejections) {
       ++m_nearest_jump_rejections;
       MPCData retry;
       if (MPCUtils::calcNearestPoseInterp(
@@ -425,10 +440,13 @@ std::pair<ResultWithReason, MPCData> MPC::getData(
             &(retry.nearest_time), ego_nearest_dist_threshold, ego_nearest_yaw_threshold)) {
         RCLCPP_WARN_THROTTLE(
           m_logger, *m_clock, 1000,
-          "[REFERENCE-JUMP] the nearest-point search moved the reference %.2f m while the robot "
-          "moved %.2f m (allowed %.2f m); holding the previous stretch instead (rejection %d/%d)",
-          reference_moved, ego_travelled, allowed, m_nearest_jump_rejections,
-          nearest_jump_max_rejections);
+          "[REFERENCE-JUMP] the nearest-point search moved the reference %.2f m and turned it "
+          "%.1f deg while the robot moved %.2f m (allowed %.2f m / %.1f deg) -- tripped on %s; "
+          "holding the previous stretch instead (rejection %d/%d)",
+          reference_moved, reference_rotated * 180.0 / M_PI, ego_travelled, allowed,
+          nearest_jump_yaw_tolerance * 180.0 / M_PI,
+          position_jumped ? (orientation_jumped ? "both" : "position") : "rotation",
+          m_nearest_jump_rejections, nearest_jump_max_rejections);
         data.nearest_pose = retry.nearest_pose;
         data.nearest_idx = retry.nearest_idx;
         data.nearest_time = retry.nearest_time;
@@ -445,6 +463,44 @@ std::pair<ResultWithReason, MPCData> MPC::getData(
   data.lateral_err = MPCUtils::calcLateralError(current_pose, data.nearest_pose);
   data.yaw_err = normalize_radian(
     tf2::getYaw(current_pose.orientation) - tf2::getYaw(data.nearest_pose.orientation));
+
+  // [YAW-CONSTRAINT-LOST 2026-09-17] Say so when the nearest-point search dropped its yaw
+  // constraint.  findFirstNearestIndexWithSoftConstraints() tries distance AND yaw first; if no
+  // point satisfies both, it falls through to a stage keeping only distance and returns whatever
+  // is geometrically nearest, however it is facing.  Nothing upstream reports that, so a
+  // reference pointing the wrong way reaches the controller silently -- and the wheel follows it.
+  //
+  // A yaw error past the threshold is the cheap hint, but interpolation between two conforming
+  // points can exceed it by a hair on its own, so confirm by asking the question the first stage
+  // asked: did ANY point satisfy both constraints?  The scan only runs on the hint, which is
+  // rare, and traj is the resampled reference (tens of points), not the raw trajectory.
+  if (enable_yaw_constraint_lost_report && std::abs(data.yaw_err) > ego_nearest_yaw_threshold) {
+    const double squared_dist_threshold = ego_nearest_dist_threshold * ego_nearest_dist_threshold;
+    const double ego_yaw = tf2::getYaw(current_pose.orientation);
+    bool any_point_within_both = false;
+    for (size_t i = 0; i < traj.size(); ++i) {
+      const double dx = traj.x.at(i) - current_pose.position.x;
+      const double dy = traj.y.at(i) - current_pose.position.y;
+      if (dx * dx + dy * dy > squared_dist_threshold) {
+        continue;
+      }
+      if (std::abs(normalize_radian(ego_yaw - traj.yaw.at(i))) <= ego_nearest_yaw_threshold) {
+        any_point_within_both = true;
+        break;
+      }
+    }
+    if (!any_point_within_both) {
+      ++m_yaw_constraint_lost_count;
+      RCLCPP_ERROR_THROTTLE(
+        m_logger, *m_clock, 1000,
+        "[YAW-CONSTRAINT-LOST] no reference point within %.1f m is oriented within %.1f deg of "
+        "the robot, so the nearest-point search fell back to distance only and the reference it "
+        "returned may face any direction (yaw_err %.1f deg, lateral_err %.2f m). This has now "
+        "happened %zu time(s) since start.",
+        ego_nearest_dist_threshold, ego_nearest_yaw_threshold * 180.0 / M_PI,
+        data.yaw_err * 180.0 / M_PI, data.lateral_err, m_yaw_constraint_lost_count);
+    }
+  }
 
   // get predicted steer
   data.predicted_steer = m_steering_predictor->calcSteerPrediction();

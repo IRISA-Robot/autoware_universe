@@ -135,6 +135,16 @@ MpcLateralController::MpcLateralController(
   m_mpc->ego_nearest_dist_threshold = m_ego_nearest_dist_threshold;
   m_mpc->ego_nearest_yaw_threshold = m_ego_nearest_yaw_threshold;
 
+  // Reference-continuity guard.  All four are parameters rather than constants so the guard can
+  // be loosened, tightened or switched off in the field: it sits on the safety path, and if it
+  // ever holds a legitimately new reference the robot follows something stale -- the same
+  // failure it exists to prevent.  See mpc.hpp for what each one bounds.
+  m_mpc->nearest_jump_tolerance = dp_double("nearest_jump_tolerance");
+  m_mpc->nearest_jump_max_rejections = dp_int("nearest_jump_max_rejections");
+  m_mpc->nearest_jump_yaw_tolerance = dp_double("nearest_jump_yaw_tolerance");
+  m_mpc->enable_nearest_jump_yaw_check = dp_bool("enable_nearest_jump_yaw_check");
+  m_mpc->enable_yaw_constraint_lost_report = dp_bool("enable_yaw_constraint_lost_report");
+
   m_mpc->m_use_delayed_initial_state = dp_bool("use_delayed_initial_state");
 
   m_mpc->m_publish_debug_trajectories = dp_bool("publish_debug_trajectories");
