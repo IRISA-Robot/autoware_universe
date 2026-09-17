@@ -25,8 +25,11 @@
 #include <boost/scope_exit.hpp>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -98,6 +101,81 @@ void PlannerManager::configureModuleSlot(
     }
   }
 }
+
+namespace
+{
+/// Where two consecutive segments of a path point in opposite directions.
+struct DirectionReversal
+{
+  size_t index;       ///< index of the point the outgoing segment starts at
+  double ds_in;       ///< length of the incoming segment [m]
+  double ds_out;      ///< length of the outgoing segment [m]
+  double delta_rad;   ///< how far the direction turned between them
+};
+
+/// \brief find the sharpest place where the path folds back on itself.
+///
+/// A path that reverses direction mid-way is never valid output for this vehicle, and nothing
+/// downstream notices it: resamplePath() builds its arc length by summing UNSIGNED distances
+/// (resample.cpp), so a fold still reads as a monotonically increasing s and passes every
+/// validation; insertOrientation() then reports the fold faithfully as a ~180 degree yaw step
+/// between neighbouring points. That step is what reaches the controller, and it is what took
+/// motion_velocity_planner -- and the whole motion_planning_container with it -- down on
+/// 2026-09-16. Measured live: yaw alternating between 52.1 and -127.9 degrees in runs of three
+/// to four points, one of them across a 0.063 m segment, i.e. curvature 49.7 1/m against this
+/// robot's 1.667 1/m limit.
+///
+/// Segments shorter than min_segment_length carry no reliable direction and are skipped, so the
+/// two segments compared here are not necessarily adjacent in index.
+std::optional<DirectionReversal> find_direction_reversal(
+  const PathWithLaneId & path, const double reversal_threshold_rad)
+{
+  constexpr double min_segment_length = 1.0e-3;
+
+  std::optional<DirectionReversal> worst;
+  std::optional<double> prev_azimuth;
+  double prev_ds = 0.0;
+
+  for (size_t i = 0; i + 1 < path.points.size(); ++i) {
+    const auto & from = path.points.at(i).point.pose.position;
+    const auto & to = path.points.at(i + 1).point.pose.position;
+    const double ds = std::hypot(to.x - from.x, to.y - from.y);
+    if (ds < min_segment_length) {
+      continue;
+    }
+    const double azimuth = std::atan2(to.y - from.y, to.x - from.x);
+    if (prev_azimuth) {
+      const double raw = azimuth - *prev_azimuth;
+      const double delta = std::abs(std::atan2(std::sin(raw), std::cos(raw)));
+      if (delta > reversal_threshold_rad && (!worst || delta > worst->delta_rad)) {
+        worst = DirectionReversal{i, prev_ds, ds, delta};
+      }
+    }
+    prev_azimuth = azimuth;
+    prev_ds = ds;
+  }
+
+  return worst;
+}
+
+/// \brief name the modules that produced the path, so a fold can be traced to its author.
+std::string running_module_names(
+  const std::vector<std::shared_ptr<SceneModuleStatus>> & statuses)
+{
+  std::string names;
+  for (const auto & status : statuses) {
+    if (!status->is_waiting_approval && status->status != ModuleStatus::RUNNING) {
+      continue;
+    }
+    if (!names.empty()) {
+      names += ", ";
+    }
+    names += status->module_name;
+    names += status->is_waiting_approval ? "(waiting_approval)" : "(running)";
+  }
+  return names.empty() ? std::string{"<none>"} : names;
+}
+}  // namespace
 
 // This is a temporary process until motion planning can take the terminal pose into account
 bool keep_input_points(const std::vector<std::shared_ptr<SceneModuleStatus>> & statuses)
@@ -213,9 +291,77 @@ BehaviorModuleOutput PlannerManager::run(const std::shared_ptr<PlannerData> & da
     m->publish_planning_factors();
   });
   // resample the path prior to generating the drivable area
+  //
+  // The path is checked for a direction reversal on BOTH sides of the resample -- see
+  // find_direction_reversal() for why a fold is invisible to everything downstream. Checking
+  // twice is the point: it says whether a module handed a folded path in, or whether the spline
+  // produced the fold from anchors that were fine. Without that distinction the fold can only be
+  // guessed at, and /planning/path_with_lane_id is not in the recovery bag to settle it after
+  // the fact.
+  constexpr double reversal_threshold_rad = 2.618;  // 150 degrees
+  const size_t points_before_resample = result_output.valid_output.path.points.size();
+  const auto fold_before_resample =
+    find_direction_reversal(result_output.valid_output.path, reversal_threshold_rad);
+
   result_output.valid_output.path = utils::resamplePathWithSpline(
     result_output.valid_output.path, data->parameters.output_path_interval,
     keep_input_points(getSceneModuleStatus()));
+
+  const auto fold_after_resample =
+    find_direction_reversal(result_output.valid_output.path, reversal_threshold_rad);
+
+  // [PATH-FOLD 2026-09-17] A folded path is not merely ugly, it is actively dangerous: the
+  // controller's nearest-point search can lock onto the far side of the fold, and the reference
+  // then jumps metres while the robot has moved centimetres -- measured on this vehicle as 1.12 m
+  // of reference movement against 0.04 m of travel, felt as a sharp steering swing. Rather than
+  // hand that to the controller, republish the last path that was not folded.
+  //
+  // Bounded on purpose. Substituting forever would freeze the robot on a path that goes stale as
+  // it drives, which is its own hazard, so after max_fold_substitutions consecutive cycles this
+  // gives up and publishes what it has -- the same behaviour as before this guard existed, but
+  // now loudly. The bound is short: it exists to bridge a transient fold, not to mask a
+  // persistent one.
+  constexpr size_t max_fold_substitutions = 10;  // ~1 s at 10 Hz
+  if (!fold_after_resample) {
+    last_unfolded_path_ = result_output.valid_output.path;
+    fold_substitution_count_ = 0;
+  } else if (last_unfolded_path_ && fold_substitution_count_ < max_fold_substitutions) {
+    ++fold_substitution_count_;
+    RCLCPP_ERROR_THROTTLE(
+      logger_, clock_, 1000,
+      "[PATH-FOLD] published path folds back on itself; republishing the last unfolded path "
+      "instead (substitution %zu of %zu). Giving up after that and publishing the folded path, "
+      "because a stale path is its own hazard.",
+      fold_substitution_count_, max_fold_substitutions);
+    result_output.valid_output.path = *last_unfolded_path_;
+  } else if (fold_after_resample) {
+    RCLCPP_ERROR_THROTTLE(
+      logger_, clock_, 1000,
+      "[PATH-FOLD] published path folds back on itself and there is no usable path to fall back "
+      "on (%s). Publishing it: the controller may steer sharply.",
+      last_unfolded_path_ ? "substitution budget spent" : "no unfolded path seen yet");
+  }
+
+  if (fold_before_resample || fold_after_resample) {
+    const auto describe = [](const std::optional<DirectionReversal> & fold) {
+      if (!fold) {
+        return std::string{"none"};
+      }
+      char buf[160];
+      std::snprintf(
+        buf, sizeof(buf), "at point %zu, direction turned %.1f deg across segments %.4f m -> %.4f m",
+        fold->index, fold->delta_rad * 180.0 / M_PI, fold->ds_in, fold->ds_out);
+      return std::string{buf};
+    };
+    RCLCPP_ERROR_THROTTLE(
+      logger_, clock_, 3000,
+      "[PATH-FOLD] the behavior path folds back on itself -- this is never drivable and nothing "
+      "downstream rejects it. before resample (%zu points): %s. after resample (%zu points): %s. "
+      "modules that built this path: %s.",
+      points_before_resample, describe(fold_before_resample).c_str(),
+      result_output.valid_output.path.points.size(), describe(fold_after_resample).c_str(),
+      running_module_names(getSceneModuleStatus()).c_str());
+  }
   generateCombinedDrivableArea(result_output.valid_output, data);
   return result_output.valid_output;
 }

@@ -604,6 +604,11 @@ private:
   std::shared_ptr<SceneModuleVisitor> debug_msg_ptr_;
 
   mutable std::optional<BehaviorModuleOutput> last_valid_reference_path_;
+
+  /// The most recent published path that did not fold back on itself, and how many consecutive
+  /// cycles it has been republished in place of a folded one. See the [PATH-FOLD] block in run().
+  std::optional<PathWithLaneId> last_unfolded_path_;
+  size_t fold_substitution_count_{0};
 };
 }  // namespace autoware::behavior_path_planner
 
