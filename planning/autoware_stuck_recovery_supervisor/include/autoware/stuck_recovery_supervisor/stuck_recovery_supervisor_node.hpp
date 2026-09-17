@@ -308,6 +308,10 @@ private:
     /// [UNKNOWN-STOP 2026-09-16] How long the corridor must read clear, while SUSPECT is
     /// holding an unexplained stop, before the watchdog releases back to lane driving.
     double unknown_stop_clear_hold_sec{3.0};
+    /// How many times in a row SUSPECT may release an unexplained-but-clear stop before it
+    /// stops re-arming and holds.  The budget resets the moment the robot is seen moving,
+    /// so it only ever bounds a robot that is getting nowhere.
+    int max_unknown_releases{3};
     double abort_shadow_replan_sec{3.0};
     double abort_retry_sec{15.0};
     /// How many such retries in a row are allowed before ABORT latches for a human.  The
@@ -546,6 +550,8 @@ private:
   bool abort_was_mechanical_{false};
   /// Consecutive abort retries; reset as soon as the robot is observed moving.
   int abort_retries_{0};
+  /// Consecutive unexplained-but-clear releases; reset as soon as the robot moves.
+  int unknown_releases_{0};
   /// uuid of the route last seen, so a genuinely new mission can be told from a
   /// re-publication of the same one.
   std::array<uint8_t, 16> prev_route_uuid_{};

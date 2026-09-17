@@ -257,7 +257,10 @@
 
     # --- budget ------------------------------------------------------------
     max_attempts: 2
-    cooldown_sec: 10.0    # [TEST] shortened from 60.0
+    cooldown_sec: 3.0     # how long NOMINAL is held after a recovery before the watchdog may
+                          # arm again.  Was 60.0 upstream, then 10.0 for testing; 3.0 is an
+                          # operator decision -- long enough for the handback to settle, short
+                          # enough that a robot which gets stuck again is picked up promptly.
     max_episode_duration_sec: 180.0
     # ABORT releases itself after the blockage has been gone this long, and returns via
     # COOLDOWN.  Latching it forever left the watchdog dead for the rest of the session
@@ -284,6 +287,13 @@
     # the expensive mistake, so that direction must be sustained, while a blockage is acted
     # on as soon as it is seen.
     unknown_stop_clear_hold_sec: 3.0
+    # Releasing an unexplained-but-clear stop is right; releasing it for ever is not.  The
+    # release used to go straight to NOMINAL -- the one path in this node that skipped
+    # COOLDOWN -- so the still-stationary robot was re-detected on the next tick and the
+    # cycle repeated every 12 s indefinitely (measured: episode 164 -> 174 in two minutes,
+    # robot frozen throughout).  After this many releases with no motion at all, the node
+    # holds and says so.  The budget resets the moment the robot moves.
+    max_unknown_releases: 3
 
     abort_shadow_replan_sec: 3.0
     # Last resort, only if the shadow check never finds anything: re-arm the watchdog for a
@@ -297,6 +307,18 @@
     # /planning/planning_factors/<name> for each (see planning_factor_interface.hpp).
     # Verify the live list once on the robot with:
     #   ros2 topic list | grep planning_factors
+    # [FACTOR-COVERAGE 2026-09-16] 37 planning-factor topics are live on this stack; this
+    # node used to subscribe to 12.  A STOP published on any of the other 25 arrived as
+    # SOURCE_UNKNOWN with an EMPTY stop_source_module, which reads as "nobody knows why the
+    # robot stopped" when in fact the module said so plainly on a topic nothing was
+    # listening to.  Caught live: static_obstacle_avoidance publishing
+    # behavior=STOP distance=0.80 while the supervisor reported an unexplained stop and
+    # cycled SUSPECT->NOMINAL every 12 s for minutes.
+    #
+    # Pathological = a blockage lane driving cannot get past on its own, so recovery should
+    # look.  static_obstacle_avoidance belongs here because it publishes its yield STOP
+    # exactly when it has concluded an object cannot be avoided -- lane driving giving up is
+    # the definition of this module's case.
     pathological_factor_topics:
       - "obstacle_stop"
       - "dynamic_obstacle_stop"
@@ -304,6 +326,18 @@
       - "road_user_stop"
       - "out_of_lane"
       - "boundary_departure_prevention"
+      - "static_obstacle_avoidance"
+      - "avoidance_by_lane_change"
+      - "dynamic_obstacle_avoidance"
+      - "surround_obstacle_checker"
+      - "no_drivable_lane"
+      - "obstacle_cruise"
+      - "obstacle_cruise_planner"
+      - "obstacle_stop_planner"
+    # Legit = a deliberate hold.  Recovery must never manoeuvre around a stop line, a
+    # pedestrian crossing, a traffic light, or a collision check that is doing its job.
+    # goal_planner and start_planner are here because stopping at the goal or before pulling
+    # out is the mission working, not a blockage.
     legit_factor_topics:
       - "stop_line"
       - "crosswalk"
@@ -311,6 +345,19 @@
       - "detection_area"
       - "virtual_traffic_light"
       - "road_crossing"
+      - "traffic_light"
+      - "intersection"
+      - "blind_spot"
+      - "merge_from_private"
+      - "no_stopping_area"
+      - "occlusion_spot"
+      - "roundabout"
+      - "goal_planner"
+      - "start_planner"
+      - "lane_change_left"
+      - "lane_change_right"
+      - "rear_collision_checker"
+      - "intersection_collision_checker"
 
     # road_crossing FSM states that mean "it is deliberately holding":
     # ARMED_CROSSWALK(1), REROUTING_TO_ALT(3), ARMED_LIGHT(4), WAIT_GREEN(5),

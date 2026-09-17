@@ -194,6 +194,7 @@ void StuckRecoverySupervisorNode::load_parameters()
   p.abort_release_sec = declare_parameter<double>("abort_release_sec", 5.0);
   p.unknown_stop_clear_hold_sec =
     declare_parameter<double>("unknown_stop_clear_hold_sec", 3.0);
+  p.max_unknown_releases = static_cast<int>(declare_parameter<int64_t>("max_unknown_releases", 3));
   p.abort_shadow_replan_sec = declare_parameter<double>("abort_shadow_replan_sec", 3.0);
   p.abort_retry_sec = declare_parameter<double>("abort_retry_sec", 15.0);
   p.max_abort_retries = static_cast<int>(declare_parameter<int64_t>("max_abort_retries", 3));
@@ -592,6 +593,7 @@ void StuckRecoverySupervisorNode::update_motion()
     // clears the abort-retry budget.  Resetting on entering NOMINAL instead would make
     // the budget meaningless -- every retry passes through NOMINAL by construction.
     abort_retries_ = 0;
+    unknown_releases_ = 0;
   }
   is_stopped_ = stopped_now;
 
@@ -994,12 +996,36 @@ void StuckRecoverySupervisorNode::step_suspect()
         last_sweep_.narrowest_pose.position.y);
       triggerable = true;
     } else if ((now - unknown_clear_since_).seconds() >= param_.unknown_stop_clear_hold_sec) {
+      // [UNKNOWN-RELEASE-BUDGET 2026-09-16] Releasing is right, but releasing FOREVER is
+      // not.  This used to transition straight to NOMINAL -- the only release path in the
+      // node that skipped COOLDOWN -- so the watchdog re-armed on the very next tick, the
+      // still-stationary robot was re-detected, and the whole thing ran again.  Measured
+      // live: NOMINAL -> SUSPECT -> NOMINAL every 12 s, episode counter 164 -> 174 in two
+      // minutes, robot frozen the entire time with its position identical to 15 decimals.
+      //
+      // Two changes.  Go out through COOLDOWN like every other release, and bound the
+      // repeats: once the budget is spent without the robot having moved once, hold and say
+      // so instead of spinning.  The budget resets on observed motion, so a robot that is
+      // actually getting somewhere is never limited.
+      if (unknown_releases_ >= param_.max_unknown_releases) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 10000,
+          "[episode %u] stop is unexplained and the corridor reads clear, but the robot has "
+          "not moved through %d releases -- holding instead of re-arming.  Nothing in "
+          "planning is claiming this stop and recovery has nothing to manoeuvre around; "
+          "this needs a look at what is publishing the zero velocity.",
+          episode_id_, unknown_releases_);
+        return;
+      }
+      ++unknown_releases_;
+      cooldown_until_ = now + rclcpp::Duration::from_seconds(param_.cooldown_sec);
       RCLCPP_INFO(
         get_logger(),
         "[episode %u] stop was unexplained and the corridor has read clear for %.1f s -- "
-        "nothing to recover from; handing back to lane driving",
-        episode_id_, param_.unknown_stop_clear_hold_sec);
-      transition(State::NOMINAL, "unexplained stop, but the way ahead is clear");
+        "nothing to recover from; handing back to lane driving (release %d/%d)",
+        episode_id_, param_.unknown_stop_clear_hold_sec, unknown_releases_,
+        param_.max_unknown_releases);
+      transition(State::COOLDOWN, "unexplained stop, but the way ahead is clear");
       return;
     } else {
       RCLCPP_INFO_THROTTLE(
