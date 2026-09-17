@@ -408,6 +408,13 @@ struct AvoidanceParameters
   // almost everything and stop instead.  See AvoidanceHelper::getSteerableShiftDistance().
   double shift_curvature_ratio{0.5};
 
+  // [DEAD-LINE-ENGAGE 2026-09-17] Distance below which a stop is one the vehicle can never
+  // drive away from, so inserting it would freeze the robot rather than protect it.  Must be
+  // kept at or above the longitudinal controller's own departure condition,
+  // drive_state_stop_dist + drive_state_offset_stop_dist in pid.param.yaml -- the controller
+  // will not leave STOPPED for anything nearer.  See insertReturnDeadLine().
+  double min_engageable_stop_distance{1.5};
+
   std::vector<double> velocity_map;
 
   // Minimum lateral jerk limitation map for avoidance maneuver.

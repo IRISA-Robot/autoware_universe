@@ -192,11 +192,23 @@ public:
     return M_PI * std::sqrt(std::abs(shift_length) / (2.0 * curvature_budget));
   }
 
-  double getMinAvoidanceDistance(const double shift_length) const
+  /// \param bound_by_curvature keep the steering-curvature floor.  True for every caller that
+  ///        is sizing a shift the steering will actually have to follow.  False only for
+  ///        insertReturnDeadLine(), which is not shaping a path at all -- it is deciding where
+  ///        to give up on returning.  The returned path's own steerability is already enforced
+  ///        where the shift line is generated, so applying the floor again at the dead line
+  ///        double-counts it and makes the module give up roughly 1.5 m earlier than it needs
+  ///        to.  Live-confirmed 2026-09-17: that early give-up planted a stop 0.40 m ahead,
+  ///        below the controller's 1.50 m engage distance, and the robot could never move again.
+  double getMinAvoidanceDistance(
+    const double shift_length, const bool bound_by_curvature = true) const
   {
     const auto & p = parameters_;
     const auto from_jerk = autoware::motion_utils::calc_longitudinal_dist_from_jerk(
       shift_length, p->lateral_max_jerk_map.front(), p->velocity_map.front());
+    if (!bound_by_curvature) {
+      return from_jerk;
+    }
     // Whichever is longer.  This is the ONE definition of "shortest distance this shift
     // can be done in" -- every caller, from the close-range rescue to the stoppability
     // judgement, inherits the correction from here.

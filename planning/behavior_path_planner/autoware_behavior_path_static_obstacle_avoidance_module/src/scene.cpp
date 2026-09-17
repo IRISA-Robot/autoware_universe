@@ -2100,12 +2100,39 @@ void StaticObstacleAvoidanceModule::insertReturnDeadLine(
     shifted_path.path.points, getEgoPosition(), shifted_path.path.points.size() - 1);
   const auto buffer = std::max(0.0, to_shifted_path_end - to_reference_path_end);
 
-  const auto min_return_distance =
-    helper_->getMinAvoidanceDistance(shift_length) + helper_->getNominalPrepareDistance(0.0);
+  // [DEAD-LINE-ENGAGE 2026-09-17] The curvature floor is deliberately NOT applied here -- see
+  // getMinAvoidanceDistance()'s bound_by_curvature parameter.  This line is not shaping a path,
+  // it is deciding where to give up on returning, and the shift line generator already holds the
+  // returned path to the same floor.  Counting it twice pushed this dead line ~1.5 m nearer the
+  // robot than the geometry requires.
+  const auto min_return_distance = helper_->getMinAvoidanceDistance(shift_length, false) +
+                                   helper_->getNominalPrepareDistance(0.0);
   const auto to_stop_line = data.to_return_point - min_return_distance - buffer;
   if (to_stop_line < -1.0 * parameters_->stop_buffer) {
     RCLCPP_WARN_THROTTLE(
       getLogger(), *clock_, 3000, "ego overran return shift dead line. do nothing.");
+    return;
+  }
+
+  // [DEAD-LINE-ENGAGE 2026-09-17] A stop the vehicle can never drive away from is not a dead
+  // line, it is a trap.  The PID longitudinal controller leaves STOPPED only once the distance
+  // to the stop exceeds drive_state_stop_dist + drive_state_offset_stop_dist; a dead line nearer
+  // than that stops the robot at a spot where the very motion needed to clear the dead line has
+  // been forbidden, and the two lock each other permanently.  Live-confirmed on this robot: dead
+  // line at 0.40 m against a 1.50 m engage distance, every target object already behind the
+  // robot and avoid_required false for all of them, yet the module went on holding a return
+  // shift that waited on an ego displacement which could no longer change.
+  //
+  // Declining to insert leaves the robot displaced by at most max_deviation_from_lane, which is
+  // the deviation this vehicle is already configured to tolerate -- a far smaller cost than a
+  // robot that cannot be recovered without an operator.
+  if (to_stop_line < parameters_->min_engageable_stop_distance) {
+    RCLCPP_WARN_THROTTLE(
+      getLogger(), *clock_, 3000,
+      "[DEAD-LINE-ENGAGE] return dead line is %.2f m ahead, nearer than the %.2f m the "
+      "controller needs to depart from a stop. Not inserting it: the robot could never leave it, "
+      "and the return this line exists to enforce needs that motion to happen at all.",
+      to_stop_line, parameters_->min_engageable_stop_distance);
     return;
   }
 

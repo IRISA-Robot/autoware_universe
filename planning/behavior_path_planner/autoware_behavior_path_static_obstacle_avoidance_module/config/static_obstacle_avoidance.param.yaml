@@ -360,6 +360,10 @@
       constraints:
         # lateral constraints
         lateral:
+          # Both of these are read with get_or_declare_parameter and have no default at the
+          # call site, so they must exist in whichever copy of this file is actually loaded.
+          shift_curvature_ratio: 0.5                    # [-] see AvoidanceHelper::getSteerableShiftDistance()
+          min_engageable_stop_distance: 1.5             # [m] see insertReturnDeadLine(); keep >= pid.param.yaml's drive_state_stop_dist + drive_state_offset_stop_dist
           velocity: [1.39, 4.17, 11.1]                   # [m/s]
           max_accel_values: [0.5, 0.5, 0.5]             # [m/ss]
           min_jerk_values:
