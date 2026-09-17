@@ -21,6 +21,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <optional>
+#include <vector>
 
 namespace autoware::behavior_path_planner::reverse_lane_follow_utils
 {
@@ -75,6 +77,67 @@ bool isHeadingContinuousAcross(
   const double diff = std::abs(autoware_utils::normalize_radian(entry_tangent - exit_tangent));
   return diff < kMaxContinuousHeadingChangeRad;
 }
+
+// [SEAM-FOLD 2026-09-17] Drop points that do not advance along the path.
+//
+// getCenterLinePath() concatenates the centreline of each lanelet in the sequence end to end, and
+// it assumes those centrelines meet at the seam.  On this map they do not: live-captured on route
+// lanelets 193(inv) 206(inv) 21(inv), lanelet 206's centreline ends at (-25.083, 26.612) while
+// lanelet 21's begins at (-24.392, 27.100) -- 0.85 m *behind* it along the direction of travel.
+// Concatenated as-is the path advances, jumps 0.85 m backwards at the seam, then advances again
+// on the same heading, which reads downstream as a 175.8 degree direction reversal.
+//
+// This is invisible to every check further on: resamplePath() accumulates arc length from
+// UNSIGNED distances, so a fold still looks like a monotonically increasing s, and
+// insertOrientation() faithfully reports the reversal as a ~180 degree yaw step between
+// neighbouring points.  Live-confirmed consequence: the controller's nearest-point search locks
+// onto the wrong side of the fold and the reference jumps (1.12 m of reference movement against
+// 0.04 m of robot movement), which is the sharp steering swing seen on the vehicle.
+//
+// Note the heading check upstream (isHeadingContinuousAcross) is NOT at fault and does not catch
+// this: the headings either side of the seam are the same, it is only the positions that overlap.
+//
+// A point is dropped when the step to it turns more than max_reversal_rad away from the direction
+// already being travelled.  At the ~1 m point spacing these centrelines use, no legitimate curve
+// on a vehicle that cannot rotate in place comes close to that, so only true backtracking is
+// removed.
+void dropNonAdvancingPoints(PathWithLaneId & path, const double max_reversal_rad)
+{
+  constexpr double min_step_length = 1.0e-3;
+  if (path.points.size() < 3) {
+    return;
+  }
+
+  std::vector<autoware_internal_planning_msgs::msg::PathPointWithLaneId> kept;
+  kept.reserve(path.points.size());
+  kept.push_back(path.points.front());
+
+  std::optional<double> travel_dir;
+  for (size_t i = 1; i < path.points.size(); ++i) {
+    const auto & from = kept.back().point.pose.position;
+    const auto & to = path.points[i].point.pose.position;
+    const double dx = to.x - from.x;
+    const double dy = to.y - from.y;
+    const double ds = std::hypot(dx, dy);
+    if (ds < min_step_length) {
+      continue;  // duplicate of the point already kept
+    }
+    const double dir = std::atan2(dy, dx);
+    if (travel_dir) {
+      const double raw = dir - *travel_dir;
+      if (std::abs(std::atan2(std::sin(raw), std::cos(raw))) > max_reversal_rad) {
+        continue;  // this point lies behind the one already kept -- a seam overlap
+      }
+    }
+    travel_dir = dir;
+    kept.push_back(path.points[i]);
+  }
+
+  if (kept.size() >= 2) {
+    path.points = std::move(kept);
+  }
+}
+
 }  // namespace
 
 std::optional<TraveledTail> extractTraveledTailPath(
@@ -228,22 +291,64 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
     // built from an unrelated/bled window -- fall back to just current_lanelet itself.
     lanelet_sequence = {current_lanelet};
   } else {
+    // [PREFERRED-ONLY 2026-09-17] Stop the walk at any lanelet the mission planner did not
+    // actually choose.
+    //
+    // getLaneletSequence() is already route-filtered, but it filters against
+    // RouteHandler::route_lanelets_, which setLaneletsFromRouteMsg() fills with EVERY primitive of
+    // every route segment -- the alternatives included. Only preferred_lanelets_ holds the ones
+    // the mission planner picked, and nothing on the path-building side consults it. So on a map
+    // with deliberately overlapping lanelets the routing graph can chain a chosen lanelet straight
+    // into an unchosen one that covers the same ground, and the "is it in the route" test waves it
+    // through. Live-captured here: 193(inv) 206(inv) 21(inv), where lanelet 21's centreline begins
+    // 0.85 m BEHIND where 206's ends, which is the seam that folded the path.
+    //
+    // This module follows one reference path in reverse; it never changes lane, so it has no use
+    // for the alternative primitives that the wider filter deliberately keeps. Narrowing here (and
+    // only here) leaves lane change and avoidance -- which genuinely need those neighbours -- alone.
+    const auto preferred_lanelets = route_handler->getPreferredLanelets();
+    const auto is_preferred = [&preferred_lanelets](const lanelet::ConstLanelet & llt) {
+      return std::any_of(
+        preferred_lanelets.begin(), preferred_lanelets.end(), [&llt](const auto & pref) {
+          return pref.id() == llt.id() && pref.inverted() == llt.inverted();
+        });
+    };
+    // If ego itself is sitting on an unchosen primitive, narrowing would strand this module on a
+    // single lanelet. Fall back to the old, unnarrowed behaviour in that case -- a longer window
+    // built from route lanelets is still far better than no window at all.
+    const bool apply_preferred_filter = is_preferred(current_lanelet);
+
     size_t begin_idx = current_idx;
     while (begin_idx > 0 &&
            isHeadingContinuousAcross(
-             lanelet_sequence_raw[begin_idx - 1], lanelet_sequence_raw[begin_idx])) {
+             lanelet_sequence_raw[begin_idx - 1], lanelet_sequence_raw[begin_idx]) &&
+           (!apply_preferred_filter || is_preferred(lanelet_sequence_raw[begin_idx - 1]))) {
       --begin_idx;
     }
     size_t end_idx = current_idx;  // inclusive
-    while (end_idx + 1 < lanelet_sequence_raw.size() &&
-           isHeadingContinuousAcross(
-             lanelet_sequence_raw[end_idx], lanelet_sequence_raw[end_idx + 1])) {
+    bool stopped_on_heading = false;
+    while (end_idx + 1 < lanelet_sequence_raw.size()) {
+      if (!isHeadingContinuousAcross(
+            lanelet_sequence_raw[end_idx], lanelet_sequence_raw[end_idx + 1])) {
+        stopped_on_heading = true;
+        break;
+      }
+      if (apply_preferred_filter && !is_preferred(lanelet_sequence_raw[end_idx + 1])) {
+        break;  // an unchosen primitive -- stop, but this is NOT a gear-change boundary
+      }
       ++end_idx;
     }
-    // The forward walk above only ever stops early (before exhausting lanelet_sequence_raw)
-    // because isHeadingContinuousAcross() returned false right there -- i.e. this *is* a genuine
-    // discontinuity, not just the edge of the requested forward_distance_m window.
-    forward_end_is_genuine_discontinuity = (end_idx + 1 < lanelet_sequence_raw.size());
+    // Only a heading break is a genuine discontinuity the vehicle must stop and change gear for.
+    // Running into an unchosen primitive is just the edge of the window this module should use, so
+    // it must NOT force the zero-velocity handoff below -- doing so would brake for nothing.
+    forward_end_is_genuine_discontinuity = stopped_on_heading;
+    if (apply_preferred_filter && end_idx + 1 < lanelet_sequence_raw.size() && !stopped_on_heading) {
+      RCLCPP_WARN_THROTTLE(
+        logger, steady_clock, 3000,
+        "[PREFERRED-ONLY] window stopped at lanelet %ld: the next one (%ld) is in the route but is "
+        "not the segment's preferred primitive. Building the reverse path from chosen lanelets only.",
+        lanelet_sequence_raw[end_idx].id(), lanelet_sequence_raw[end_idx + 1].id());
+    }
     lanelet_sequence = lanelet::ConstLanelets(
       lanelet_sequence_raw.begin() + static_cast<std::ptrdiff_t>(begin_idx),
       lanelet_sequence_raw.begin() + static_cast<std::ptrdiff_t>(end_idx) + 1);
@@ -286,6 +391,20 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
       logger, steady_clock, 2000,
       "[BIDIR-DEBUG] buildRouteReversedFollowPath: getCenterLinePath returned EMPTY path");
     return std::nullopt;
+  }
+
+  // [SEAM-FOLD 2026-09-17] Remove the backward step the lanelet seams leave behind -- see
+  // dropNonAdvancingPoints() for the measured geometry and why nothing downstream would catch it.
+  {
+    const size_t before = path.points.size();
+    dropNonAdvancingPoints(path, M_PI / 2.0);
+    if (path.points.size() != before) {
+      RCLCPP_WARN_THROTTLE(
+        logger, steady_clock, 2000,
+        "[SEAM-FOLD] dropped %zu point(s) that stepped backwards where the lanelet centrelines "
+        "overlap; path %zu -> %zu points",
+        before - path.points.size(), before, path.points.size());
+    }
   }
 
   for (auto & path_point : path.points) {
