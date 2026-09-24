@@ -55,6 +55,13 @@ struct AstarParam
   double smoothness_weight;
   double obstacle_distance_weight;
   double goal_lat_distance_weight;
+
+  // Shortest leg a solution with direction changes may have [m].  0 = no limit.  A vehicle
+  // stops at every cusp and has to set off again, and a controller will not start towards
+  // a stop point closer than its departure distance: a plan with a shorter leg cannot be
+  // driven.  The search expands in steps of expansion_distance, so without this the
+  // cheapest cusp is routinely a single 0.5 m step.
+  double min_leg_length{0.0};
 };
 
 struct AstarNode
@@ -116,7 +123,8 @@ public:
         node.declare_parameter<double>("astar.distance_heuristic_weight"),
         node.declare_parameter<double>("astar.smoothness_weight"),
         node.declare_parameter<double>("astar.obstacle_distance_weight"),
-        node.declare_parameter<double>("astar.goal_lat_distance_weight")},
+        node.declare_parameter<double>("astar.goal_lat_distance_weight"),
+        node.declare_parameter<double>("astar.min_leg_length_m", 0.0)},
       node.get_clock())
   {
   }
@@ -137,6 +145,7 @@ private:
   void setCollisionFreeDistanceMap();
   bool search();
   void expandNodes(AstarNode & current_node, const bool is_back = false);
+  bool lastLegIsLongEnough(const AstarNode & node) const;
   void resetData();
   void setPath(const AstarNode & goal);
   void setStartNode(const double cost_offset = 0.0);

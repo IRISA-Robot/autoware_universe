@@ -62,7 +62,10 @@ bool RRTStar::makePlan(
     const int index_x = std::round(pose.x / costmap_.info.resolution);
     const int index_y = std::round(pose.y / costmap_.info.resolution);
     const int index_theta = discretizeAngle(pose.yaw, planner_common_param_.theta_size);
-    return !detectCollision(IndexXYT{index_x, index_y, index_theta});
+    geometry_msgs::msg::Pose pose_local;
+    pose_local.position.x = pose.x;
+    pose_local.position.y = pose.y;
+    return !detectCollisionWithEscape(IndexXYT{index_x, index_y, index_theta}, pose_local);
   };
 
   const rrtstar_core::Pose lo{0, 0, 0};
@@ -75,7 +78,7 @@ bool RRTStar::makePlan(
   const auto x_start = poseMsgToPose(start_pose_);
   const auto x_goal = poseMsgToPose(goal_pose_);
 
-  if (!is_obstacle_free(x_start)) {
+  if (!acceptStartPose(start_pose) || !is_obstacle_free(x_start)) {
     return false;
   }
 
@@ -122,7 +125,7 @@ bool RRTStar::hasObstacleOnTrajectory(const geometry_msgs::msg::PoseArray & traj
 {
   for (const auto & pose : trajectory.poses) {
     const auto pose_local = global2local(costmap_, pose);
-    if (detectCollision(pose_local)) {
+    if (detectCollisionWithEscape(pose_local)) {
       return true;
     }
   }

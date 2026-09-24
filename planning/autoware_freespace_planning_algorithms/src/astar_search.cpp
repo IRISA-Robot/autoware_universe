@@ -148,7 +148,7 @@ bool AstarSearch::makePlan(const Pose & start_pose, const Pose & goal_pose)
   start_pose_ = global2local(costmap_, start_pose);
   goal_pose_ = global2local(costmap_, goal_pose);
 
-  if (detectCollision(start_pose_) || detectCollision(goal_pose_)) {
+  if (!acceptStartPose(start_pose) || detectCollision(goal_pose_)) {
     throw std::logic_error("Invalid start or goal pose");
   }
 
@@ -188,7 +188,7 @@ bool AstarSearch::makePlan(
     goals_local.push_back(goal_local);
   }
 
-  if (detectCollision(start_pose_) || goals_local.empty()) {
+  if (!acceptStartPose(start_pose) || goals_local.empty()) {
     throw std::logic_error("Invalid start or goal pose");
   }
 
@@ -305,7 +305,7 @@ bool AstarSearch::search()
     if (current_node->status == NodeStatus::Closed) continue;
     current_node->status = NodeStatus::Closed;
 
-    if (isGoal(*current_node)) {
+    if (isGoal(*current_node) && lastLegIsLongEnough(*current_node)) {
       goal_node_ = current_node;
       setPath(*current_node);
       return true;
@@ -341,11 +341,18 @@ void AstarSearch::expandNodes(AstarNode & current_node, const bool is_back)
     if (isOutOfRange(next_index) || isObs(next_index)) continue;
 
     AstarNode * next_node = &graph_[getKey(next_index)];
-    if (next_node->status == NodeStatus::Closed || detectCollision(next_index)) continue;
+    if (
+      next_node->status == NodeStatus::Closed || detectCollisionWithEscape(next_index, next_pose))
+      continue;
 
     const auto obs_edt = getObstacleEDT(next_index);
     const bool is_direction_switch =
       (current_node.parent != nullptr) && (is_back != current_node.is_back);
+    // The leg ending here is current_node.dir_distance long; a cusp after a shorter one
+    // makes the solution undrivable, however cheap it is.
+    if (is_direction_switch && current_node.dir_distance + 1e-3 < astar_param_.min_leg_length) {
+      continue;
+    }
 
     double total_weight = 1.0;
     total_weight += getSteeringCost(steering_index);
@@ -371,6 +378,23 @@ void AstarSearch::expandNodes(AstarNode & current_node, const bool is_back)
       continue;
     }
   }
+}
+
+bool AstarSearch::lastLegIsLongEnough(const AstarNode & node) const
+{
+  // The cusp check in expandNodes() covers every leg but the last one, which ends at the
+  // goal instead of at a cusp.  It only matters when there was a cusp before it.  The start
+  // node is left out: its direction flag is a default, not a direction it travelled.
+  if (astar_param_.min_leg_length <= 0.0 || node.dir_distance + 1e-3 >= astar_param_.min_leg_length) {
+    return true;
+  }
+  for (const AstarNode * n = &node; n->parent != nullptr && n->parent->parent != nullptr;
+       n = n->parent) {
+    if (n->is_back != n->parent->is_back) {
+      return false;
+    }
+  }
+  return true;
 }
 
 double AstarSearch::getExpansionDistance(const AstarNode & current_node) const

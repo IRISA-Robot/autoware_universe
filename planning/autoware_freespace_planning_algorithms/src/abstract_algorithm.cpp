@@ -132,7 +132,19 @@ void AbstractPlanningAlgorithm::setMap(const nav_msgs::msg::OccupancyGrid & cost
       coll_indexes_table_.push_back(indexes_2d);
       vertex_indexes_table_.push_back(vertex_indexes_2d);
     }
+    if (escape_radius_ > 0.0) {
+      for (int i = 0; i < planner_common_param_.theta_size; i++) {
+        std::vector<IndexXY> indexes_2d, vertex_indexes_2d;
+        computeCollisionIndexes(escape_shape_, i, indexes_2d, vertex_indexes_2d);
+        escape_coll_indexes_table_.push_back(indexes_2d);
+        escape_vertex_indexes_table_.push_back(vertex_indexes_2d);
+      }
+    }
     is_collision_table_initialized = true;
+  }
+  if (escape_active_) {
+    escape_center_local_ = global2local(costmap_, escape_center_global_);
+    rebuildEscapeMask();
   }
 
   const double base2front = collision_vehicle_shape_.length - collision_vehicle_shape_.base2back;
@@ -231,8 +243,14 @@ void AbstractPlanningAlgorithm::computeCollisionIndexes(
   int theta_index, std::vector<IndexXY> & indexes_2d,
   std::vector<IndexXY> & vertex_indexes_2d) const
 {
+  computeCollisionIndexes(collision_vehicle_shape_, theta_index, indexes_2d, vertex_indexes_2d);
+}
+
+void AbstractPlanningAlgorithm::computeCollisionIndexes(
+  const VehicleShape & vehicle_shape, int theta_index, std::vector<IndexXY> & indexes_2d,
+  std::vector<IndexXY> & vertex_indexes_2d) const
+{
   IndexXYT base_index{0, 0, theta_index};
-  const VehicleShape & vehicle_shape = collision_vehicle_shape_;
 
   // Define the robot as rectangle
   const double back = -1.0 * vehicle_shape.base2back;
@@ -295,8 +313,15 @@ void AbstractPlanningAlgorithm::computeCollisionIndexes(
 
 bool AbstractPlanningAlgorithm::detectBoundaryExit(const IndexXYT & base_index) const
 {
+  return detectBoundaryExit(base_index, vertex_indexes_table_);
+}
+
+bool AbstractPlanningAlgorithm::detectBoundaryExit(
+  const IndexXYT & base_index,
+  const std::vector<std::vector<IndexXY>> & vertex_indexes_table) const
+{
   if (isWithinMargin(base_index)) return false;
-  const auto & vertex_indexes_2d = vertex_indexes_table_[base_index.theta];
+  const auto & vertex_indexes_2d = vertex_indexes_table[base_index.theta];
   for (const auto & vertex_index_2d : vertex_indexes_2d) {
     IndexXY vertex_index{vertex_index_2d.x, vertex_index_2d.y};
     // must slide to current base position
@@ -321,17 +346,25 @@ bool AbstractPlanningAlgorithm::detectCollision(const IndexXYT & base_index) con
     std::cerr << "[abstract_algorithm] setMap has not yet been done." << std::endl;
     return false;
   }
+  return detectCollisionWithShape(
+    base_index, collision_vehicle_shape_, coll_indexes_table_, vertex_indexes_table_);
+}
 
-  if (detectBoundaryExit(base_index)) return true;
+bool AbstractPlanningAlgorithm::detectCollisionWithShape(
+  const IndexXYT & base_index, const VehicleShape & vehicle_shape,
+  const std::vector<std::vector<IndexXY>> & coll_indexes_table,
+  const std::vector<std::vector<IndexXY>> & vertex_indexes_table) const
+{
+  if (detectBoundaryExit(base_index, vertex_indexes_table)) return true;
 
   double obstacle_edt = getObstacleEDT(base_index).distance;
 
   // if nearest obstacle is further than largest dimension, no collision is guaranteed
   // if nearest obstacle is closer than smallest dimension, collision is guaranteed
-  if (obstacle_edt > collision_vehicle_shape_.max_dimension) return false;
-  if (obstacle_edt < collision_vehicle_shape_.min_dimension) return true;
+  if (obstacle_edt > vehicle_shape.max_dimension) return false;
+  if (obstacle_edt < vehicle_shape.min_dimension) return true;
 
-  const auto & coll_indexes_2d = coll_indexes_table_[base_index.theta];
+  const auto & coll_indexes_2d = coll_indexes_table[base_index.theta];
   for (const auto & coll_index_2d : coll_indexes_2d) {
     IndexXY coll_index{coll_index_2d.x, coll_index_2d.y};
     // must slide to current base position
@@ -346,12 +379,136 @@ bool AbstractPlanningAlgorithm::detectCollision(const IndexXYT & base_index) con
   return false;
 }
 
+void AbstractPlanningAlgorithm::setStartEscape(
+  const VehicleShape & escape_shape, const double radius, const double max_start_overlap_ratio)
+{
+  escape_shape_ = escape_shape;
+  escape_shape_.setMinMaxDimension();
+  escape_radius_ = std::max(radius, 0.0);
+  escape_max_overlap_ratio_ = std::clamp(max_start_overlap_ratio, 0.0, 1.0);
+  escape_active_ = false;
+  escape_overlap_cells_global_.clear();
+  escape_overlap_mask_.clear();
+  escape_start_overlap_ = 0;
+  escape_coll_indexes_table_.clear();
+  escape_vertex_indexes_table_.clear();
+  // The tables depend on the costmap resolution, so they are (re)built on the next setMap().
+  coll_indexes_table_.clear();
+  vertex_indexes_table_.clear();
+  is_collision_table_initialized = false;
+}
+
+bool AbstractPlanningAlgorithm::detectCollisionWithEscape(
+  const IndexXYT & base_index, const geometry_msgs::msg::Pose & pose_local) const
+{
+  if (
+    escape_active_ && !escape_coll_indexes_table_.empty() &&
+    std::hypot(
+      pose_local.position.x - escape_center_local_.position.x,
+      pose_local.position.y - escape_center_local_.position.y) <= escape_radius_) {
+    return detectEscapeCollision(base_index);
+  }
+  return detectCollision(base_index);
+}
+
+bool AbstractPlanningAlgorithm::detectEscapeCollision(const IndexXYT & base_index) const
+{
+  if (escape_start_overlap_ == 0) {
+    return detectCollisionWithShape(
+      base_index, escape_shape_, escape_coll_indexes_table_, escape_vertex_indexes_table_);
+  }
+  // No EDT shortcut here: the distance map counts the ignored cells as obstacles, so "an
+  // obstacle is closer than the smallest dimension" says nothing any more.
+  if (detectBoundaryExit(base_index, escape_vertex_indexes_table_)) return true;
+  size_t overlap = 0;
+  for (const auto & offset : escape_coll_indexes_table_[base_index.theta]) {
+    const IndexXY cell{offset.x + base_index.x, offset.y + base_index.y};
+    if (isOutOfRange(cell) || !isObs(cell)) continue;
+    const int id = indexToId(cell);
+    if (id < 0 || static_cast<size_t>(id) >= escape_overlap_mask_.size() || !escape_overlap_mask_[id]) {
+      return true;  // an obstacle cell the robot was not already on
+    }
+    if (++overlap > escape_start_overlap_) return true;  // further into it than at the start
+  }
+  return false;
+}
+
+void AbstractPlanningAlgorithm::rebuildEscapeMask()
+{
+  escape_overlap_mask_.assign(costmap_.data.size(), false);
+  for (const auto & cell_global : escape_overlap_cells_global_) {
+    const auto cell_local = global2local(costmap_, cell_global);
+    const IndexXY cell{
+      static_cast<int>(std::floor(cell_local.position.x / costmap_.info.resolution)),
+      static_cast<int>(std::floor(cell_local.position.y / costmap_.info.resolution))};
+    if (isOutOfRange(cell)) continue;
+    escape_overlap_mask_[indexToId(cell)] = true;
+  }
+}
+
+bool AbstractPlanningAlgorithm::detectCollisionWithEscape(
+  const geometry_msgs::msg::Pose & pose_local) const
+{
+  return detectCollisionWithEscape(
+    pose2index(costmap_, pose_local, planner_common_param_.theta_size), pose_local);
+}
+
+bool AbstractPlanningAlgorithm::acceptStartPose(const geometry_msgs::msg::Pose & start_pose_global)
+{
+  escape_active_ = false;
+  const auto start_local = global2local(costmap_, start_pose_global);
+  if (!detectCollision(start_local)) {
+    return true;
+  }
+  if (escape_radius_ <= 0.0 || escape_coll_indexes_table_.empty()) {
+    return false;
+  }
+  const auto index = pose2index(costmap_, start_local, planner_common_param_.theta_size);
+  escape_overlap_cells_global_.clear();
+  escape_overlap_mask_.clear();
+  escape_start_overlap_ = 0;
+  if (detectCollisionWithShape(
+        index, escape_shape_, escape_coll_indexes_table_, escape_vertex_indexes_table_)) {
+    // The robot itself, not just its margin, covers obstacle cells.  Only acceptable when it
+    // is a sliver of the footprint -- a robot touching something -- and never off the grid.
+    if (escape_max_overlap_ratio_ <= 0.0 || detectBoundaryExit(index, escape_vertex_indexes_table_)) {
+      return false;
+    }
+    const auto & footprint = escape_coll_indexes_table_[index.theta];
+    for (const auto & offset : footprint) {
+      const IndexXY cell{offset.x + index.x, offset.y + index.y};
+      if (isOutOfRange(cell) || !isObs(cell)) continue;
+      geometry_msgs::msg::Pose cell_local;
+      cell_local.position.x = (cell.x + 0.5) * costmap_.info.resolution;
+      cell_local.position.y = (cell.y + 0.5) * costmap_.info.resolution;
+      cell_local.orientation.w = 1.0;
+      escape_overlap_cells_global_.push_back(local2global(costmap_, cell_local));
+    }
+    const double ratio = footprint.empty() ? 1.0
+                                           : static_cast<double>(escape_overlap_cells_global_.size()) /
+                                               static_cast<double>(footprint.size());
+    if (ratio > escape_max_overlap_ratio_) {
+      escape_overlap_cells_global_.clear();
+      return false;
+    }
+    escape_start_overlap_ = escape_overlap_cells_global_.size();
+    rebuildEscapeMask();
+  }
+  escape_active_ = true;
+  escape_center_global_ = start_pose_global;
+  escape_center_local_ = start_local;
+  return true;
+}
+
 bool AbstractPlanningAlgorithm::hasObstacleOnTrajectory(
   const geometry_msgs::msg::PoseArray & trajectory) const
 {
+  // The escape stays armed for the plan it was used to make: its opening poses are inside
+  // the full margin by construction, and judging them by it would call the plan blocked on
+  // every tick and replan it away before the robot had moved.
   for (const auto & pose : trajectory.poses) {
     const auto pose_local = global2local(costmap_, pose);
-    if (detectCollision(pose_local)) {
+    if (detectCollisionWithEscape(pose_local)) {
       return true;
     }
   }

@@ -190,15 +190,61 @@ public:
   const PlannerWaypoints & getWaypoints() const { return waypoints_; }
   double getDistanceToObstacle(const geometry_msgs::msg::Pose & pose) const;
 
+  /// Start escape.  Off unless this is called with a radius above zero.
+  ///
+  /// A robot that has ended up closer to an obstacle than the collision margin cannot be
+  /// planned for at all -- its start pose "collides" -- although that is exactly the case
+  /// where a way out is needed most.  With this set, a start that collides under the full
+  /// shape but not under `escape_shape` is accepted, and every pose within `radius` of it is
+  /// checked against `escape_shape`.  Everything further out keeps the full shape, so the
+  /// relaxation only ever buys the robot its way out of where it already is.  A start that
+  /// is free under the full shape plans exactly as before.
+  ///
+  /// `max_start_overlap_ratio` > 0 goes one step further, for a robot whose footprint
+  /// already covers obstacle cells -- on a coarse grid an obstacle a few centimetres off the
+  /// bumper fills a cell under it.  Those cells, and only those, are ignored inside the
+  /// radius, provided they are at most this fraction of the footprint, and no pose there may
+  /// cover more of them than the start did.  The robot may leave what it stands on; it may
+  /// not go further into it.
+  void setStartEscape(
+    const VehicleShape & escape_shape, const double radius,
+    const double max_start_overlap_ratio = 0.0);
+  /// True when the last makePlan() had to use the start escape.
+  bool isStartEscapeActive() const { return escape_active_; }
+  /// How many obstacle cells the start footprint covered when the last plan was made.
+  size_t getStartEscapeOverlap() const { return escape_start_overlap_; }
+
   virtual ~AbstractPlanningAlgorithm() {}
 
 protected:
   void computeCollisionIndexes(
     int theta_index, std::vector<IndexXY> & indexes,
     std::vector<IndexXY> & vertex_indexes_2d) const;
+  void computeCollisionIndexes(
+    const VehicleShape & vehicle_shape, int theta_index, std::vector<IndexXY> & indexes,
+    std::vector<IndexXY> & vertex_indexes_2d) const;
+  bool detectCollisionWithShape(
+    const IndexXYT & base_index, const VehicleShape & vehicle_shape,
+    const std::vector<std::vector<IndexXY>> & coll_indexes_table,
+    const std::vector<std::vector<IndexXY>> & vertex_indexes_table) const;
+  /// The escape-zone check: escape shape, with the cells the start already covered ignored
+  /// as long as no more of them are covered than at the start.
+  bool detectEscapeCollision(const IndexXYT & base_index) const;
+  void rebuildEscapeMask();
   bool detectBoundaryExit(const IndexXYT & base_index) const;
+  bool detectBoundaryExit(
+    const IndexXYT & base_index,
+    const std::vector<std::vector<IndexXY>> & vertex_indexes_table) const;
   bool detectCollision(const IndexXYT & base_index) const;
   bool detectCollision(const geometry_msgs::msg::Pose & base_pose) const;
+  /// detectCollision(), except inside the start-escape radius, where the escape shape is used.
+  /// `pose_local` is the pose `base_index` was made from, in costmap-local coordinates.
+  bool detectCollisionWithEscape(
+    const IndexXYT & base_index, const geometry_msgs::msg::Pose & pose_local) const;
+  bool detectCollisionWithEscape(const geometry_msgs::msg::Pose & pose_local) const;
+  /// Decide whether planning may start from `start_pose_global`.  Returns false when it may
+  /// not; otherwise arms or disarms the start escape for this plan.
+  bool acceptStartPose(const geometry_msgs::msg::Pose & start_pose_global);
 
   // cspell: ignore Toriwaki
   /// @brief Computes the euclidean distance to the nearest obstacle for each grid cell.
@@ -298,12 +344,29 @@ protected:
   geometry_msgs::msg::Pose goal_pose_;
 
   // Is collision table initalized
-  bool is_collision_table_initialized;
+  bool is_collision_table_initialized{false};
 
   // result path
   PlannerWaypoints waypoints_;
 
   int nb_of_margin_cells_;
+
+  // start escape (see setStartEscape)
+  double escape_radius_{0.0};
+  VehicleShape escape_shape_{};
+  std::vector<std::vector<IndexXY>> escape_coll_indexes_table_;
+  std::vector<std::vector<IndexXY>> escape_vertex_indexes_table_;
+  bool escape_active_{false};
+  double escape_max_overlap_ratio_{0.0};
+  // Obstacle cells under the start footprint, as cell centres in the costmap's parent frame
+  // (the grid moves with the robot), and the same set as a per-cell mask of the current map.
+  std::vector<geometry_msgs::msg::Pose> escape_overlap_cells_global_;
+  std::vector<bool> escape_overlap_mask_;
+  size_t escape_start_overlap_{0};
+  // Kept in the costmap's parent frame: the recovery costmap moves with the robot, so a
+  // local copy would drift away from the real start between maps.
+  geometry_msgs::msg::Pose escape_center_global_{};
+  geometry_msgs::msg::Pose escape_center_local_{};
 };
 
 }  // namespace autoware::freespace_planning_algorithms
