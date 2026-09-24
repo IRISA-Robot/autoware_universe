@@ -38,12 +38,30 @@
     cluster_minimum_height: 0.1
     minimum_cluster_size: 10
     maximum_cluster_size: 10000
+    # Distance-weighted cluster size.  With enable, a cluster counts as an obstacle when the
+    # SUM of its points' weights reaches minimum_weighted_size.  A point's weight grows as it
+    # gets closer to the vehicle body (distance to the footprint rectangle, 0 inside it):
+    #   w = clamp(reference_distance / d, 1, max_weight)
+    # so points beyond reference_distance count 1 (same as minimum_cluster_size), and a point
+    # within reference_distance / max_weight counts max_weight.  With 2.0 / 5.0 / 30: far
+    # away 30 points are needed, as before; within 0.4 m of the body 6 are enough -- a near
+    # obstacle shows few lidar points but is the one that matters.  minimum_raw_points is the
+    # noise floor for the clustering itself.  minimum_cluster_size is unused while enabled.
+    weighted_cluster:
+      enable: false
+      reference_distance: 2.0     # [m]
+      max_weight: 5.0             # [-]
+      minimum_weighted_size: 30.0 # [-] the threshold
+      minimum_raw_points: 3       # [points]
 
     # RSS distance collision check
     longitudinal_offset_margin: 1.0
     t_response: 1.0
     a_ego_min: -3.0
     a_obj_min: -1.0
+    # Onset hysteresis: a collision must be seen continuously for this long before the brake
+    # goes on.  Release is collision_keeping_sec.  0 = brake on the first frame (upstream).
+    collision_onset_sec: 0.0
     collision_keeping_sec: 3.0
     previous_obstacle_keep_time: 1.0
     aeb_hz: 10.0

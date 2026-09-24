@@ -189,6 +189,16 @@ AEB::AEB(const rclcpp::NodeOptions & node_options)
   cluster_minimum_height_ = declare_parameter<double>("cluster_minimum_height");
   minimum_cluster_size_ = declare_parameter<int>("minimum_cluster_size");
   maximum_cluster_size_ = declare_parameter<int>("maximum_cluster_size");
+  // Defaulted so a param file without them keeps the upstream behaviour exactly.
+  use_weighted_cluster_size_ = declare_parameter<bool>("weighted_cluster.enable", false);
+  weighted_cluster_reference_distance_ =
+    declare_parameter<double>("weighted_cluster.reference_distance", 2.0);
+  weighted_cluster_max_weight_ = declare_parameter<double>("weighted_cluster.max_weight", 5.0);
+  minimum_weighted_cluster_size_ =
+    declare_parameter<double>("weighted_cluster.minimum_weighted_size", 30.0);
+  weighted_cluster_min_raw_points_ =
+    declare_parameter<int>("weighted_cluster.minimum_raw_points", 3);
+  collision_onset_sec_ = declare_parameter<double>("collision_onset_sec", 0.0);
 
   imu_prediction_time_horizon_ = declare_parameter<double>("imu_prediction_time_horizon");
   imu_prediction_time_interval_ = declare_parameter<double>("imu_prediction_time_interval");
@@ -253,6 +263,15 @@ rcl_interfaces::msg::SetParametersResult AEB::onParameter(
   update_param<double>(parameters, "cluster_minimum_height", cluster_minimum_height_);
   update_param<int>(parameters, "minimum_cluster_size", minimum_cluster_size_);
   update_param<int>(parameters, "maximum_cluster_size", maximum_cluster_size_);
+  update_param<bool>(parameters, "weighted_cluster.enable", use_weighted_cluster_size_);
+  update_param<double>(
+    parameters, "weighted_cluster.reference_distance", weighted_cluster_reference_distance_);
+  update_param<double>(parameters, "weighted_cluster.max_weight", weighted_cluster_max_weight_);
+  update_param<double>(
+    parameters, "weighted_cluster.minimum_weighted_size", minimum_weighted_cluster_size_);
+  update_param<int>(
+    parameters, "weighted_cluster.minimum_raw_points", weighted_cluster_min_raw_points_);
+  update_param<double>(parameters, "collision_onset_sec", collision_onset_sec_);
 
   update_param<double>(parameters, "imu_prediction_time_horizon", imu_prediction_time_horizon_);
   update_param<double>(parameters, "imu_prediction_time_interval", imu_prediction_time_interval_);
@@ -413,7 +432,23 @@ void AEB::onCheckCollision(DiagnosticStatusWrapper & stat)
   MarkerArray debug_markers;
   MarkerArray virtual_wall_marker;
   auto metrics = MetricArray();
-  checkCollision(debug_markers);
+  pending_collision_.reset();
+  const bool collision_now = checkCollision(debug_markers) && pending_collision_.has_value();
+
+  // Onset hysteresis.  Brake only once the collision has been seen for collision_onset_sec
+  // without a break; while already braking, every new sighting refreshes the brake at once.
+  const auto now = this->get_clock()->now();
+  if (collision_now) {
+    if (!collision_first_seen_) {
+      collision_first_seen_ = now;
+    }
+    const bool braking = collision_data_keeper_.get().has_value();
+    if (braking || (now - *collision_first_seen_).seconds() >= collision_onset_sec_) {
+      collision_data_keeper_.setCollisionData(*pending_collision_);
+    }
+  } else {
+    collision_first_seen_.reset();
+  }
 
   if (!collision_data_keeper_.checkCollisionExpired()) {
     const std::string error_msg = "[AEB]: Emergency Brake";
@@ -645,10 +680,11 @@ bool AEB::hasCollision(const double current_v, const ObjectData & closest_object
 
   if (closest_object.distance_to_object > rss_dist) return false;
 
-  // collision happens
+  // collision happens -- committed to the keeper by onCheckCollision(), after the onset
+  // hysteresis, not here
   ObjectData collision_data = closest_object;
   collision_data.rss = rss_dist;
-  collision_data_keeper_.setCollisionData(collision_data);
+  pending_collision_ = collision_data;
   return true;
 }
 
@@ -882,7 +918,11 @@ void AEB::getPointsBelongingToClusterHulls(
     tree->setInputCloud(obstacle_points_ptr);
     pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
     ec.setClusterTolerance(cluster_tolerance_);
-    ec.setMinClusterSize(minimum_cluster_size_);
+    // With weighting on, the raw count is only a noise floor; the real test is the weighted
+    // sum below.
+    ec.setMinClusterSize(
+      use_weighted_cluster_size_ ? std::max(1, weighted_cluster_min_raw_points_)
+                                 : minimum_cluster_size_);
     ec.setMaxClusterSize(maximum_cluster_size_);
     ec.setSearchMethod(tree);
     ec.setInputCloud(obstacle_points_ptr);
@@ -893,14 +933,22 @@ void AEB::getPointsBelongingToClusterHulls(
   for (const auto & indices : cluster_indices) {
     PointCloud::Ptr cluster(new PointCloud);
     bool cluster_surpasses_threshold_height{false};
+    double weighted_size = 0.0;
     for (const auto & index : indices.indices) {
       const auto & p = (*obstacle_points_ptr)[index];
       cluster_surpasses_threshold_height = (cluster_surpasses_threshold_height)
                                              ? cluster_surpasses_threshold_height
                                              : (p.z > cluster_minimum_height_);
       cluster->push_back(p);
+      if (use_weighted_cluster_size_) {
+        const double max_weight = std::max(1.0, weighted_cluster_max_weight_);
+        const double d = std::max(
+          distanceToVehicleBody(p), weighted_cluster_reference_distance_ / max_weight);
+        weighted_size += std::clamp(weighted_cluster_reference_distance_ / d, 1.0, max_weight);
+      }
     }
     if (!cluster_surpasses_threshold_height) continue;
+    if (use_weighted_cluster_size_ && weighted_size < minimum_weighted_cluster_size_) continue;
     // Make a 2d convex hull for the objects
     pcl::ConvexHull<pcl::PointXYZ> hull;
     hull.setDimension(2);
@@ -922,6 +970,16 @@ void AEB::getPointsBelongingToClusterHulls(
     constexpr colorTuple debug_color = {255.0 / 256.0, 51.0 / 256.0, 255.0 / 256.0, 0.999};
     addClusterHullMarkers(now(), hull_polygons, debug_color, "hulls", debug_markers);
   }
+}
+
+double AEB::distanceToVehicleBody(const pcl::PointXYZ & p) const
+{
+  const double front = vehicle_info_.max_longitudinal_offset_m;
+  const double rear = vehicle_info_.min_longitudinal_offset_m;  // negative
+  const double half_width = vehicle_info_.vehicle_width_m / 2.0;
+  const double dx = std::max({rear - p.x, 0.0, p.x - front});
+  const double dy = std::max(std::abs(p.y) - half_width, 0.0);
+  return std::hypot(dx, dy);
 }
 
 void AEB::getClosestObjectsOnPath(

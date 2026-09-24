@@ -580,6 +580,25 @@ public:
   double cluster_minimum_height_;
   int minimum_cluster_size_;
   int maximum_cluster_size_;
+
+  // Distance-weighted cluster size.  With it on, a cluster is kept when the SUM of its points'
+  // weights reaches minimum_weighted_cluster_size, where a point's weight grows as it gets
+  // closer to the vehicle body: w = clamp(reference_distance / d, 1, max_weight).  A near
+  // obstacle returns few lidar points but is exactly the one that matters; a fixed point count
+  // throws it away as noise while happily keeping a large far one.
+  bool use_weighted_cluster_size_{false};
+  double weighted_cluster_reference_distance_{2.0};
+  double weighted_cluster_max_weight_{5.0};
+  double minimum_weighted_cluster_size_{30.0};
+  int weighted_cluster_min_raw_points_{3};
+
+  // Onset hysteresis.  A collision has to be seen continuously for this long before the brake
+  // goes on (release is collision_keeping_sec).  One noisy frame no longer stops the vehicle.
+  double collision_onset_sec_{0.0};
+  std::optional<rclcpp::Time> collision_first_seen_{};
+  std::optional<ObjectData> pending_collision_{};
+  /// Distance from a point in base_link to the vehicle footprint rectangle; 0 inside it.
+  double distanceToVehicleBody(const pcl::PointXYZ & p) const;
   double imu_prediction_time_horizon_;
   double imu_prediction_time_interval_;
   double mpc_prediction_time_horizon_;
