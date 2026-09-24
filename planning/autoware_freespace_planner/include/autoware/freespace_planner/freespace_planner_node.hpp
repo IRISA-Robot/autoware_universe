@@ -97,6 +97,13 @@ struct NodeParam
   double th_course_out_distance_m;  // collision margin [m]
   double th_obstacle_time_sec;
   double vehicle_shape_margin_m;
+  // [STUCK-RECOVERY] start escape, see initializePlanningAlgorithm().  radius 0 = off.
+  double escape_vehicle_shape_margin_m;
+  double escape_radius_m;
+  double escape_max_start_overlap_ratio;
+  // [STUCK-RECOVERY] replan instead of switching segment when stopped this far from the cusp.
+  // Negative = off.
+  double replan_at_cusp_tolerance_m;
   bool replan_when_obstacle_found;
   bool replan_when_course_out;
 };
@@ -109,6 +116,9 @@ public:
 private:
   // ros
   rclcpp::Publisher<Trajectory>::SharedPtr trajectory_pub_;
+  // [STUCK-RECOVERY] The whole plan, every cusp included, next to the one segment
+  // trajectory_pub_ carries.  See where it is published.
+  rclcpp::Publisher<Trajectory>::SharedPtr full_trajectory_pub_;
   rclcpp::Publisher<PoseArray>::SharedPtr debug_pose_array_pub_;
   rclcpp::Publisher<PoseArray>::SharedPtr debug_partial_pose_array_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr parking_state_pub_;
@@ -144,6 +154,7 @@ private:
   size_t target_index_;
   bool is_completed_ = false;
   bool reset_in_progress_ = false;
+  bool replan_at_cusp_requested_ = false;
   bool is_new_parking_cycle_ = true;
   boost::optional<rclcpp::Time> obs_found_time_;
 

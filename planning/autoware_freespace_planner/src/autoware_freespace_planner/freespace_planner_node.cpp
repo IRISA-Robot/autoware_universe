@@ -64,6 +64,14 @@ FreespacePlannerNode::FreespacePlannerNode(const rclcpp::NodeOptions & node_opti
     p.th_course_out_distance_m = declare_parameter<double>("th_course_out_distance_m");
     p.th_obstacle_time_sec = declare_parameter<double>("th_obstacle_time_sec");
     p.vehicle_shape_margin_m = declare_parameter<double>("vehicle_shape_margin_m");
+    // Defaulted, unlike the rest: the parking profile does not know about them, and without
+    // them the planner behaves exactly as upstream.
+    p.escape_vehicle_shape_margin_m =
+      declare_parameter<double>("escape.vehicle_shape_margin_m", p.vehicle_shape_margin_m);
+    p.escape_radius_m = declare_parameter<double>("escape.radius_m", 0.0);
+    p.escape_max_start_overlap_ratio =
+      declare_parameter<double>("escape.max_start_overlap_ratio", 0.0);
+    p.replan_at_cusp_tolerance_m = declare_parameter<double>("replan_at_cusp_tolerance_m", -1.0);
     p.replan_when_obstacle_found = declare_parameter<bool>("replan_when_obstacle_found");
     p.replan_when_course_out = declare_parameter<bool>("replan_when_course_out");
   }
@@ -92,6 +100,7 @@ FreespacePlannerNode::FreespacePlannerNode(const rclcpp::NodeOptions & node_opti
     rclcpp::QoS qos{1};
     qos.transient_local();  // latch
     trajectory_pub_ = create_publisher<Trajectory>("~/output/trajectory", qos);
+    full_trajectory_pub_ = create_publisher<Trajectory>("~/output/full_trajectory", qos);
     debug_pose_array_pub_ = create_publisher<PoseArray>("~/debug/pose_array", qos);
     debug_partial_pose_array_pub_ = create_publisher<PoseArray>("~/debug/partial_pose_array", qos);
     parking_state_pub_ = create_publisher<std_msgs::msg::Bool>("is_completed", qos);
@@ -157,6 +166,11 @@ bool FreespacePlannerNode::isPlanRequired()
     return true;
   }
 
+  if (replan_at_cusp_requested_) {
+    replan_at_cusp_requested_ = false;
+    return true;
+  }
+
   if (node_param_.replan_when_obstacle_found && checkCurrentTrajectoryCollision()) {
     RCLCPP_DEBUG(get_logger(), "Found obstacle");
     return true;
@@ -211,6 +225,27 @@ void FreespacePlannerNode::updateTargetIndex()
 
   const auto new_target_index =
     utils::get_next_target_index(trajectory_.points.size(), reversing_indices_, target_index_);
+
+  // [STUCK-RECOVERY] The next segment was planned to start AT this cusp.  Handing it over
+  // with the robot stopped short of the cusp -- anywhere inside th_arrived_distance_m --
+  // makes the controller chase a path that begins somewhere the robot is not, with a heading
+  // it does not have, which it does with a hard steer.  Measured: stopped 0.50 m before the
+  // cusp of a 1.49 m reverse leg, then turned sharply into the forward leg.  Plan the rest
+  // afresh from where the robot actually stands instead; it is stopped, which is all the
+  // planner needs.
+  if (new_target_index != target_index_ && node_param_.replan_at_cusp_tolerance_m >= 0.0) {
+    const double miss = autoware_utils::calc_distance2d(
+      trajectory_.points.at(target_index_).pose, current_pose_.pose);
+    if (miss > node_param_.replan_at_cusp_tolerance_m) {
+      RCLCPP_WARN(
+        get_logger(),
+        "stopped %.2f m from the cusp (tolerance %.2f m); replanning from here instead of "
+        "starting the next segment",
+        miss, node_param_.replan_at_cusp_tolerance_m);
+      replan_at_cusp_requested_ = true;
+      return;
+    }
+  }
 
   if (new_target_index == target_index_) {
     // Finished publishing all partial trajectories
@@ -368,6 +403,13 @@ void FreespacePlannerNode::onTimer()
     utils::get_partial_trajectory(trajectory_, prev_target_index_, target_index_, get_clock());
 
   // Publish messages
+  // [STUCK-RECOVERY] The full plan goes out first, and in the same tick as the segment cut
+  // from it.  ~/output/trajectory only ever carries one direction segment, so a consumer
+  // judging the manoeuvre from that alone sees the first leg, accepts it, and only learns
+  // at the cusp that the next leg goes somewhere it would never have agreed to -- with the
+  // robot already committed to half a manoeuvre.  The header stamp is the planner's own and
+  // stays fixed for the life of one plan, so it identifies the plan.
+  full_trajectory_pub_->publish(trajectory_);
   trajectory_pub_->publish(partial_trajectory_);
   debug_pose_array_pub_->publish(utils::trajectory_to_pose_array(trajectory_));
   debug_partial_pose_array_pub_->publish(utils::trajectory_to_pose_array(partial_trajectory_));
@@ -413,6 +455,14 @@ void FreespacePlannerNode::planTrajectory()
 
   if (result) {
     RCLCPP_DEBUG(get_logger(), "Found goal!");
+    if (algo_->isStartEscapeActive()) {
+      RCLCPP_WARN(
+        get_logger(),
+        "start pose is inside the %.2f m margin; planned out of it with the %.2f m escape "
+        "margin for the first %.2f m (footprint already on %zu obstacle cell(s))",
+        node_param_.vehicle_shape_margin_m, node_param_.escape_vehicle_shape_margin_m,
+        node_param_.escape_radius_m, algo_->getStartEscapeOverlap());
+    }
     trajectory_ = utils::create_trajectory(
       current_pose_, algo_->getWaypoints(), node_param_.waypoints_velocity);
     reversing_indices_ = utils::get_reversing_indices(trajectory_);
@@ -427,6 +477,7 @@ void FreespacePlannerNode::planTrajectory()
 
 void FreespacePlannerNode::reset()
 {
+  replan_at_cusp_requested_ = false;
   trajectory_ = Trajectory();
   partial_trajectory_ = Trajectory();
   is_completed_ = false;
@@ -472,6 +523,30 @@ void FreespacePlannerNode::initializePlanningAlgorithm()
     throw std::runtime_error("No such algorithm named " + algo_name + " exists.");
   }
   RCLCPP_INFO_STREAM(get_logger(), "initialize planning algorithm: " << algo_name);
+
+  // [STUCK-RECOVERY] Start escape.  A robot that stopped closer to an obstacle than
+  // vehicle_shape_margin_m has a start pose that "collides", and the planner refuses it
+  // outright ("Invalid start or goal pose") -- in precisely the situation where the only
+  // way out is a plan that backs away.  Within escape.radius_m of such a start the robot is
+  // checked with escape.vehicle_shape_margin_m instead; beyond it, and for every start that
+  // is clear anyway, the full margin applies unchanged.
+  const double escape_margin =
+    std::clamp(node_param_.escape_vehicle_shape_margin_m, 0.0, margin);
+  if (node_param_.escape_radius_m > 0.0 && escape_margin < margin) {
+    autoware::freespace_planning_algorithms::VehicleShape escape_shape = vehicle_shape_;
+    escape_shape.length += escape_margin;
+    escape_shape.width += escape_margin;
+    escape_shape.base2back += escape_margin / 2;
+    escape_shape.setMinMaxDimension();
+    algo_->setStartEscape(
+      escape_shape, node_param_.escape_radius_m, node_param_.escape_max_start_overlap_ratio);
+    RCLCPP_INFO(
+      get_logger(),
+      "start escape: margin %.2f m (instead of %.2f m) within %.2f m of a start that collides, "
+      "ignoring up to %.0f%% of the footprint already on obstacle cells",
+      escape_margin, margin, node_param_.escape_radius_m,
+      100.0 * node_param_.escape_max_start_overlap_ratio);
+  }
 }
 }  // namespace autoware::freespace_planner
 
