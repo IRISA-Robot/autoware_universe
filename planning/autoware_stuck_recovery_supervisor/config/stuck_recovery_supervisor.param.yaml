@@ -80,6 +80,12 @@
     # escape goal is validated against the same inflated footprint freespace will use,
     # so we never hand it a goal it rejects outright as "Invalid start or goal pose".
     goal_shape_margin_m: 0.2
+    # Mirror of escape.vehicle_shape_margin_m in recovery_freespace_planner.param.yaml, same
+    # convention (added to length and width, so half per side).  Freespace can plan OUT of a
+    # start whose footprint is clear at this margin, so only a start blocked even at this
+    # margin aborts as "start pose is inside an obstacle".  If the escape is turned off in
+    # freespace, set this to vehicle_shape_margin_m there.
+    escape_shape_margin_m: 0.05
     recovery_timeout_sec: 60.0
     # Hysteresis on the exit test, so a pedestrian crossing in front for half a second
     # cannot make the scenario flip back and forth.
@@ -203,9 +209,41 @@
     # grid is treated as broken and recovery refuses to drive rather than trusting it.
     min_occupied_fraction: 0.05
 
-    # There is no reverse budget, and no retreat for it to bound.  Recovery refuses any
-    # plan that travels against the mission's motion mode, so "the obstacle closes in and
-    # the robot keeps giving ground" cannot happen in the first place.
+    # Legs against the mission -- backing up, in a forward mission -- planned by freespace.
+    #
+    # This is NOT the old BACKOFF.  BACKOFF was the supervisor's own blind retreat along the
+    # path it came from, for as long as the obstacle kept coming.  Here a leg against the
+    # mission is only ever driven as part of a freespace plan the supervisor has seen WHOLE,
+    # every cusp of it (/planning/recovery/freespace_full_trajectory), and only if:
+    #   - the plan ENDS travelling the mission's way (a three-point turn, never a retreat),
+    #   - it changes direction at most max_direction_changes times,
+    #   - every leg is >= min_leg_length_m, or the robot stalls at the cusp,
+    #   - its legs against the mission total <= max_counter_mission_per_plan_m, and
+    #   - that, plus the ground already given up this episode, fits in max_ground_given_m.
+    # The plan is judged once, when it appears, and refused whole or not at all.
+    #
+    # max_ground_given_m is measured along the reference path from the furthest point the
+    # robot has reached this episode, so driving on pays it back.  It is what bounds "the
+    # obstacle closes in and the robot keeps giving ground", which is possible again now.
+    # false = the strict rule: every freespace segment must travel with the mission.
+    allow_counter_mission_legs: true
+    max_direction_changes: 2               # forward-back-forward
+    # pid_longitudinal_controller leaves STOPPED on stop_dist > drive_state_stop_dist
+    # (0.5 m); the 1.5 m sum is only its STOPPING-state test.  At a cusp the robot is
+    # STOPPED, so a 1.0 m leg should start.  A* backs up exactly 1.0 m in the cases seen so
+    # far (2026-09-24, live grid: back 1.0 m, forward 4.6 m), and 1.5 refused every one.
+    # If the robot is seen standing at a cusp without starting the next leg, the controller
+    # disagrees -- raise this and astar.min_leg_length_m in the freespace profile together.
+    # [2026-09-24, second pass] The departure distance was never the limit -- the STOPPING
+    # state is.  pid_longitudinal_controller goes DRIVE -> STOPPING the moment stop_dist <
+    # stopping_state_stop_dist (1.0 m), moving or not, and a robot standing still in STOPPING
+    # is held there until stop_dist > drive_state_stop_dist + offset (1.5 m).  So a leg of
+    # 1.0 m or less can never be started from rest: measured, CONTROL_STATE = STOPPING with
+    # STOP_DIST 0.83 m and a -0.25 m/s target, command 0.00, for a whole episode.  A leg has to
+    # be longer than stopping_state_stop_dist, with room to get moving before it: 1.5 m.
+    min_leg_length_m: 1.5                  # clamped to [0.5, 5]
+    max_counter_mission_per_plan_m: 3.0    # clamped to [0, 5]
+    max_ground_given_m: 4.0                # clamped to [0, 6]
 
     # Hard ceiling for everything this scenario drives.  Enforced in the supervisor's
     # relay, which is the single publisher of the recovery trajectory, so nothing
@@ -226,7 +264,20 @@
     # standing still.  Freespace splits its plan at every direction cusp with a
     # zero-velocity point, so short segments are normal in a Reeds-Shepp escape and land
     # in that band easily.  If the controller values change, change this one with them.
-    min_engageable_stop_distance_m: 1.5
+    #
+    # [2026-09-24] 1.5 -> 0.5.  The stalls this was sized on were the controller, not a
+    # departure distance: smooth_stop_max_strong_acc (-1.5) braked the 0.278 m/s crawl to a
+    # halt within centimetres of entering STOPPING, and the robot then crept on in hops until
+    # it was within drive_state_stop_dist (0.5 m) of the stop point, where it stayed.  With
+    # that fixed in pid.param.yaml (-0.05, and drive_state_stop_dist 0.2) the controller sets
+    # off for anything beyond 0.2 m.
+    #
+    # [2026-09-24, second pass] 0.5 -> 1.1.  "Sets off for anything beyond 0.2 m" was wrong:
+    # from rest, the controller drops into STOPPING for any stop point closer than
+    # stopping_state_stop_dist (1.0 m) and never leaves it.  So a plan whose next stop is
+    # nearer than that IS spent for a standing robot, and this has to sit just above 1.0.
+    # Keep it below min_leg_length_m (1.5), or the start of every leg reads as spent.
+    min_engageable_stop_distance_m: 1.1
 
     # Forced replan.  When the robot stops past the live part of freespace's plan, the
     # nearest trajectory point to it already has zero velocity: the smoother then reads
@@ -257,25 +308,20 @@
 
     # --- budget ------------------------------------------------------------
     max_attempts: 2
-    cooldown_sec: 3.0     # how long NOMINAL is held after a recovery before the watchdog may
-                          # arm again.  Was 60.0 upstream, then 10.0 for testing; 3.0 is an
-                          # operator decision -- long enough for the handback to settle, short
-                          # enough that a robot which gets stuck again is picked up promptly.
+    # How long COOLDOWN lasts after an episode ends, handed back or given up.
+    # [2026-09-24] 3.0 -> 1.0, and there is no ABORT state any more: every "give up" goes
+    # straight to COOLDOWN, then NOMINAL, and the next episode starts from nothing -- fresh
+    # PROBE, fresh goals, fresh plans.  That replaced ABORT's release rules, shadow
+    # replanning and retry budget (abort_release_sec, abort_shadow_replan_sec,
+    # abort_reentry_hold_sec, abort_retry_sec, max_abort_retries -- all removed).  A new
+    # episode still has to pass SUSPECT (suspect_timeout_sec) first, which is what keeps
+    # the retries from spinning.  A mechanical stall no longer latches either.
+    cooldown_sec: 1.0
+    # How long BLOCKED waits before re-measuring the corridor.  It used to borrow
+    # cooldown_sec; at 1 s that would bounce BLOCKED <-> PROBE every second.
+    blocked_retry_sec: 60.0
     max_episode_duration_sec: 180.0
-    # ABORT releases itself after the blockage has been gone this long, and returns via
-    # COOLDOWN.  Latching it forever left the watchdog dead for the rest of the session
-    # even once the obstacle had been removed.  A mechanical stall stays latched
-    # regardless -- that one needs a human.
-    abort_release_sec: 5.0
 
-    # ABORT is not a dead end.  Its two normal exits -- the robot moving, or the blockage
-    # clearing -- are both unreachable for a robot frozen inside an obstacle_stop margin,
-    # which is exactly the case recovery exists for.  So while aborted the recovery
-    # costmap and freespace keep running (they do NOT move the robot; the scenario is not
-    # handed over), the last plan is re-checked against the live costmap every tick, and a
-    # fresh plan is requested this often.  The moment one is clear, goes the mission's way
-    # and stays on the road, it is driven -- straight back into RECOVERY, without redoing
-    # PROBE.
     # [UNKNOWN-STOP 2026-09-16] A stop that no Autoware planning factor claims used to
     # leave SUSPECT with no exit at all -- not triggerable, not legitimate, so it waited
     # for ever (caught live at 83 s).  Now SUSPECT measures for itself with the recovery
@@ -294,13 +340,6 @@
     # robot frozen throughout).  After this many releases with no motion at all, the node
     # holds and says so.  The budget resets the moment the robot moves.
     max_unknown_releases: 3
-
-    abort_shadow_replan_sec: 3.0
-    # Last resort, only if the shadow check never finds anything: re-arm the watchdog for a
-    # completely fresh episode after this long, at most max_abort_retries times in a row.
-    # The retry budget resets the moment the robot is seen moving.
-    abort_retry_sec: 15.0
-    max_abort_retries: 3
 
     # --- stop attribution --------------------------------------------------
     # Planning factor topic suffixes; the node subscribes to
@@ -380,6 +419,8 @@
     # freespace publishes here; the supervisor is the single publisher on
     # topic_out_recovery_trajectory, relaying freespace's plan verbatim.
     topic_freespace_trajectory: "/planning/recovery/freespace_trajectory"
+    # The whole plan the segment above was cut from.  Judged before the first leg moves.
+    topic_freespace_full_trajectory: "/planning/recovery/freespace_full_trajectory"
     topic_recovery_is_completed: "/planning/recovery/is_completed"
     topic_road_crossing_state: "/planning/road_crossing/fsm_state"
     topic_emergency_code: "/gama/mw/emergency_code"

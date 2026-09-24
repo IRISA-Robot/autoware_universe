@@ -10,6 +10,9 @@
     activate_by_scenario is true.  Nothing upstream sees these topics.
   -->
   <arg name="stuck_recovery_mode" default="detect_only" description="detect_only | probe | recovery"/>
+  <!-- Overrides planning_algorithm in the freespace param file, so the two can be compared
+       from the command line without editing it. -->
+  <arg name="recovery_freespace_algorithm" default="astar" description="freespace algorithm for the stuck recovery: astar | rrtstar"/>
   <arg name="vehicle_param_file"/>
   <arg name="container_type" default="component_container_mt"/>
 
@@ -64,14 +67,20 @@
         <remap from="~/input/odometry" to="/localization/kinematic_state"/>
         <!-- Freespace publishes to its OWN topic; the supervisor is the single
              publisher on /planning/recovery/trajectory, and relays this verbatim once it
-             has checked that the plan goes the way the mission is going and stays on the
-             road.  Verbatim matters: freespace already splits its plan at every direction
-             cusp and waits for the robot to stop there, which is the only reason the MPC
-             can follow such a path at all. -->
+             has checked that the plan as a whole ends up going the way the mission goes,
+             keeps any leg against it within budget, and stays on the road.  Verbatim
+             matters: freespace already splits its plan at every direction cusp and waits
+             for the robot to stop there, which is the only reason the MPC can follow such
+             a path at all. -->
         <remap from="~/output/trajectory" to="/planning/recovery/freespace_trajectory"/>
+        <!-- The whole plan, every cusp included.  The segment above is all that gets
+             driven; this is what the supervisor judges the manoeuvre by, before the
+             first leg of it is allowed to move the robot. -->
+        <remap from="~/output/full_trajectory" to="/planning/recovery/freespace_full_trajectory"/>
         <remap from="is_completed" to="/planning/recovery/is_completed"/>
         <param from="$(var vehicle_param_file)"/>
         <param from="$(var recovery_freespace_planner_param_path)"/>
+        <param name="planning_algorithm" value="$(var recovery_freespace_algorithm)"/>
         <extra_arg name="use_intra_process_comms" value="false"/>
       </composable_node>
 

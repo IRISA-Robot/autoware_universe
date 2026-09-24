@@ -68,8 +68,8 @@ namespace autoware::stuck_recovery_supervisor
 //   PROBE    = 2   costmap armed; measuring the lateral corridor
 //   RECOVERY = 3   recovery scenario active; freespace is driving
 //   BLOCKED  = 4   corridor too narrow -- stay stopped, raise diagnostics
-//   COOLDOWN = 5   recovered; refuse to re-trigger for a while
-//   ABORT    = 6   latched failure; needs an operator
+//   COOLDOWN = 5   episode over (handed back or given up); pause, then start afresh
+//   ABORT    = 6   retired -- never entered; giving up is a COOLDOWN
 // ---------------------------------------------------------------------------
 enum class State : int32_t {
   NOMINAL = 0,
@@ -78,6 +78,9 @@ enum class State : int32_t {
   RECOVERY = 3,
   BLOCKED = 4,
   COOLDOWN = 5,
+  // 6 was ABORT, a latched failure with its own shadow replanning and retry rules.  Giving up
+  // now goes straight to COOLDOWN (see abort_episode()), and this value is never entered.
+  // Kept, like 7, so bags recorded before the removal still decode.
   ABORT = 6,
   // 7 was BACKOFF, a blind retreat along the path the robot came from.  It is gone:
   // it drove the robot backwards against its own mission direction for as long as the
@@ -165,6 +168,11 @@ private:
     // goal is validated against the same inflated footprint freespace will use, so we
     // never hand it a goal it is going to reject outright.
     double goal_shape_margin_m{0.2};
+    // Mirror of escape.vehicle_shape_margin_m in the recovery freespace profile, in the same
+    // convention freespace uses: added to the vehicle's length and width, i.e. half of it on
+    // each side.  Freespace can plan out of a start whose footprint is clear at THIS margin,
+    // so this, not goal_shape_margin_m, decides whether the start is hopeless.
+    double escape_shape_margin_m{0.05};
     double recovery_timeout_sec{60.0};
     double clear_hold_sec{1.0};
     // Recovery may only hand back once the robot has REJOINED the path.  Judging the exit
@@ -263,6 +271,30 @@ private:
     /// to move but this node still calls the plan drivable, so nothing replans and the
     /// episode runs out its timeout with the robot standing still.
     double min_engageable_stop_distance_m{1.5};
+
+    // Legs against the mission, planned by freespace.
+    //
+    // BACKOFF was a blind retreat: the supervisor drove the robot back along the path it
+    // came from, with no plan, for as long as the obstacle kept coming.  What is allowed
+    // here is different in kind: a leg against the mission is only ever driven as PART of
+    // a freespace plan that the supervisor has seen whole -- every cusp of it -- and that
+    // ends travelling the way the mission goes.  A three-point turn, not a retreat.
+    //
+    // false restores the strict rule: every segment must travel with the mission.
+    bool allow_counter_mission_legs{true};
+    /// Most direction changes one plan may have.  2 is forward-back-forward.
+    int max_direction_changes{2};
+    /// Shortest leg a plan with cusps may have.  Every leg ends at a stop, and the robot
+    /// has to be able to set off again for the next one.  Defaults to the engage distance.
+    double min_leg_length_m{1.5};
+    /// Total length of the legs against the mission in one plan.
+    double max_counter_mission_per_plan_m{3.0};
+    /// How far back along the reference path, from the furthest point it has reached this
+    /// episode, the robot may be put by the plans it drives.  Measured along the PATH, so
+    /// ground won back by driving on pays it off, and a new plan is only accepted if its
+    /// legs against the mission fit in what is left.  This is the bound on "the obstacle
+    /// closes in and the robot keeps giving ground".
+    double max_ground_given_m{4.0};
     // How long to wait for a usable plan before moving on to the next goal candidate.
     double goal_retry_sec{4.0};
     // Forced-replan cycle: how long to wait for freespace to come back with a plan, and
@@ -290,21 +322,12 @@ private:
 
     // budget
     int max_attempts{2};
-    double cooldown_sec{60.0};
+    /// Pause after an episode ends -- handed back, or given up -- before the watchdog may
+    /// open the next one.  Giving up has no state of its own any more: it is a cooldown.
+    double cooldown_sec{1.0};
+    /// How long BLOCKED waits before re-measuring the corridor.
+    double blocked_retry_sec{60.0};
     double max_episode_duration_sec{180.0};
-    // ABORT is not a dead end.  Once the blockage that caused it is gone, the watchdog
-    // has to come back to life -- latching it forever left the feature dead for the rest
-    // of the session even after the obstacle had been removed.  A mechanical stall is
-    // the exception: that one stays latched, because it needs a human to look at it.
-    double abort_release_sec{5.0};
-    /// How long a non-mechanical ABORT may sit on a still-blocked, still-stopped robot
-    /// before the watchdog is re-armed so a fresh episode can try again.  ABORT's two
-    /// normal exits -- the robot moving, or the blockage clearing -- are both unreachable
-    /// when the robot is frozen inside an obstacle_stop margin, which is precisely the
-    /// case recovery exists for.  Without this the state is a dead end.
-    /// How often, while aborted, to ask freespace for a fresh plan from where the robot
-    /// now stands.  The previous plan is re-checked every tick regardless; this is the
-    /// rate at which a NEW one is requested.
     /// [UNKNOWN-STOP 2026-09-16] How long the corridor must read clear, while SUSPECT is
     /// holding an unexplained stop, before the watchdog releases back to lane driving.
     double unknown_stop_clear_hold_sec{3.0};
@@ -312,12 +335,6 @@ private:
     /// stops re-arming and holds.  The budget resets the moment the robot is seen moving,
     /// so it only ever bounds a robot that is getting nowhere.
     int max_unknown_releases{3};
-    double abort_shadow_replan_sec{3.0};
-    double abort_retry_sec{15.0};
-    /// How many such retries in a row are allowed before ABORT latches for a human.  The
-    /// counter resets the moment the robot is seen moving, so it only ever bounds a robot
-    /// that is genuinely getting nowhere.
-    int max_abort_retries{3};
 
     // classification inputs
     std::vector<std::string> pathological_factor_topics{};
@@ -337,6 +354,7 @@ private:
     std::string topic_occupancy_grid;
     std::string topic_recovery_trajectory;
     std::string topic_freespace_trajectory;
+    std::string topic_freespace_full_trajectory;
     std::string topic_recovery_is_completed;
     std::string topic_road_crossing_state;
     std::string topic_emergency_code;
@@ -369,7 +387,8 @@ private:
   void step_recovery();
   void step_blocked();
   void step_cooldown();
-  void step_abort();
+  /// Give up on this episode: record why, and go to COOLDOWN so the next one starts fresh.
+  void abort_episode(const std::string & why);
   void step_replan();
   /// Drive the reference path at the recovery crawl until the robot points along it.
   void step_transit();
@@ -437,6 +456,9 @@ private:
   /// True when the robot is close enough to the reference path that lane driving, which
   /// drives that path, can take it back.  Every hand-back has to pass this.
   bool rejoined_reference_path() const;
+  /// Farther from the reference path than max_lateral_excursion_m.  Checked by RECOVERY to
+  /// abort, and by ABORT before it lets a shadow plan take the robot back.
+  bool excursion_exceeded() const;
   /// Would following this plan drive into something the costmap now shows?
   bool recovery_path_is_blocked(const autoware_planning_msgs::msg::Trajectory & traj);
   /// Direction the MISSION travels in, in the robot's own frame: +1 when the robot drives
@@ -444,11 +466,23 @@ private:
   /// (reverse motion mode).  One definition, used everywhere, so both motion modes go
   /// through identical code.
   double mission_travel_sign() const;
-  /// Does this plan move the robot the way the mission is going?  A plan that travels
-  /// against the mission -- or that changes direction part way -- is refused: driving it
-  /// is the "robot keeps retreating while the obstacle closes in" behaviour, whichever
-  /// motion mode the mission is in.
+  /// Does this plan move the robot the way the mission is going, all of it?  The strict
+  /// rule: used for TRANSIT, and for freespace segments when allow_counter_mission_legs is
+  /// off or the whole plan is not available to judge them by.
   bool plan_follows_mission_direction(const autoware_planning_msgs::msg::Trajectory & traj);
+  /// Verdict on the direction of a freespace segment.  HOLD means the segment cannot be
+  /// judged yet -- the whole plan it was cut from has not arrived -- and it must not be
+  /// driven, but it is not a reason to give up on the goal either.
+  enum class DirectionVerdict { OK, HOLD, REFUSE };
+  /// Judge the segment freespace wants driven by the WHOLE plan it was cut from: how many
+  /// times the plan changes direction, how much of it runs against the mission, whether
+  /// that fits in the ground budget, and whether it ends going the mission's way.  The
+  /// plan is judged once, when it first appears; the robot is standing at its start then.
+  DirectionVerdict judge_plan_direction(const autoware_planning_msgs::msg::Trajectory & segment);
+  /// The whole-plan half of judge_plan_direction().  Sets aeb_reason_ when it refuses.
+  bool full_plan_is_acceptable(const autoware_planning_msgs::msg::Trajectory & full);
+  /// Arc position of `pose` along reference_path_, increasing in the mission's direction.
+  std::optional<double> arc_position_on_reference(const geometry_msgs::msg::Pose & pose) const;
   /// Every pose of the plan, footprint and all, inside the drivable area of the recovery
   /// costmap.  Outside the road lanelets is occupied there, so this is also the guarantee
   /// that recovery never steers the robot off the road.
@@ -481,6 +515,9 @@ private:
   /// route is published, so nothing from one episode can act in another.
   void discard_recovery_state();
   void relay_recovery_trajectory();
+  /// Zero-velocity trajectory at the robot, for when this scenario owns the trajectory but has
+  /// no plan to relay.
+  void publish_hold_trajectory();
   /// Hard-limit every point's speed magnitude, keeping its sign.
   void clamp_recovery_speed(autoware_planning_msgs::msg::Trajectory & traj) const;
 
@@ -547,9 +584,6 @@ private:
   int failed_goal_tries_{0};
   int replan_attempts_{0};
   bool start_blocked_{false};
-  bool abort_was_mechanical_{false};
-  /// Consecutive abort retries; reset as soon as the robot is observed moving.
-  int abort_retries_{0};
   /// Consecutive unexplained-but-clear releases; reset as soon as the robot moves.
   int unknown_releases_{0};
   /// uuid of the route last seen, so a genuinely new mission can be told from a
@@ -565,11 +599,8 @@ private:
   /// Wipe every trace of the current episode and return to NOMINAL.  Used when the
   /// mission itself changes underneath the state machine.
   void reset_for_new_mission(const std::string & why);
-  /// When the last shadow replan was requested while in ABORT.
-  rclcpp::Time shadow_replan_at_{0, 0, RCL_ROS_TIME};
   /// When the corridor last STOPPED reading clear during an unexplained SUSPECT.
   rclcpp::Time unknown_clear_since_{0, 0, RCL_ROS_TIME};
-  rclcpp::Time abort_clear_since_{0, 0, RCL_ROS_TIME};
   rclcpp::Time spent_since_{0, 0, RCL_ROS_TIME};
   CorridorResult last_sweep_{};
   /// Footprint boxes from the last relay, with the verdict each one got.
@@ -603,6 +634,31 @@ private:
   rclcpp::Time grid_at_{0, 0, RCL_ROS_TIME};
   autoware_planning_msgs::msg::Trajectory::ConstSharedPtr recovery_trajectory_{};
   autoware_planning_msgs::msg::Trajectory::ConstSharedPtr freespace_trajectory_{};
+  /// The whole plan freespace_trajectory_ is a segment of, cusps and all.
+  autoware_planning_msgs::msg::Trajectory::ConstSharedPtr freespace_full_trajectory_{};
+  rclcpp::Time freespace_full_at_{0, 0, RCL_ROS_TIME};
+  /// The verdict on the last whole plan judged, keyed by that plan's header stamp and size
+  /// (freespace stamps a plan once, when it is made).  Judging once matters: the ground
+  /// budget is checked against where the robot was when the plan was made, and a plan
+  /// half driven must not be re-judged with its own first leg already counted against it.
+  struct FullPlanVerdict
+  {
+    builtin_interfaces::msg::Time stamp{};
+    size_t size{0};
+    bool acceptable{false};
+    std::string reason{};
+  };
+  std::optional<FullPlanVerdict> full_plan_verdict_{};
+  /// Since when the segment in hand has not been found on the whole plan in hand.
+  bool plan_mismatch_{false};
+  rclcpp::Time plan_mismatch_since_{0, 0, RCL_ROS_TIME};
+  /// Furthest the robot has got along the reference path this episode, kept as a pose so
+  /// it survives the reference path being recaptured.
+  std::optional<geometry_msgs::msg::Pose> furthest_pose_{};
+  /// How far back along the path from furthest_pose_ the robot now is.
+  double ground_given_m_{0.0};
+  /// Total distance driven against the mission this session, for the record only.
+  double counter_mission_total_m_{0.0};
   /// When the current episode's route was published, and when the freespace plan we hold
   /// arrived.  A plan that predates the route belongs to an older goal.
   rclcpp::Time route_published_at_{0, 0, RCL_ROS_TIME};
@@ -633,6 +689,8 @@ private:
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr sub_grid_{};
   rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr sub_recovery_traj_{};
   rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr sub_freespace_traj_{};
+  rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr
+    sub_freespace_full_traj_{};
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_recovery_completed_{};
   rclcpp::Subscription<autoware_internal_debug_msgs::msg::Int32Stamped>::SharedPtr
     sub_road_crossing_{};
