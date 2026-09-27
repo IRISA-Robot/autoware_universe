@@ -187,6 +187,25 @@ void DummyPerceptionPublisherNode::timerCallback()
     obj_infos.insert(obj_infos.end(), plugin_infos.begin(), plugin_infos.end());
   }
 
+  // [2026-09-27] Keep every object standing on the robot's CURRENT ground.  use_base_link_z
+  // used to fix an object's height once, at spawn, to the robot's height at that moment.  On a
+  // map with elevation (this one spans ~1.7 m) the robot then drives to lower or higher ground
+  // and the object floats or sinks relative to it -- and the ego-centric virtual lidar, which
+  // fires from base_link over +-15 deg, only reaches +-d*tan(15 deg) in height at distance d.
+  // Measured live: an object 0.87 m to the robot's left spanned z +0.33..+2.33 m in base_link
+  // while the beams there reach +-0.23 m, so it got 0 points, shape_estimation dropped the empty
+  // cluster, and the object vanished from tracking, prediction and the costmap exactly as the
+  // robot came alongside it.  Far away the beams reach high enough, which is why it was only
+  // ever the near ones.
+  if (use_base_link_z_) {
+    const double base_link_z_in_map = tf_base_link2map.inverse().getOrigin().z();
+    for (auto & obj_info : obj_infos) {
+      auto origin = obj_info.tf_map2moved_object.getOrigin();
+      origin.setZ(base_link_z_in_map + 0.5 * obj_info.height);
+      obj_info.tf_map2moved_object.setOrigin(origin);
+    }
+  }
+
   for (size_t i = 0; i < all_objects.size(); ++i) {
     if (detection_successful_rate_ >= detection_successful_random(random_generator_)) {
       selected_indices.push_back(i);
