@@ -426,6 +426,9 @@ private:
   void step_cooldown();
   /// Give up on this episode: record why, and go to COOLDOWN so the next one starts fresh.
   void abort_episode(const std::string & why);
+  /// SUSPECT -> RECOVERY in recovery mode, PROBE bypassed.  The first escape goal is chosen by
+  /// reselect_escape_goal() once the recovery costmap is up.
+  void enter_recovery(const std::string & why);
   /// Drive the reference path at the recovery crawl until the robot points along it.
   void step_transit();
   /// False while the robot has not yet moved transit_retry_progress_m since TRANSIT last fell

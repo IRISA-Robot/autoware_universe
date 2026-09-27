@@ -1083,7 +1083,40 @@ void StuckRecoverySupervisorNode::step_suspect()
   // Re-capture: the trajectory may have been refreshed since we entered SUSPECT and
   // the newest one is the better description of where we were trying to go.
   capture_reference_path();
-  transition(State::PROBE, was_forced ? "forced by operator" : "stuck confirmed");
+  const std::string why = was_forced ? "forced by operator" : "stuck confirmed";
+  // [2026-09-27] In recovery mode PROBE is bypassed: SUSPECT goes straight to RECOVERY and
+  // freespace decides.  PROBE's corridor verdicts sent real episodes to BLOCKED -- measured:
+  // a 1.65 m corridor that FITS, then BLOCKED over and over because no escape goal had 4 m of
+  // clear path behind it -- while freespace, continuously re-planning and re-selecting goals,
+  // is the better judge.  A genuinely blocked robot still stays put: no goal or no plan that
+  // passes means RECOVERY publishes a stop.  detect_only / probe modes keep PROBE: measuring
+  // without acting is what they are for.
+  if (mode_ == Mode::RECOVERY) {
+    enter_recovery(why);
+    return;
+  }
+  transition(State::PROBE, why);
+}
+
+void StuckRecoverySupervisorNode::enter_recovery(const std::string & why)
+{
+  if (attempts_ >= param_.max_attempts) {
+    abort_episode("attempt budget exhausted");
+    return;
+  }
+  const auto now = this->now();
+  ++attempts_;
+  recovery_completed_ = false;
+  escape_goal_.reset();
+  goal_candidates_.clear();
+  goal_index_ = 0;
+  clear_since_ = now;
+  last_valid_plan_ = now;
+  spent_since_ = now;
+  // Due at once: the first escape goal is chosen by reselect_escape_goal() as soon as the
+  // recovery costmap is up.
+  goal_reselected_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+  transition(State::RECOVERY, why + "; straight to freespace, PROBE bypassed");
 }
 
 void StuckRecoverySupervisorNode::step_probe()
@@ -1290,6 +1323,32 @@ void StuckRecoverySupervisorNode::step_recovery()
     abort_episode("episode watchdog expired");
     return;
   }
+  // What PROBE used to check before handing over, now done here: the recovery costmap has to
+  // be up (it is only armed on entering this state, so give it the PROBE warm-up), it has to
+  // carry the road layer, and there has to be a reference path.  Until then nothing is
+  // adopted and the relay holds the robot still.
+  if (!costmap_is_fresh()) {
+    if ((now - state_since_).seconds() > param_.probe_warmup_sec + 5.0) {
+      abort_episode(
+        grid_ ? "recovery costmap went stale (is the recovery container alive?)"
+              : "recovery costmap never published (is the recovery container alive?)");
+    }
+    return;
+  }
+  if (grid_occupied_fraction_ < param_.min_occupied_fraction) {
+    RCLCPP_ERROR(
+      get_logger(),
+      "[episode %u] only %.1f%% of the recovery costmap is occupied -- the road layer was never "
+      "filled, so recovery cannot keep the robot on the road. Not driving.",
+      episode_id_, 100.0 * grid_occupied_fraction_);
+    abort_episode("recovery costmap has no road boundary; refusing to drive");
+    return;
+  }
+  if (reference_path_.empty() && !capture_reference_path()) {
+    abort_episode("no reference path to recover along");
+    return;
+  }
+
   // Continuous execution: look at the newest freespace plan, then advance and publish the
   // segment of whichever plan is adopted.  Freespace replans on its own every period, so
   // nothing here ever has to stop the robot to ask for a plan.
@@ -1368,6 +1427,10 @@ void StuckRecoverySupervisorNode::step_recovery()
   // replan: the next freespace plan, made from where the robot now stands, is adopted as soon
   // as it arrives.  Only when none has been usable for goal_retry_sec is the goal changed.
   if (adopted_plan_ && !plan_is_spent_confirmed()) {
+    last_valid_plan_ = now;
+  } else if (!escape_goal_) {
+    // No goal published yet (none fits right now): nothing freespace could have answered, so
+    // the retry clock does not run.  recovery_timeout_sec still bounds the wait.
     last_valid_plan_ = now;
   } else if ((now - last_valid_plan_).seconds() > param_.goal_retry_sec) {
     if (start_blocked_) {
@@ -1530,15 +1593,24 @@ void StuckRecoverySupervisorNode::reselect_escape_goal()
   if (!goal_blocked && (now - goal_reselected_at_).seconds() < param_.goal_reselect_period_sec) {
     return;
   }
+  // The first search of an episode logs its full summary (why candidates were rejected);
+  // the periodic ones stay quiet.
+  const bool first_search = goal_reselected_at_.nanoseconds() == 0;
   goal_reselected_at_ = now;
 
-  auto candidates = collect_goal_candidates(false);
+  auto candidates = collect_goal_candidates(first_search);
   if (candidates.empty()) {
     if (goal_blocked) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "[episode %u] the escape goal is blocked and no other candidate fits right now",
         episode_id_);
+    } else if (!escape_goal_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "[episode %u] no escape goal fits yet (goal_min_clear_length_m %.1f m of clear path "
+        "behind it) -- holding still and searching again every %.1f s",
+        episode_id_, param_.goal_min_clear_length_m, param_.goal_reselect_period_sec);
     }
     return;
   }
