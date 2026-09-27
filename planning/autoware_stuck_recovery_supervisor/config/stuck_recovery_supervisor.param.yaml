@@ -135,6 +135,14 @@
     transit_hold_sec: 1.0
     # If it cannot line up in this long it is not going to. Stop rather than crawl forever.
     transit_timeout_sec: 30.0
+    # [2026-09-27] TRANSIT drives the reference path and nothing else, so a brake holding it
+    # left only the 30 s timeout -- measured: held with 15 deg of heading to go until the
+    # operator stopped it.  Held this long, the robot goes back to RECOVERY with fresh goals and
+    # freespace plans around what the brake is holding against.  RECOVERY may then enter TRANSIT
+    # again only after the robot has moved transit_retry_progress_m, so it cannot bounce straight
+    # back onto the same brake.  max_episode_duration_sec still bounds the whole episode.
+    transit_aeb_exit_sec: 3.0
+    transit_retry_progress_m: 0.5
 
     # How much of the reference path TRANSIT actually drives.  It only has to CONVERGE onto
     # the path, not travel it -- and the reference path is the lane, which runs straight

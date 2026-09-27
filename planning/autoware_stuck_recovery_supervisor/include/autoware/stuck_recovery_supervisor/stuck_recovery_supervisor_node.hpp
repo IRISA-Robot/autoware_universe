@@ -190,6 +190,12 @@ private:
     double transit_hold_sec{1.0};
     // If it cannot line up in this long it is not going to; stop rather than crawl forever.
     double transit_timeout_sec{30.0};
+    /// The brake holding TRANSIT this long sends the robot back to RECOVERY, where freespace
+    /// can plan around what it is holding against.
+    double transit_aeb_exit_sec{3.0};
+    /// After such a fall-back, RECOVERY may enter TRANSIT again only once the robot has moved
+    /// this far from where TRANSIT was braked.
+    double transit_retry_progress_m{0.5};
     // How much of the reference path TRANSIT actually drives.  It only has to converge onto
     // the path, not travel it: the reference path is the lane, and the lane runs straight
     // through the obstacle recovery just went around.  Driving 30 m of it meant the
@@ -422,6 +428,9 @@ private:
   void abort_episode(const std::string & why);
   /// Drive the reference path at the recovery crawl until the robot points along it.
   void step_transit();
+  /// False while the robot has not yet moved transit_retry_progress_m since TRANSIT last fell
+  /// back to RECOVERY.
+  bool may_enter_transit();
   /// Trajectory along the reference path from the robot, at recovery_speed_limit_mps,
   /// signed by the mission's direction of travel.
   autoware_planning_msgs::msg::Trajectory build_transit_trajectory() const;
@@ -711,6 +720,8 @@ private:
   /// Stamp of the last freespace plan considered, so each one is looked at once.
   std::optional<builtin_interfaces::msg::Time> last_candidate_stamp_{};
   rclcpp::Time goal_reselected_at_{0, 0, RCL_ROS_TIME};
+  /// Where the robot was when the brake sent TRANSIT back to RECOVERY.
+  std::optional<geometry_msgs::msg::Pose> transit_fallback_pose_{};
   /// Internal AEB hysteresis timers, and whether the current brake must bypass the onset.
   std::optional<rclcpp::Time> aeb_raw_since_{};
   std::optional<rclcpp::Time> aeb_clear_since_{};

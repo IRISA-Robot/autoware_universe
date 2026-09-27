@@ -159,6 +159,8 @@ void StuckRecoverySupervisorNode::load_parameters()
     declare_parameter<double>("transit_yaw_tolerance_rad", 0.26);
   p.transit_hold_sec = declare_parameter<double>("transit_hold_sec", 1.0);
   p.transit_timeout_sec = declare_parameter<double>("transit_timeout_sec", 30.0);
+  p.transit_aeb_exit_sec = declare_parameter<double>("transit_aeb_exit_sec", 3.0);
+  p.transit_retry_progress_m = declare_parameter<double>("transit_retry_progress_m", 0.5);
   p.transit_lookahead_m = declare_parameter<double>("transit_lookahead_m", 5.0);
   p.transit_join_min_m = declare_parameter<double>("transit_join_min_m", 1.5);
   p.transit_join_gain = declare_parameter<double>("transit_join_gain", 2.5);
@@ -1352,6 +1354,9 @@ void StuckRecoverySupervisorNode::step_recovery()
       abort_episode("ran out of escape goals while still off the path");
       return;
     }
+    if (!may_enter_transit()) {
+      return;
+    }
     RCLCPP_INFO(
       get_logger(), "[episode %u] escape goal passed and none left ahead", episode_id_);
     cooldown_until_ = now + rclcpp::Duration::from_seconds(param_.cooldown_sec);
@@ -1483,8 +1488,32 @@ void StuckRecoverySupervisorNode::step_recovery()
     return;
   }
 
+  if (!may_enter_transit()) {
+    return;
+  }
   cooldown_until_ = now + rclcpp::Duration::from_seconds(param_.cooldown_sec);
   transition(State::TRANSIT, "corridor ahead is clear; lining up before handing back");
+}
+
+bool StuckRecoverySupervisorNode::may_enter_transit()
+{
+  // After falling back from TRANSIT, the conditions that sent the robot into TRANSIT (corridor
+  // clear, on the path) are usually still true -- entering it again at once would just bounce
+  // off the same brake.  Require freespace to have moved the robot first.
+  if (!transit_fallback_pose_ || !odom_) {
+    return true;
+  }
+  const double moved = distance2d(*transit_fallback_pose_, odom_->pose.pose);
+  if (moved < param_.transit_retry_progress_m) {
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "[episode %u] ready to line up again, but only %.2f m from where TRANSIT was braked "
+      "(need %.2f m) -- letting freespace move the robot first",
+      episode_id_, moved, param_.transit_retry_progress_m);
+    return false;
+  }
+  transit_fallback_pose_.reset();
+  return true;
 }
 
 void StuckRecoverySupervisorNode::reselect_escape_goal()
@@ -2139,6 +2168,35 @@ void StuckRecoverySupervisorNode::step_transit()
   }
   if ((now - episode_since_).seconds() > param_.max_episode_duration_sec) {
     abort_episode("episode watchdog expired while lining up");
+    return;
+  }
+
+  // [2026-09-27] TRANSIT drives the reference path and nothing else, so when the brake holds
+  // it there is no other plan to switch to and its only exits -- lined up, or the 30 s timeout
+  // -- are both out of reach for a robot that cannot move.  Measured: held in TRANSIT with
+  // 15 deg of heading left until the operator stopped it.  Once the brake has held for
+  // transit_aeb_exit_sec, go back to RECOVERY, where freespace plans around whatever the brake
+  // is holding against.
+  if (aeb_holding_ && (now - aeb_hold_since_).seconds() > param_.transit_aeb_exit_sec) {
+    goal_candidates_ = collect_goal_candidates();
+    goal_index_ = 0;
+    if (goal_candidates_.empty()) {
+      abort_episode("the brake is holding TRANSIT and there is no escape goal to plan to");
+      return;
+    }
+    if (odom_) {
+      transit_fallback_pose_ = odom_->pose.pose;
+    }
+    const double held = (now - aeb_hold_since_).seconds();
+    transition(
+      State::RECOVERY, "the brake held TRANSIT for " + std::to_string(held).substr(0, 4) +
+                         " s (" + aeb_reason_ + "); back to freespace to get around it");
+    if (!advance_past_passed_goals() || !publish_current_goal()) {
+      abort_episode("no escape goal ahead to fall back to from TRANSIT");
+      return;
+    }
+    last_valid_plan_ = now;
+    spent_since_ = now;
     return;
   }
 
@@ -2997,13 +3055,20 @@ double StuckRecoverySupervisorNode::plan_obstruction(
   if (!odom_ || traj.points.size() < 2) {
     return 0.0;
   }
-  const auto [start_blocked, start_total] =
-    footprint_blocked_count(odom_->pose.pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold);
-  (void)start_total;
   const auto nearest = std::min_element(
     traj.points.begin(), traj.points.end(), [this](const auto & a, const auto & b) {
       return distance2d(a.pose, odom_->pose.pose) < distance2d(b.pose, odom_->pose.pose);
     });
+  // The baseline is where the robot IS: its own footprint, or the plan's pose at the robot,
+  // whichever covers more.  The plan's pose there carries the plan's heading, not the robot's;
+  // measured in TRANSIT, 15 deg of heading still to take out rotated that footprint onto a few
+  // more occupied cells, "blocked 0.00 m along it" braked the robot, and a braked robot cannot
+  // take out heading -- it sat there until the operator stopped it.
+  const size_t start_blocked = std::max(
+    footprint_blocked_count(odom_->pose.pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
+      .first,
+    footprint_blocked_count(nearest->pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
+      .first);
   const double min_step =
     grid_ ? std::max(static_cast<double>(grid_->info.resolution), 0.05) : 0.05;
   const double max_weight = std::max(1.0, param_.optimizer_max_weight);
@@ -3355,6 +3420,7 @@ void StuckRecoverySupervisorNode::discard_recovery_state()
   failed_goal_tries_ = 0;
   drop_adopted_plan();
   last_candidate_stamp_.reset();
+  transit_fallback_pose_.reset();
 }
 
 void StuckRecoverySupervisorNode::publish_recovery_route(const geometry_msgs::msg::Pose & goal)
@@ -3460,13 +3526,15 @@ void StuckRecoverySupervisorNode::record_footprint_debug(
   // brake would stop.  They used to show the drivable-area test over the whole plan, so a red
   // box beyond the brake's lookahead read as "the AEB sees it" while the brake, correctly,
   // did not act on it.
-  const auto start_blocked =
-    footprint_blocked_count(odom_->pose.pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
-      .first;
   const auto nearest = std::min_element(
     traj.points.begin(), traj.points.end(), [this](const auto & a, const auto & b) {
       return distance2d(a.pose, odom_->pose.pose) < distance2d(b.pose, odom_->pose.pose);
     });
+  const size_t start_blocked = std::max(
+    footprint_blocked_count(odom_->pose.pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
+      .first,
+    footprint_blocked_count(nearest->pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
+      .first);
   double arc = 0.0;
   for (auto it = nearest; it != traj.points.end(); ++it) {
     if (it != nearest) {
