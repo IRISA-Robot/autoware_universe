@@ -411,6 +411,19 @@ std::pair<ResultWithReason, MPCData> MPC::getData(
   // from the ego pose, which keeps it on the same stretch.  Note this only ever CONSTRAINS
   // the choice; it never invents a pose, and it gives up after
   // nearest_jump_max_rejections so a robot that has genuinely been displaced can re-acquire.
+  // [REFERENCE-JUMP 2026-09-27] A change of driving direction starts a new manoeuvre: the
+  // reference legitimately moves to a different stretch and faces the other way.  Treated as
+  // a jump, the retry below searched the NEW trajectory from where the OLD reference was --
+  // measured: stuck recovery switched from a reverse leg to a forward plan while the robot
+  // was 2 m off the old one, the guard held a point 3.1 m away and 149 deg off, and the
+  // steering went wild.  Re-arm instead.
+  if (m_prev_guard_forward_shift && *m_prev_guard_forward_shift != m_is_forward_shift) {
+    m_prev_nearest_pose.reset();
+    m_prev_ego_pose.reset();
+    m_nearest_jump_rejections = 0;
+  }
+  m_prev_guard_forward_shift = m_is_forward_shift;
+
   if (m_prev_nearest_pose && m_prev_ego_pose) {
     const double ego_travelled =
       autoware_utils_geometry::calc_distance2d(m_prev_ego_pose->position, current_pose.position);

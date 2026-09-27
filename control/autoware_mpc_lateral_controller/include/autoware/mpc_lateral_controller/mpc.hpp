@@ -250,6 +250,9 @@ private:
   // reference point and the robot travel along the same path, so between two cycles the
   // reference cannot move much further than the robot did.
   std::optional<geometry_msgs::msg::Pose> m_prev_nearest_pose{std::nullopt};
+  // Driving direction the continuity guard last compared against.  A reversal is a new
+  // manoeuvre, not a teleport, so it re-arms the guard instead of tripping it.
+  std::optional<bool> m_prev_guard_forward_shift{std::nullopt};
   std::optional<geometry_msgs::msg::Pose> m_prev_ego_pose{std::nullopt};
   // How many consecutive candidates have been rejected as teleports.  Bounded, so a robot
   // that genuinely IS somewhere else can still re-acquire instead of steering to a stale
