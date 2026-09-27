@@ -62,6 +62,7 @@
 #include <deque>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -104,6 +105,10 @@ struct NodeParam
   // [STUCK-RECOVERY] replan instead of switching segment when stopped this far from the cusp.
   // Negative = off.
   double replan_at_cusp_tolerance_m;
+  // [STUCK-RECOVERY] planner-server mode: replan every period from wherever the robot is,
+  // publish whole plans only, never stop the robot.  See onTimerContinuous().
+  bool continuous_replan_enable;
+  double continuous_replan_period_sec;
   bool replan_when_obstacle_found;
   bool replan_when_course_out;
 };
@@ -155,6 +160,8 @@ private:
   bool is_completed_ = false;
   bool reset_in_progress_ = false;
   bool replan_at_cusp_requested_ = false;
+  bool continuous_replan_requested_ = false;
+  std::optional<rclcpp::Time> last_continuous_plan_time_{};
   bool is_new_parking_cycle_ = true;
   boost::optional<rclcpp::Time> obs_found_time_;
 
@@ -176,7 +183,10 @@ private:
   void onTimer();
   void updateData();
   void reset();
-  void planTrajectory();
+  /// \return true when a plan was found and trajectory_ now holds it.
+  bool planTrajectory();
+  /// The whole of onTimer() in continuous mode, once the inputs are ready.
+  void onTimerContinuous();
   void initializePlanningAlgorithm();
   bool isDataReady();
 

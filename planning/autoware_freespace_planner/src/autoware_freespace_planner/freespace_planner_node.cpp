@@ -72,6 +72,9 @@ FreespacePlannerNode::FreespacePlannerNode(const rclcpp::NodeOptions & node_opti
     p.escape_max_start_overlap_ratio =
       declare_parameter<double>("escape.max_start_overlap_ratio", 0.0);
     p.replan_at_cusp_tolerance_m = declare_parameter<double>("replan_at_cusp_tolerance_m", -1.0);
+    p.continuous_replan_enable = declare_parameter<bool>("continuous_replan.enable", false);
+    p.continuous_replan_period_sec =
+      declare_parameter<double>("continuous_replan.period_sec", 0.5);
     p.replan_when_obstacle_found = declare_parameter<bool>("replan_when_obstacle_found");
     p.replan_when_course_out = declare_parameter<bool>("replan_when_course_out");
   }
@@ -268,6 +271,14 @@ void FreespacePlannerNode::onRoute(const LaneletRoute::ConstSharedPtr msg)
   goal_pose_.header = msg->header;
   goal_pose_.pose = msg->goal_pose;
 
+  // [STUCK-RECOVERY] In continuous mode a new goal is just a reason to plan again now.
+  // reset() here is what made every goal change stop the robot: it dropped the plan and made
+  // the next one wait for the vehicle to stand still.
+  if (node_param_.continuous_replan_enable) {
+    continuous_replan_requested_ = true;
+    return;
+  }
+
   is_new_parking_cycle_ = true;
 
   reset();
@@ -357,6 +368,11 @@ void FreespacePlannerNode::onTimer()
     return;
   }
 
+  if (node_param_.continuous_replan_enable) {
+    onTimerContinuous();
+    return;
+  }
+
   // Must stop before replanning any new trajectory
   const bool is_reset_required = !reset_in_progress_ && isPlanRequired();
   if (is_reset_required) {
@@ -423,10 +439,40 @@ void FreespacePlannerNode::onTimer()
   processing_time_pub_->publish(processing_time_msg);
 }
 
-void FreespacePlannerNode::planTrajectory()
+void FreespacePlannerNode::onTimerContinuous()
+{
+  // [STUCK-RECOVERY] Planner server, Nav2-style.  None of the stop-before-replan machinery runs
+  // here -- no stop trajectories, no waiting for the vehicle to stand still, no segments: the
+  // consumer (the stuck-recovery supervisor) keeps driving the plan it has, cuts its own
+  // segments, and decides whether each new plan is worth switching to.  This node only keeps
+  // the plan fresh: from wherever the robot is now, every period, and at once on a new goal.
+  // A failed search publishes nothing, which leaves the consumer on the plan it already has.
+  const auto now = get_clock()->now();
+  const bool due = continuous_replan_requested_ || !last_continuous_plan_time_ ||
+                   (now - *last_continuous_plan_time_).seconds() >=
+                     node_param_.continuous_replan_period_sec;
+  if (!due) {
+    return;
+  }
+  continuous_replan_requested_ = false;
+  last_continuous_plan_time_ = now;
+
+  autoware_utils::StopWatch<std::chrono::milliseconds> stop_watch;
+  if (planTrajectory()) {
+    full_trajectory_pub_->publish(trajectory_);
+    debug_pose_array_pub_->publish(utils::trajectory_to_pose_array(trajectory_));
+  }
+
+  autoware_internal_debug_msgs::msg::Float64Stamped processing_time_msg;
+  processing_time_msg.stamp = get_clock()->now();
+  processing_time_msg.data = stop_watch.toc();
+  processing_time_pub_->publish(processing_time_msg);
+}
+
+bool FreespacePlannerNode::planTrajectory()
 {
   if (occupancy_grid_ == nullptr) {
-    return;
+    return false;
   }
 
   // Provide robot shape and map for the planner
@@ -469,10 +515,16 @@ void FreespacePlannerNode::planTrajectory()
     prev_target_index_ = 0;
     target_index_ = utils::get_next_target_index(
       trajectory_.points.size(), reversing_indices_, prev_target_index_);
-  } else {
-    RCLCPP_INFO(get_logger(), "Can't find goal: %s", error_msg.c_str());
+    return true;
+  }
+  RCLCPP_INFO_THROTTLE(
+    get_logger(), *get_clock(), 1000, "Can't find goal: %s", error_msg.c_str());
+  // In continuous mode keep the last plan: the consumer is still driving it, and this node
+  // never republishes it anyway.  Otherwise the upstream behaviour: drop everything.
+  if (!node_param_.continuous_replan_enable) {
     reset();
   }
+  return false;
 }
 
 void FreespacePlannerNode::reset()
