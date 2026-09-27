@@ -261,6 +261,9 @@ private:
     // lower a limit, and measurements showed the trajectory reaching control at anything
     // from 0.250 to 0.303 m/s.
     double recovery_speed_limit_mps{0.278};
+    // Measured speed above this multiple of the limit commands a stop until the speed is back
+    // under the limit.  See the overspeed governor in relay_recovery_trajectory().
+    double recovery_overspeed_ratio{1.5};
     // Must stay above the smoother's stop_dist_to_prohibit_engage (0.2 m).  Purely for
     // the warning below -- it explains a robot that refuses to move for no visible
     // reason, which is otherwise a very expensive thing to work out.
@@ -297,15 +300,9 @@ private:
     double max_ground_given_m{4.0};
     // How long to wait for a usable plan before moving on to the next goal candidate.
     double goal_retry_sec{4.0};
-    // Forced-replan cycle: how long to wait for freespace to come back with a plan, and
-    // how many times to ask before giving up on this goal candidate.
-    double replan_wait_sec{5.0};
-    // The plan must look spent for THIS long, continuously, before a replan is forced.
-    // Evaluating it instantaneously caused a RECOVERY <-> REPLAN oscillation: freespace
-    // publishes a short partial for a tick, we declare the plan spent, and the forced
-    // replan re-publishes the route -- which makes freespace reset() and throw away the
-    // plan it had just produced.  The dwell also gives the robot time to actually drive
-    // the segment before we conclude it cannot.
+    // The plan must look spent for THIS long, continuously, before it stops counting as a
+    // usable plan for the goal-retry timer.  A single short segment is not evidence of
+    // anything.
     double spent_hold_sec{2.0};
     // A freespace plan is only trusted if it arrived AFTER this episode's route was
     // published, and recently.  Both matter: /planning/recovery/route is transient_local
@@ -318,7 +315,42 @@ private:
     // snapshot -- reporting an unchanging clear corridor and exiting recovery instantly,
     // with nothing to indicate the planner was gone.
     double costmap_timeout_sec{1.0};
-    int max_replan_attempts{3};
+
+    // --- continuous execution (freespace is a planner server, this node the executor) ---
+    // Segment execution, moved here from freespace: stopped this long, within this distance
+    // of the cusp, moves on to the next segment -- unless it stopped further than the
+    // tolerance from the cusp, in which case the rest of the plan is dropped and the next
+    // fresh plan, made from where the robot actually stands, takes over.
+    double cusp_arrived_distance_m{0.5};
+    double cusp_stopped_sec{1.0};
+    double replan_at_cusp_tolerance_m{0.15};
+    // Plan optimizer.  Cost of a plan = obstruction inside the internal AEB's window, each
+    // pose weighted w(s) = clamp(reference_distance / s, 1, max_weight) by its distance s
+    // along the plan, integrated over arc; plus stop_penalty when adopting it means stopping
+    // to change direction now.  A new plan is adopted when its cost is within tie_epsilon of
+    // the current one's or lower -- ties go to the newest plan.
+    double optimizer_reference_distance_m{1.0};
+    double optimizer_max_weight{5.0};
+    double optimizer_stop_penalty{0.5};
+    double optimizer_tie_epsilon{0.01};
+    // Internal AEB hysteresis: blocked this long before braking, clear this long before
+    // releasing.  A stale costmap still brakes at once.
+    double aeb_onset_sec{0.2};
+    double aeb_release_sec{0.5};
+    // Escape-goal selection: "first_fit" (first point with goal_min_clear_length_m of clear
+    // path behind it) or "top_large_fit" (every such point up to the edge of the costmap,
+    // ranked by lateral clearance, searched up to goal_clearance_cap_m).
+    std::string goal_selection{"top_large_fit"};
+    double goal_clearance_cap_m{1.0};
+    // The escape goal is re-selected throughout RECOVERY, from where the robot is and the
+    // costmap as it is now, every goal_reselect_period_sec -- and at once if the goal itself
+    // becomes blocked.  It only moves when the new winner is clearly better: at least
+    // goal_reselect_min_gain_m more clearance (top_large_fit), or at least
+    // goal_reselect_min_shift_m away (first_fit).  Otherwise two near-equal spots would trade
+    // places every period and the plan with them.
+    double goal_reselect_period_sec{1.0};
+    double goal_reselect_min_gain_m{0.05};
+    double goal_reselect_min_shift_m{0.5};
 
     // budget
     int max_attempts{2};
@@ -353,7 +385,6 @@ private:
     std::string topic_scenario;
     std::string topic_occupancy_grid;
     std::string topic_recovery_trajectory;
-    std::string topic_freespace_trajectory;
     std::string topic_freespace_full_trajectory;
     std::string topic_recovery_is_completed;
     std::string topic_road_crossing_state;
@@ -389,7 +420,6 @@ private:
   void step_cooldown();
   /// Give up on this episode: record why, and go to COOLDOWN so the next one starts fresh.
   void abort_episode(const std::string & why);
-  void step_replan();
   /// Drive the reference path at the recovery crawl until the robot points along it.
   void step_transit();
   /// Trajectory along the reference path from the robot, at recovery_speed_limit_mps,
@@ -397,7 +427,6 @@ private:
   autoware_planning_msgs::msg::Trajectory build_transit_trajectory() const;
   /// Signed heading error between the robot and the reference path's direction of travel.
   std::optional<double> heading_error_to_reference() const;
-  void force_freespace_replan(const std::string & why);
   /// True when the robot is stopped and there is no usable velocity left ahead of it in
   /// the plan being relayed -- i.e. the plan is spent and only a replan can help.
   /// \param stop_dist_out when non-null, receives the distance from the robot to the
@@ -406,8 +435,32 @@ private:
   ///        -- the caller does that instead.
   bool plan_is_spent(double * stop_dist_out = nullptr) const;
   /// plan_is_spent() held continuously for spent_hold_sec, and long enough after entering
-  /// the state that the robot had a fair chance to drive.  Only this may force a replan.
+  /// the state that the robot had a fair chance to drive.
   bool plan_is_spent_confirmed();
+  /// Take the newest freespace plan, if there is one not yet looked at, and adopt it when
+  /// it is acceptable and costs no more than the plan being driven.
+  void consider_candidate_plan();
+  /// Advance the adopted plan's segment at a cusp, and publish the current segment into
+  /// freespace_trajectory_ for everything downstream to use.
+  void update_adopted_segment();
+  void adopt_plan(const autoware_planning_msgs::msg::Trajectory & plan, const std::string & why);
+  void drop_adopted_plan();
+  /// The internal AEB's window over `traj`: from the pose nearest the robot to
+  /// aeb_lookahead_m, counting only obstruction beyond what the robot already stands on.  Returns the weighted, arc-integrated obstruction.  When
+  /// `first_blocked_out` is non-null it receives the first pose the brake would stop for.
+  double plan_obstruction(
+    const autoware_planning_msgs::msg::Trajectory & traj,
+    std::optional<std::pair<double, geometry_msgs::msg::Pose>> * first_blocked_out) const;
+  /// {blocked, total} footprint samples (with margin) on cells at or above threshold, or
+  /// off-grid.
+  std::pair<size_t, size_t> footprint_blocked_count(
+    const geometry_msgs::msg::Pose & pose, double margin, int threshold) const;
+  /// Optimizer cost of driving `plan` from where the robot is now.
+  double plan_cost(const autoware_planning_msgs::msg::Trajectory & plan, bool * needs_flip);
+  /// recovery_path_is_blocked() through the onset/release hysteresis.  True = brake.
+  bool aeb_brake(const autoware_planning_msgs::msg::Trajectory & traj);
+  /// Largest extra margin, up to goal_clearance_cap_m, at which the goal footprint is free.
+  double goal_clearance(const geometry_msgs::msg::Pose & pose) const;
   void transition(State next, const std::string & reason);
 
   // Detection helpers
@@ -470,16 +523,10 @@ private:
   /// rule: used for TRANSIT, and for freespace segments when allow_counter_mission_legs is
   /// off or the whole plan is not available to judge them by.
   bool plan_follows_mission_direction(const autoware_planning_msgs::msg::Trajectory & traj);
-  /// Verdict on the direction of a freespace segment.  HOLD means the segment cannot be
-  /// judged yet -- the whole plan it was cut from has not arrived -- and it must not be
-  /// driven, but it is not a reason to give up on the goal either.
-  enum class DirectionVerdict { OK, HOLD, REFUSE };
-  /// Judge the segment freespace wants driven by the WHOLE plan it was cut from: how many
-  /// times the plan changes direction, how much of it runs against the mission, whether
-  /// that fits in the ground budget, and whether it ends going the mission's way.  The
-  /// plan is judged once, when it first appears; the robot is standing at its start then.
-  DirectionVerdict judge_plan_direction(const autoware_planning_msgs::msg::Trajectory & segment);
-  /// The whole-plan half of judge_plan_direction().  Sets aeb_reason_ when it refuses.
+  /// Judge a whole freespace plan: how many times it changes direction, how much of it runs
+  /// against the mission, whether that fits in the ground budget, and whether it ends going
+  /// the mission's way.  Judged once per plan (cached by stamp).  Sets aeb_reason_ when it
+  /// refuses.
   bool full_plan_is_acceptable(const autoware_planning_msgs::msg::Trajectory & full);
   /// Arc position of `pose` along reference_path_, increasing in the mission's direction.
   std::optional<double> arc_position_on_reference(const geometry_msgs::msg::Pose & pose) const;
@@ -505,11 +552,13 @@ private:
   void publish_recovery_arming(bool active);
   void publish_recovery_route(const geometry_msgs::msg::Pose & goal);
   /// Ordered escape-goal candidates, nearest usable first.
-  std::vector<geometry_msgs::msg::Pose> collect_goal_candidates() const;
+  /// \param verbose log the search summary.  Off for the periodic re-selection, which would
+  ///        otherwise repeat it every period.
+  std::vector<geometry_msgs::msg::Pose> collect_goal_candidates(bool verbose = true) const;
+  /// Re-run the goal search during RECOVERY and move the goal when the result is clearly
+  /// better, or when the current goal has become blocked.
+  void reselect_escape_goal();
   bool publish_current_goal();
-  /// Does the relayed freespace output actually move the robot, or is it one of the
-  /// stop trajectories freespace emits while it is failing?
-  bool freespace_plan_is_valid();
   /// Forget every trace of the recovery scenario: the held plan, the goal, the candidate
   /// list and the relayed trajectory.  Called whenever the scenario is left or a new
   /// route is published, so nothing from one episode can act in another.
@@ -526,7 +575,10 @@ private:
   void publish_outputs();
   void publish_markers();
   /// Verdict for one footprint box, in the order the checks apply them.
-  enum class FootprintVerdict { FREE, GRACED, BLOCKING };
+  /// FREE: clear.  GRACED: on occupied cells, but no deeper than the robot already is.
+  /// BLOCKING: the internal AEB brakes for this.  BEYOND: occupied, but past the AEB's
+  /// lookahead -- the brake does not look there yet.
+  enum class FootprintVerdict { FREE, GRACED, BLOCKING, BEYOND };
   /// Record what each footprint test along the plan decided, so the markers show the
   /// checks' own answers rather than a second opinion computed separately.
   void record_footprint_debug(const autoware_planning_msgs::msg::Trajectory & traj);
@@ -582,7 +634,6 @@ private:
   size_t goal_index_{0};
   rclcpp::Time last_valid_plan_{0, 0, RCL_ROS_TIME};
   int failed_goal_tries_{0};
-  int replan_attempts_{0};
   bool start_blocked_{false};
   /// Consecutive unexplained-but-clear releases; reset as soon as the robot moves.
   int unknown_releases_{0};
@@ -650,8 +701,21 @@ private:
   };
   std::optional<FullPlanVerdict> full_plan_verdict_{};
   /// Since when the segment in hand has not been found on the whole plan in hand.
-  bool plan_mismatch_{false};
-  rclcpp::Time plan_mismatch_since_{0, 0, RCL_ROS_TIME};
+  /// The plan being executed, its cusp indices, and the current segment [seg_prev_,
+  /// seg_target_].  Kept across new goals and new freespace plans until one is adopted in
+  /// its place, so the robot never has to stop to change plans.
+  std::optional<autoware_planning_msgs::msg::Trajectory> adopted_plan_{};
+  std::vector<size_t> adopted_reversing_{};
+  size_t seg_prev_{0};
+  size_t seg_target_{0};
+  /// Stamp of the last freespace plan considered, so each one is looked at once.
+  std::optional<builtin_interfaces::msg::Time> last_candidate_stamp_{};
+  rclcpp::Time goal_reselected_at_{0, 0, RCL_ROS_TIME};
+  /// Internal AEB hysteresis timers, and whether the current brake must bypass the onset.
+  std::optional<rclcpp::Time> aeb_raw_since_{};
+  std::optional<rclcpp::Time> aeb_clear_since_{};
+  bool aeb_immediate_{false};
+  bool overspeed_braking_{false};
   /// Furthest the robot has got along the reference path this episode, kept as a pose so
   /// it survives the reference path being recaptured.
   std::optional<geometry_msgs::msg::Pose> furthest_pose_{};
@@ -688,7 +752,6 @@ private:
   rclcpp::Subscription<autoware_internal_planning_msgs::msg::Scenario>::SharedPtr sub_scenario_{};
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr sub_grid_{};
   rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr sub_recovery_traj_{};
-  rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr sub_freespace_traj_{};
   rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr
     sub_freespace_full_traj_{};
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_recovery_completed_{};

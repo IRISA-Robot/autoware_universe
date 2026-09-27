@@ -14,6 +14,7 @@
 
 #include "autoware/stuck_recovery_supervisor/stuck_recovery_supervisor_node.hpp"
 
+#include <autoware/freespace_planner/utils.hpp>
 #include <autoware/motion_utils/resample/resample.hpp>
 #include <autoware_utils/math/normalization.hpp>
 #include <autoware_lanelet2_extension/utility/utilities.hpp>
@@ -179,6 +180,7 @@ void StuckRecoverySupervisorNode::load_parameters()
   p.min_occupied_fraction = declare_parameter<double>("min_occupied_fraction", 0.05);
 
   p.recovery_speed_limit_mps = declare_parameter<double>("recovery_speed_limit_mps", 0.278);
+  p.recovery_overspeed_ratio = declare_parameter<double>("recovery_overspeed_ratio", 1.5);
   p.min_engageable_stop_distance_m =
     declare_parameter<double>("min_engageable_stop_distance_m", 1.5);
   p.allow_counter_mission_legs = declare_parameter<bool>("allow_counter_mission_legs", true);
@@ -189,13 +191,25 @@ void StuckRecoverySupervisorNode::load_parameters()
     declare_parameter<double>("max_counter_mission_per_plan_m", 3.0);
   p.max_ground_given_m = declare_parameter<double>("max_ground_given_m", 4.0);
   p.goal_retry_sec = declare_parameter<double>("goal_retry_sec", 4.0);
-  p.replan_wait_sec = declare_parameter<double>("replan_wait_sec", 5.0);
   p.spent_hold_sec = declare_parameter<double>("spent_hold_sec", 2.0);
   p.freespace_plan_timeout_sec =
     declare_parameter<double>("freespace_plan_timeout_sec", 1.0);
   p.costmap_timeout_sec = declare_parameter<double>("costmap_timeout_sec", 1.0);
-  p.max_replan_attempts =
-    static_cast<int>(declare_parameter<int64_t>("max_replan_attempts", 3));
+  p.cusp_arrived_distance_m = declare_parameter<double>("cusp_arrived_distance_m", 0.5);
+  p.cusp_stopped_sec = declare_parameter<double>("cusp_stopped_sec", 1.0);
+  p.replan_at_cusp_tolerance_m = declare_parameter<double>("replan_at_cusp_tolerance_m", 0.15);
+  p.optimizer_reference_distance_m =
+    declare_parameter<double>("optimizer.reference_distance_m", 1.0);
+  p.optimizer_max_weight = declare_parameter<double>("optimizer.max_weight", 5.0);
+  p.optimizer_stop_penalty = declare_parameter<double>("optimizer.stop_penalty", 0.5);
+  p.optimizer_tie_epsilon = declare_parameter<double>("optimizer.tie_epsilon", 0.01);
+  p.aeb_onset_sec = declare_parameter<double>("aeb_onset_sec", 0.2);
+  p.aeb_release_sec = declare_parameter<double>("aeb_release_sec", 0.5);
+  p.goal_selection = declare_parameter<std::string>("goal_selection", "top_large_fit");
+  p.goal_clearance_cap_m = declare_parameter<double>("goal_clearance_cap_m", 1.0);
+  p.goal_reselect_period_sec = declare_parameter<double>("goal_reselect_period_sec", 1.0);
+  p.goal_reselect_min_gain_m = declare_parameter<double>("goal_reselect_min_gain_m", 0.05);
+  p.goal_reselect_min_shift_m = declare_parameter<double>("goal_reselect_min_shift_m", 0.5);
   p.max_attempts = static_cast<int>(declare_parameter<int64_t>("max_attempts", 2));
   p.cooldown_sec = declare_parameter<double>("cooldown_sec", 1.0);
   p.blocked_retry_sec = declare_parameter<double>("blocked_retry_sec", 60.0);
@@ -231,8 +245,6 @@ void StuckRecoverySupervisorNode::load_parameters()
     "topic_occupancy_grid", "/planning/recovery/costmap_generator/occupancy_grid");
   p.topic_recovery_trajectory =
     declare_parameter<std::string>("topic_recovery_trajectory", "/planning/recovery/trajectory");
-  p.topic_freespace_trajectory = declare_parameter<std::string>(
-    "topic_freespace_trajectory", "/planning/recovery/freespace_trajectory");
   p.topic_freespace_full_trajectory = declare_parameter<std::string>(
     "topic_freespace_full_trajectory", "/planning/recovery/freespace_full_trajectory");
   p.topic_recovery_is_completed = declare_parameter<std::string>(
@@ -420,12 +432,6 @@ void StuckRecoverySupervisorNode::setup_interfaces()
     [this](const autoware_planning_msgs::msg::Trajectory::ConstSharedPtr msg) {
       recovery_trajectory_ = msg;
     });
-  sub_freespace_traj_ = create_subscription<autoware_planning_msgs::msg::Trajectory>(
-    param_.topic_freespace_trajectory, qos,
-    [this](const autoware_planning_msgs::msg::Trajectory::ConstSharedPtr msg) {
-      freespace_trajectory_ = msg;
-      freespace_traj_at_ = this->now();
-    });
   sub_freespace_full_traj_ = create_subscription<autoware_planning_msgs::msg::Trajectory>(
     param_.topic_freespace_full_trajectory, qos,
     [this](const autoware_planning_msgs::msg::Trajectory::ConstSharedPtr msg) {
@@ -553,8 +559,7 @@ void StuckRecoverySupervisorNode::on_timer()
       break;
     case State::ABORT:  // retired: abort_episode() goes to COOLDOWN, so this is never entered
       break;
-    case State::REPLAN:
-      step_replan();
+    case State::REPLAN:  // retired: freespace replans continuously, nothing waits for it
       break;
     case State::TRANSIT:
       step_transit();
@@ -878,6 +883,8 @@ void StuckRecoverySupervisorNode::transition(State next, const std::string & rea
   state_ = next;
   state_since_ = this->now();
   aeb_holding_ = false;
+  aeb_raw_since_.reset();
+  aeb_clear_since_.reset();
   if (next == State::TRANSIT) {
     // The manoeuvre is over; only the line-up remains.  Drop the freespace plan so a stale
     // one can never be relayed here, and start the hold from now rather than from whatever
@@ -886,6 +893,7 @@ void StuckRecoverySupervisorNode::transition(State next, const std::string & rea
     freespace_traj_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     freespace_full_trajectory_.reset();
     full_plan_verdict_.reset();
+    drop_adopted_plan();
     transit_aligned_since_ = this->now();
   }
   if (next == State::COOLDOWN || next == State::BLOCKED) {
@@ -1280,13 +1288,19 @@ void StuckRecoverySupervisorNode::step_recovery()
     abort_episode("episode watchdog expired");
     return;
   }
+  // Continuous execution: look at the newest freespace plan, then advance and publish the
+  // segment of whichever plan is adopted.  Freespace replans on its own every period, so
+  // nothing here ever has to stop the robot to ask for a plan.
+  consider_candidate_plan();
+  update_adopted_segment();
+
   // A brake that has been on for seconds is not protecting against something passing
-  // through -- the plan it is braking against is not drivable.  Holding it until the
-  // episode times out is how a whole 60 s recovery was lost with the robot never moving,
-  // so ask for a different plan instead.
+  // through.  Freespace keeps offering plans from here, and the optimizer takes any that
+  // costs less; if none has after this long, the goal itself is the problem -- aim at the
+  // next one.  The brake stays on through this; only its hysteresis releases it.
   if (aeb_holding_ && (now - aeb_hold_since_).seconds() > param_.aeb_hold_replan_sec) {
-    aeb_holding_ = false;
-    force_freespace_replan("the emergency brake has been holding against this plan");
+    aeb_hold_since_ = now;
+    reject_plan_and_try_next_goal("the emergency brake has been holding against this plan");
     return;
   }
 
@@ -1345,12 +1359,10 @@ void StuckRecoverySupervisorNode::step_recovery()
     return;
   }
 
-  if (plan_is_spent_confirmed()) {
-    force_freespace_replan("robot stopped beyond the usable part of the plan");
-    return;
-  }
-
-  if (freespace_plan_is_valid()) {
+  // A plan counts as usable while one is adopted and not spent.  A spent plan needs no forced
+  // replan: the next freespace plan, made from where the robot now stands, is adopted as soon
+  // as it arrives.  Only when none has been usable for goal_retry_sec is the goal changed.
+  if (adopted_plan_ && !plan_is_spent_confirmed()) {
     last_valid_plan_ = now;
   } else if ((now - last_valid_plan_).seconds() > param_.goal_retry_sec) {
     if (start_blocked_) {
@@ -1360,7 +1372,7 @@ void StuckRecoverySupervisorNode::step_recovery()
       abort_episode("start pose is inside an obstacle; freespace cannot plan from here");
       return;
     }
-    reject_plan_and_try_next_goal("freespace produced no usable plan for this goal");
+    reject_plan_and_try_next_goal("no usable plan for this goal");
     return;
   }
   if (excursion_exceeded()) {
@@ -1381,6 +1393,10 @@ void StuckRecoverySupervisorNode::step_recovery()
     }
   }
   last_sweep_ = sweep(from);
+  // [2026-09-27] The goal is not fixed for the episode.  Re-run the search against the
+  // current costmap from where the robot is now: an obstacle dropped onto the goal chosen at
+  // the start used to be driven straight towards.
+  reselect_escape_goal();
   const bool clear_now = last_sweep_.valid && last_sweep_.clear;
   if (!clear_now) {
     clear_since_ = now;
@@ -1471,7 +1487,62 @@ void StuckRecoverySupervisorNode::step_recovery()
   transition(State::TRANSIT, "corridor ahead is clear; lining up before handing back");
 }
 
-std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_candidates() const
+void StuckRecoverySupervisorNode::reselect_escape_goal()
+{
+  // The goal search, re-run for the whole of RECOVERY.  Chosen once at the start, the goal
+  // went stale the moment the world changed: an obstacle dropped exactly onto it, and the
+  // robot drove on towards it.  Now the search runs again every goal_reselect_period_sec
+  // from where the robot is, against the costmap as it is, and the goal moves when the
+  // result is clearly better -- or at once when the current goal has become blocked.
+  // Freespace plans for a new goal within one period, and the adopted plan is driven until
+  // then, so moving the goal never stops the robot.
+  const auto now = this->now();
+  const bool goal_blocked = escape_goal_ && costmap_is_fresh() && !footprint_is_free(*escape_goal_);
+  if (!goal_blocked && (now - goal_reselected_at_).seconds() < param_.goal_reselect_period_sec) {
+    return;
+  }
+  goal_reselected_at_ = now;
+
+  auto candidates = collect_goal_candidates(false);
+  if (candidates.empty()) {
+    if (goal_blocked) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "[episode %u] the escape goal is blocked and no other candidate fits right now",
+        episode_id_);
+    }
+    return;
+  }
+  const auto & best = candidates.front();
+
+  if (!goal_blocked && escape_goal_) {
+    // Hysteresis: only a clearly better goal is worth a new plan.
+    if (param_.goal_selection == "top_large_fit") {
+      const double gain = goal_clearance(best) - goal_clearance(*escape_goal_);
+      if (gain < param_.goal_reselect_min_gain_m) {
+        return;
+      }
+    } else if (distance2d(best, *escape_goal_) < param_.goal_reselect_min_shift_m) {
+      return;
+    }
+  }
+
+  const double moved = escape_goal_ ? distance2d(best, *escape_goal_) : 0.0;
+  goal_candidates_ = std::move(candidates);
+  goal_index_ = 0;
+  if (!advance_past_passed_goals() || !publish_current_goal()) {
+    return;
+  }
+  RCLCPP_INFO(
+    get_logger(),
+    "[episode %u] escape goal re-selected (%s): moved %.2f m to (%.2f, %.2f), %zu candidates",
+    episode_id_, goal_blocked ? "the old one is blocked" : "a clearly better one appeared",
+    moved, escape_goal_->position.x, escape_goal_->position.y, goal_candidates_.size());
+  last_valid_plan_ = now;
+}
+
+std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_candidates(
+  bool verbose) const
 {
   std::vector<geometry_msgs::msg::Pose> candidates;
   if (reference_path_.size() < 2) {
@@ -1507,7 +1578,11 @@ std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_
   // is how far the mission goal itself is, measured ALONG the path rather than straight
   // line, so the escape goal can never be placed past the place the robot is trying to
   // reach.  On a short remaining route that shrinks on its own as the robot advances.
-  double search_limit = param_.max_goal_search_distance_m;
+  const bool top_large_fit = param_.goal_selection == "top_large_fit";
+  // top_large_fit searches out to the edge of the costmap instead of a fixed range (the loop
+  // stops at the first footprint that leaves the grid); the mission goal still bounds it.
+  double search_limit =
+    top_large_fit ? std::numeric_limits<double>::max() : param_.max_goal_search_distance_m;
   if (route_) {
     if (const auto goal_idx = find_nearest_index(reference_path_, route_->goal_pose)) {
       if (*goal_idx > ego_index) {
@@ -1545,6 +1620,9 @@ std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_
       candidate.orientation.w = std::cos(yaw * 0.5);
     }
 
+    if (top_large_fit && arc >= search_from && !footprint_within_grid(candidate)) {
+      break;  // the edge of the costmap: nothing past here can be judged
+    }
     // The run is measured at every path point, not only at the ones we would consider
     // placing a goal on -- otherwise an obstacle between two checks goes unnoticed.
     if (footprint_is_free(candidate)) {
@@ -1565,7 +1643,7 @@ std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_
       continue;
     }
     next_check = arc + param_.goal_check_interval_m;
-    if (!first_fit_logged) {
+    if (verbose && !first_fit_logged) {
       RCLCPP_INFO(
         get_logger(), "[episode %u] first fit at %.1f m along the path (%.1f m clear behind it)",
         episode_id_, arc, clear_run_m);
@@ -1574,6 +1652,39 @@ std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_
     candidates.push_back(candidate);
   }
 
+  if (top_large_fit && !candidates.empty()) {
+    // [2026-09-27] top_large_fit: every point that passes the first-fit test (clear path
+    // behind it), ranked by how much room it has -- the widest place past the obstacle comes
+    // first, the rest remain as fallbacks in the same order.  Stable, so equally wide points
+    // keep nearest-first.
+    std::vector<std::pair<double, geometry_msgs::msg::Pose>> scored;
+    scored.reserve(candidates.size());
+    for (const auto & c : candidates) {
+      scored.emplace_back(goal_clearance(c), c);
+    }
+    std::stable_sort(scored.begin(), scored.end(), [](const auto & a, const auto & b) {
+      return a.first > b.first + 1e-6;
+    });
+    std::ostringstream best;
+    best << std::fixed << std::setprecision(2);
+    for (size_t i = 0; i < std::min<size_t>(3, scored.size()); ++i) {
+      best << (i ? ", " : "") << scored[i].first << " m at (" << scored[i].second.position.x
+           << ", " << scored[i].second.position.y << ")";
+    }
+    if (verbose) {
+      RCLCPP_INFO(
+        get_logger(), "[episode %u] top_large_fit: %zu candidates, widest clearance first: %s",
+        episode_id_, scored.size(), best.str().c_str());
+    }
+    candidates.clear();
+    for (const auto & sc : scored) {
+      candidates.push_back(sc.second);
+    }
+  }
+
+  if (!verbose) {
+    return candidates;
+  }
   RCLCPP_INFO(
     get_logger(),
     "[episode %u] %zu escape-goal candidates from %.1f m (blockage at %.1f m + %.1f m offset), "
@@ -1581,8 +1692,8 @@ std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_
     "%zu rejected as too tight, %zu skipped as off-grid%s",
     episode_id_, candidates.size(), search_from,
     last_sweep_.has_blockage ? last_sweep_.first_blocked_arc_m : -1.0,
-    param_.goal_offset_beyond_obstacle_m, param_.goal_min_clear_length_m, search_limit,
-    rejected_tight, skipped_offgrid,
+    param_.goal_offset_beyond_obstacle_m, param_.goal_min_clear_length_m,
+    std::min(search_limit, arc), rejected_tight, skipped_offgrid,
     mirror ? ", headings flipped for reversed route" : "");
   return candidates;
 }
@@ -1618,159 +1729,146 @@ bool StuckRecoverySupervisorNode::publish_current_goal()
   return true;
 }
 
-bool StuckRecoverySupervisorNode::freespace_plan_is_valid()
-{
-  if (!freespace_trajectory_ || freespace_trajectory_->points.size() < 2) {
-    return false;
-  }
-
-  // Must belong to THIS episode.  The route topic is latched, so freespace can answer a
-  // previous episode's goal as soon as it is re-armed; relaying that drove the robot to
-  // the wrong place entirely.
-  if (freespace_traj_at_ <= route_published_at_) {
-    RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 2000,
-      "[episode %u] ignoring a freespace plan that predates this episode's goal", episode_id_);
-    return false;
-  }
-  if ((this->now() - freespace_traj_at_).seconds() > param_.freespace_plan_timeout_sec) {
-    return false;  // freespace has gone quiet; do not act on a stale plan
-  }
-  // create_stop_trajectory zeroes every velocity; a real plan moves the robot.
-  for (const auto & point : freespace_trajectory_->points) {
-    if (std::abs(point.longitudinal_velocity_mps) > 1e-3) {
-      return true;
-    }
-  }
-  return false;
-}
-
 void StuckRecoverySupervisorNode::relay_recovery_trajectory()
 {
-  // Single publisher on the topic scenario_selector reads.  Freespace publishes to its
-  // own topic and we forward it verbatim -- verbatim matters, because freespace already
-  // splits its plan at every direction cusp and waits for the robot to stop there,
-  // which is the only reason the MPC can follow a Reeds-Shepp path at all.
+  // Single publisher on the topic scenario_selector reads.  In RECOVERY that is the current
+  // segment of the adopted plan -- cut here, not by freespace, see update_adopted_segment() --
+  // and in TRANSIT the reference path.
   autoware_planning_msgs::msg::Trajectory traj;
   if (state_ == State::TRANSIT) {
     traj = build_transit_trajectory();
   } else if (state_ == State::RECOVERY && freespace_trajectory_) {
     traj = *freespace_trajectory_;
-  } else if (state_ != State::RECOVERY && state_ != State::REPLAN) {
+  } else if (state_ != State::RECOVERY) {
     return;
   }
   if (traj.points.empty()) {
-    // [2026-09-24] RECOVERY or REPLAN with nothing to relay must still say "stop".  This
-    // scenario owns the trajectory while it is armed, and silence leaves the controller
-    // holding the LAST trajectory it had -- which, on entering recovery, is lane driving's.
-    // In a reverse mission that one was still -1.11 m/s: the robot kept rolling, freespace
-    // sat on "Waiting for the vehicle to stop before generating a new trajectory" (it only
-    // plans from rest, and a new goal counts as a new cycle, so it publishes no stop of its
-    // own), and all seven goals ran out without a plan ever being made.
+    // [2026-09-24] RECOVERY with nothing to relay must still say "stop".  This scenario owns
+    // the trajectory while it is armed, and silence leaves the controller holding the LAST
+    // trajectory it had -- on entering recovery, lane driving's, which in a reverse mission
+    // was still -1.11 m/s.
     publish_hold_trajectory();
     return;
   }
 
-  // Two refusals before anything is driven.  A plan that goes the wrong way is rejected
-  // WHOLE -- there is no safe prefix of it.  "The wrong way" is judged on the whole
-  // freespace plan, not on the segment in hand: see judge_plan_direction().
-  //
-  // [TRANSIT-TRUNCATE 2026-09-15] Containment is different, and in TRANSIT it has to be.
-  // Rejecting the whole plan publishes it stopped, and a stopped robot cannot change its
-  // heading -- but converging the heading is the ONLY way out of TRANSIT.  So a
-  // containment refusal anywhere along the plan deadlocked the state until its 30 s
-  // timeout, every time.  Measured 2026-09-15, episode 8: 96 consecutive refusals of
-  // "plan leaves the drivable area 4.29 m along it" while the exit test sat at "heading
-  // 25.4 deg (need 14.9), 0.45 m off the path (need 0.50)" -- lateral already inside
-  // tolerance, heading frozen because nothing was moving.
-  //
-  // Wholesale rejection is right for a freespace escape: that is a committed manoeuvre,
-  // and half of it is not a manoeuvre.  TRANSIT is not committed to anything -- it is
-  // creeping along the reference path at 1 km/h until it lines up.  Driving the part that
-  // is verified free and stopping before the part that is not is exactly what should
-  // happen, and every point kept has already passed the same footprint test the refusal
-  // used.
-  size_t first_bad = 0;
-  // TRANSIT drives the reference path, never a manoeuvre, so it keeps the strict rule.  A
-  // freespace segment is judged by the whole plan it was cut from.
-  const DirectionVerdict direction =
-    state_ == State::TRANSIT
-      ? (plan_follows_mission_direction(traj) ? DirectionVerdict::OK : DirectionVerdict::REFUSE)
-      : judge_plan_direction(traj);
-  if (direction == DirectionVerdict::HOLD) {
-    // Not a refusal: the plan has not been seen whole yet, which only ever lasts a tick or
-    // two, and always with the robot standing still -- freespace only plans once it has
-    // stopped.  Hold it there, and do not burn the goal.
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 1000, "[episode %u] holding the freespace segment: %s",
-      episode_id_, aeb_reason_.c_str());
-    for (auto & point : traj.points) {
-      point.longitudinal_velocity_mps = 0.0f;
+  if (state_ == State::TRANSIT) {
+    // TRANSIT drives the reference path, never a manoeuvre, so it keeps the strict direction
+    // rule.
+    //
+    // [TRANSIT-TRUNCATE 2026-09-15] Containment is truncated rather than refused: a stopped
+    // robot cannot change its heading, and converging the heading is the ONLY way out of
+    // TRANSIT, so a refusal anywhere along the plan deadlocked the state until its timeout.
+    // Driving the part verified free and stopping before the rest is what should happen.
+    size_t first_bad = 0;
+    const bool direction_ok = plan_follows_mission_direction(traj);
+    const bool road_ok = direction_ok && plan_stays_inside_road(traj, &first_bad);
+    if (direction_ok && !road_ok && first_bad >= 2) {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "[episode %u] lining up on the first %zu of %zu plan points and stopping short: %s",
+        episode_id_, first_bad, traj.points.size(), aeb_reason_.c_str());
+      traj.points.resize(first_bad);
+      traj.points.back().longitudinal_velocity_mps = 0.0f;
+    } else if (!direction_ok || !road_ok) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000, "[episode %u] refusing the transit plan: %s",
+        episode_id_, aeb_reason_.c_str());
+      for (auto & point : traj.points) {
+        point.longitudinal_velocity_mps = 0.0f;
+      }
+      pub_recovery_traj_->publish(traj);
+      return;
     }
-    pub_recovery_traj_->publish(traj);
-    return;
   }
-  const bool direction_ok = direction == DirectionVerdict::OK;
-  const bool road_ok = direction_ok && plan_stays_inside_road(traj, &first_bad);
-  if (direction_ok && !road_ok && state_ == State::TRANSIT && first_bad >= 2) {
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 2000,
-      "[episode %u] lining up on the first %zu of %zu plan points and stopping short: %s",
-      episode_id_, first_bad, traj.points.size(), aeb_reason_.c_str());
-    traj.points.resize(first_bad);
-    traj.points.back().longitudinal_velocity_mps = 0.0f;
-    record_footprint_debug(traj);
-    clamp_recovery_speed(traj);
-    pub_recovery_traj_->publish(traj);
-    return;
-  }
-  if (!direction_ok || !road_ok) {
-    RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 1000, "[episode %u] refusing the freespace plan: %s",
-      episode_id_, aeb_reason_.c_str());
-    // Publish it stopped rather than publishing nothing.  This scenario owns the
-    // trajectory while it is armed, and going silent leaves the controller holding
-    // whatever it had last -- a refusal has to read as "stop", not as "no opinion".
-    for (auto & point : traj.points) {
-      point.longitudinal_velocity_mps = 0.0f;
-    }
-    pub_recovery_traj_->publish(traj);
-    // Cycling escape goals is meaningless in TRANSIT -- the manoeuvre is over and what is
-    // being driven is the reference path, not a freespace plan.  Doing it anyway walked
-    // TRANSIT out through "no usable escape goal left".  Hold instead, and let the TRANSIT
-    // timeout be the thing that gives up.
-    if (state_ != State::TRANSIT) {
-      reject_plan_and_try_next_goal(aeb_reason_);
-    }
-    return;
-  }
+  // In RECOVERY there is nothing to refuse here any more.  Direction, legs, ground budget and
+  // containment were all judged when the plan was adopted (consider_candidate_plan()), from
+  // where the robot stood; what can change since is the world, and that is the brake's job.
+  // Refusing the plan here would stop the robot for something beyond the brake's window,
+  // which is exactly the stop-go continuous execution exists to remove.
 
   record_footprint_debug(traj);
-
   clamp_recovery_speed(traj);
 
-  // Emergency brake.  While this scenario drives, the motion_velocity_planner stop
-  // modules are bypassed entirely, so nothing else in planning is watching.
-  if (recovery_path_is_blocked(traj)) {
+  // Overspeed governor.  clamp_recovery_speed() only bounds what is asked for; the velocity
+  // smoother re-plans from the robot's own speed once it deviates by more than
+  // replan_vel_deviation, so a robot pushed faster than asked was then TARGETED at that speed
+  // and ran away: -0.76 m/s reversing, 1.56 m/s forward, against a 0.278 m/s limit (in the
+  // planning simulator's old acceleration model -- see simulator_model.param.yaml).  A backstop:
+  // past recovery_overspeed_ratio x the limit, command a stop until the speed is back under the
+  // limit itself.
+  {
+    const double measured = velocity_ ? velocity_->longitudinal_velocity
+                                      : (odom_ ? odom_->twist.twist.linear.x : 0.0);
+    const double limit = param_.recovery_speed_limit_mps;
+    if (std::abs(measured) > limit * param_.recovery_overspeed_ratio) {
+      if (!overspeed_braking_) {
+        RCLCPP_WARN(
+          get_logger(), "[episode %u] overspeed: %.2f m/s against a %.2f m/s limit -- braking",
+          episode_id_, measured, limit);
+      }
+      overspeed_braking_ = true;
+    } else if (std::abs(measured) <= limit) {
+      overspeed_braking_ = false;
+    }
+    if (overspeed_braking_) {
+      for (auto & point : traj.points) {
+        point.longitudinal_velocity_mps = 0.0f;
+      }
+    }
+  }
+
+  // Emergency brake.  While this scenario drives, the motion_velocity_planner stop modules
+  // are bypassed entirely, so nothing else in planning is watching.  This is the ONE place
+  // recovery stops the robot mid-plan.
+  if (aeb_brake(traj)) {
     // Zero the velocities but keep the geometry, so the controller still has a reference
     // to hold position against rather than losing its trajectory entirely.
     for (auto & point : traj.points) {
       point.longitudinal_velocity_mps = 0.0f;
-    }
-    if (!aeb_holding_) {
-      aeb_holding_ = true;
-      aeb_hold_since_ = this->now();
     }
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 1000,
       "[episode %u] recovery AEB in %s: %s -- holding for %.1f s",
       episode_id_, state_name(state_).c_str(), aeb_reason_.c_str(),
       (this->now() - aeb_hold_since_).seconds());
-  } else {
-    aeb_holding_ = false;
   }
 
   pub_recovery_traj_->publish(traj);
+}
+
+bool StuckRecoverySupervisorNode::aeb_brake(const autoware_planning_msgs::msg::Trajectory & traj)
+{
+  // Hysteresis on both edges.  Onset: a blockage has to persist for aeb_onset_sec before the
+  // brake goes on, so one noisy costmap frame cannot stop the robot.  Release: it has to be
+  // gone for aeb_release_sec before the brake comes off, so the robot does not lurch at the
+  // edge of a detection.  A stale costmap is not a detection, it is blindness, and brakes at
+  // once.
+  const auto now = this->now();
+  aeb_immediate_ = false;
+  const bool raw = recovery_path_is_blocked(traj);
+  if (raw) {
+    if (!aeb_raw_since_) {
+      aeb_raw_since_ = now;
+    }
+    aeb_clear_since_.reset();
+  } else {
+    aeb_raw_since_.reset();
+    if (!aeb_clear_since_) {
+      aeb_clear_since_ = now;
+    }
+  }
+  if (!aeb_holding_) {
+    if (raw && (aeb_immediate_ || (now - *aeb_raw_since_).seconds() >= param_.aeb_onset_sec)) {
+      aeb_holding_ = true;
+      aeb_hold_since_ = now;
+    }
+  } else if (!raw && (now - *aeb_clear_since_).seconds() >= param_.aeb_release_sec) {
+    aeb_holding_ = false;
+    RCLCPP_INFO(
+      get_logger(), "[episode %u] recovery AEB released after %.1f s", episode_id_,
+      (now - aeb_hold_since_).seconds());
+  }
+  return aeb_holding_;
 }
 
 void StuckRecoverySupervisorNode::publish_hold_trajectory()
@@ -1879,85 +1977,6 @@ bool StuckRecoverySupervisorNode::plan_is_spent_confirmed()
     return false;
   }
   return (now - spent_since_).seconds() >= param_.spent_hold_sec;
-}
-
-void StuckRecoverySupervisorNode::force_freespace_replan(const std::string & why)
-{
-  if (!escape_goal_) {
-    transition(State::BLOCKED, "no goal to replan towards: " + why);
-    return;
-  }
-
-  // Never replan towards a goal the robot has already driven past.  Doing so made
-  // freespace turn the robot around and force its way back into a wall.  Step forward to
-  // the first candidate still ahead; if the whole list is behind us, the manoeuvre is
-  // over by definition -- there is nothing left to escape towards.
-  if (!goal_is_ahead(*escape_goal_)) {
-    if (!advance_past_passed_goals()) {
-      if (!rejoined_reference_path()) {
-        abort_episode("every escape goal is behind the robot and it is off the path");
-        return;
-      }
-      RCLCPP_INFO(
-        get_logger(), "[episode %u] every escape goal is behind the robot -- manoeuvre done (%s)",
-        episode_id_, why.c_str());
-      transition(State::TRANSIT, "drove past the last escape goal; lining up");
-      return;
-    }
-    if (!publish_current_goal()) {
-      if (rejoined_reference_path()) {
-        transition(State::TRANSIT, "no escape goal left ahead; lining up");
-      } else {
-        abort_episode("no escape goal left and the robot is off the path");
-      }
-      return;
-    }
-  }
-
-  ++replan_attempts_;
-  RCLCPP_WARN(
-    get_logger(), "[episode %u] forcing freespace replan (attempt %d/%d) -- %s", episode_id_,
-    replan_attempts_, param_.max_replan_attempts, why.c_str());
-  // Re-publishing the route is what makes freespace reset() and plan again from the
-  // robot's actual pose.  It will not do so on its own here: its own replan triggers
-  // (empty trajectory / obstacle on path / course out) are all false.
-  publish_recovery_route(*escape_goal_);
-  transition(State::REPLAN, why);
-}
-
-void StuckRecoverySupervisorNode::step_replan()
-{
-  const auto now = this->now();
-
-  if (!is_operational() || emergency_code_ != 0) {
-    abort_episode("left autonomous mode or emergency while replanning");
-    return;
-  }
-  if ((now - episode_since_).seconds() > param_.max_episode_duration_sec) {
-    abort_episode("episode watchdog expired while replanning");
-    return;
-  }
-
-  if (freespace_plan_is_valid() && !plan_is_spent()) {
-    last_valid_plan_ = now;
-    spent_since_ = now;
-    replan_attempts_ = 0;
-    RCLCPP_INFO(get_logger(), "[episode %u] replan produced a usable plan", episode_id_);
-    transition(State::RECOVERY, "replan succeeded");
-    return;
-  }
-
-  if ((now - state_since_).seconds() < param_.replan_wait_sec) {
-    return;  // freespace needs a moment: it only plans once the vehicle has stopped
-  }
-
-  if (replan_attempts_ < param_.max_replan_attempts) {
-    force_freespace_replan("previous replan did not produce a usable plan");
-    return;
-  }
-
-  replan_attempts_ = 0;
-  reject_plan_and_try_next_goal("replanning from this pose keeps failing");
 }
 
 std::optional<double> StuckRecoverySupervisorNode::heading_error_to_reference() const
@@ -2551,107 +2570,6 @@ std::optional<double> StuckRecoverySupervisorNode::arc_position_on_reference(
   return arc;
 }
 
-StuckRecoverySupervisorNode::DirectionVerdict StuckRecoverySupervisorNode::judge_plan_direction(
-  const autoware_planning_msgs::msg::Trajectory & segment)
-{
-  // Freespace hands over one direction segment at a time, and waits at every cusp for the
-  // robot to stop before sending the next.  Judged a segment at a time, a forward-back-
-  // forward plan passed its first leg, drove it, and was only refused at the cusp -- with
-  // the robot already half way through a manoeuvre it would never be allowed to finish.
-  // So the segment is judged by the whole plan it was cut from.
-  bool moves = false;
-  for (const auto & point : segment.points) {
-    if (std::abs(point.longitudinal_velocity_mps) > 1e-3) {
-      moves = true;
-      break;
-    }
-  }
-  if (!moves) {
-    return DirectionVerdict::OK;  // a stop trajectory drives nothing, in any direction
-  }
-  if (!param_.allow_counter_mission_legs) {
-    return plan_follows_mission_direction(segment) ? DirectionVerdict::OK
-                                                   : DirectionVerdict::REFUSE;
-  }
-
-  // Freespace cuts every segment at a cusp, so one that changes direction inside itself is
-  // not something it produces.  Refuse it rather than work out what it means.
-  int seen = 0;
-  for (const auto & point : segment.points) {
-    const double v = point.longitudinal_velocity_mps;
-    if (std::abs(v) < 1e-3) {
-      continue;
-    }
-    const int sign = v > 0.0 ? 1 : -1;
-    if (seen != 0 && sign != seen) {
-      aeb_reason_ = "a single freespace segment changes direction part way through";
-      return DirectionVerdict::REFUSE;
-    }
-    seen = sign;
-  }
-
-  const auto now = this->now();
-  const bool full_is_fresh =
-    freespace_full_trajectory_ && freespace_full_trajectory_->points.size() >= 2 &&
-    freespace_full_at_ > route_published_at_ &&
-    (now - freespace_full_at_).seconds() <= param_.freespace_plan_timeout_sec;
-  if (!full_is_fresh) {
-    // A freespace built without ~/output/full_trajectory never sends one.  Driving its
-    // segments without the rest of the plan is exactly the half-manoeuvre problem, so fall
-    // back to the strict rule rather than guess what comes after the cusp.
-    RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 5000,
-      "[episode %u] no current whole plan on %s -- judging the freespace segment on its own, "
-      "with no leg against the mission allowed",
-      episode_id_, param_.topic_freespace_full_trajectory.c_str());
-    return plan_follows_mission_direction(segment) ? DirectionVerdict::OK
-                                                   : DirectionVerdict::REFUSE;
-  }
-
-  // The segment must actually be a piece of this plan.  Both are published in the same
-  // freespace tick but arrive on separate subscriptions, so for a tick after a new plan one
-  // can be the old one's.  That is always with the robot standing still -- freespace only
-  // plans once it has stopped -- so hold.  If they still disagree after a second, it is not
-  // a race any more.
-  const auto & full = *freespace_full_trajectory_;
-  const auto on_plan = [&full](const geometry_msgs::msg::Pose & pose) {
-    return std::any_of(full.points.begin(), full.points.end(), [&pose](const auto & p) {
-      return distance2d(p.pose, pose) < 0.01;
-    });
-  };
-  if (!on_plan(segment.points.front().pose) || !on_plan(segment.points.back().pose)) {
-    if (!plan_mismatch_) {
-      plan_mismatch_ = true;
-      plan_mismatch_since_ = now;
-    }
-    if ((now - plan_mismatch_since_).seconds() > 1.0) {
-      aeb_reason_ = "the freespace segment is not part of the whole plan freespace published";
-      return DirectionVerdict::REFUSE;
-    }
-    aeb_reason_ = "waiting for the whole plan this segment was cut from";
-    return DirectionVerdict::HOLD;
-  }
-  plan_mismatch_ = false;
-
-  const bool same_plan = full_plan_verdict_ &&
-                         full_plan_verdict_->stamp.sec == full.header.stamp.sec &&
-                         full_plan_verdict_->stamp.nanosec == full.header.stamp.nanosec &&
-                         full_plan_verdict_->size == full.points.size();
-  if (!same_plan) {
-    FullPlanVerdict verdict;
-    verdict.stamp = full.header.stamp;
-    verdict.size = full.points.size();
-    verdict.acceptable = full_plan_is_acceptable(full);
-    verdict.reason = aeb_reason_;
-    full_plan_verdict_ = verdict;
-  }
-  if (!full_plan_verdict_->acceptable) {
-    aeb_reason_ = full_plan_verdict_->reason;
-    return DirectionVerdict::REFUSE;
-  }
-  return DirectionVerdict::OK;
-}
-
 bool StuckRecoverySupervisorNode::full_plan_is_acceptable(
   const autoware_planning_msgs::msg::Trajectory & full)
 {
@@ -2703,9 +2621,9 @@ bool StuckRecoverySupervisorNode::full_plan_is_acceptable(
   }
   const auto refuse = [&](const std::string & why) {
     aeb_reason_ = why + " [" + summary.str() + "]";
-    RCLCPP_WARN(
-      get_logger(), "[episode %u] refusing the whole freespace plan: %s", episode_id_,
-      aeb_reason_.c_str());
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000, "[episode %u] refusing the whole freespace plan: %s",
+      episode_id_, aeb_reason_.c_str());
     return false;
   };
   std::ostringstream why;
@@ -2749,8 +2667,8 @@ bool StuckRecoverySupervisorNode::full_plan_is_acceptable(
   }
 
   if (changes > 0) {
-    RCLCPP_INFO(
-      get_logger(),
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000,
       "[episode %u] accepting a freespace plan with %d direction change(s), %.2f m against the "
       "%s mission (ground already given %.2f m of %.2f m) [%s]",
       episode_id_, changes, against_m, mission, ground_given_m_, param_.max_ground_given_m,
@@ -2834,8 +2752,8 @@ void StuckRecoverySupervisorNode::reject_plan_and_try_next_goal(const std::strin
   // Drop the plan, NOT the candidate list.  discard_recovery_state() clears the
   // candidates too, and calling it here sent the first rejection straight to ABORT with
   // thirteen goals still untried.
-  freespace_trajectory_.reset();
-  freespace_traj_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+  // The adopted plan and its segment stay: the robot keeps driving (or braking on) what it
+  // has until a plan for the next goal is adopted.
   freespace_full_trajectory_.reset();
   full_plan_verdict_.reset();
   recovery_trajectory_.reset();
@@ -2849,6 +2767,282 @@ void StuckRecoverySupervisorNode::reject_plan_and_try_next_goal(const std::strin
   RCLCPP_INFO(
     get_logger(), "[episode %u] trying escape goal %zu/%zu instead", episode_id_,
     goal_index_ + 1, goal_candidates_.size());
+}
+
+void StuckRecoverySupervisorNode::drop_adopted_plan()
+{
+  adopted_plan_.reset();
+  adopted_reversing_.clear();
+  seg_prev_ = 0;
+  seg_target_ = 0;
+}
+
+void StuckRecoverySupervisorNode::adopt_plan(
+  const autoware_planning_msgs::msg::Trajectory & plan, const std::string & why)
+{
+  namespace fs_utils = autoware::freespace_planner::utils;
+  adopted_plan_ = plan;
+  adopted_reversing_ = fs_utils::get_reversing_indices(plan);
+  seg_prev_ = 0;
+  seg_target_ = fs_utils::get_next_target_index(plan.points.size(), adopted_reversing_, 0);
+  spent_since_ = this->now();
+  last_valid_plan_ = this->now();
+  RCLCPP_INFO(
+    get_logger(), "[episode %u] adopted a freespace plan (%zu points, %zu cusp(s)): %s",
+    episode_id_, plan.points.size(), adopted_reversing_.size(), why.c_str());
+}
+
+double StuckRecoverySupervisorNode::plan_cost(
+  const autoware_planning_msgs::msg::Trajectory & plan, bool * needs_flip)
+{
+  // Only the segment that would be driven first is costed, and only inside the brake's
+  // window: obstruction the brake would never react to is not the optimizer's business
+  // either.  Obstacles further out are handled by freshness -- ties go to the newest plan,
+  // made from the newest costmap.
+  namespace fs_utils = autoware::freespace_planner::utils;
+  const auto reversing = fs_utils::get_reversing_indices(plan);
+  const auto first_end = fs_utils::get_next_target_index(plan.points.size(), reversing, 0);
+  const auto first_segment =
+    fs_utils::get_partial_trajectory(plan, 0, first_end, this->get_clock());
+  double cost = plan_obstruction(first_segment, nullptr);
+
+  // Changing direction while moving means stopping first.  Point 0 carries no direction of
+  // its own (see full_plan_is_acceptable()), so read the first moving point after it.
+  double first_sign = 0.0;
+  for (size_t i = 1; i < plan.points.size(); ++i) {
+    const double v = plan.points[i].longitudinal_velocity_mps;
+    if (std::abs(v) > 1e-3) {
+      first_sign = v > 0.0 ? 1.0 : -1.0;
+      break;
+    }
+  }
+  const double measured = velocity_ ? velocity_->longitudinal_velocity
+                                    : (odom_ ? odom_->twist.twist.linear.x : 0.0);
+  const bool flip = std::abs(measured) >= param_.th_stopped_velocity_mps && first_sign != 0.0 &&
+                    first_sign * measured < 0.0;
+  if (needs_flip != nullptr) {
+    *needs_flip = flip;
+  }
+  if (flip) {
+    cost += param_.optimizer_stop_penalty;
+  }
+  return cost;
+}
+
+void StuckRecoverySupervisorNode::consider_candidate_plan()
+{
+  // The small optimizer.  Freespace offers a plan every period; this decides whether to
+  // switch to it or keep driving the one adopted.  Cost = obstruction inside the internal
+  // AEB's window, nearer obstruction weighing more, plus the price of stopping to change
+  // direction.  Lower or equal wins -- ties go to the newest plan.
+  if (!freespace_full_trajectory_ || freespace_full_trajectory_->points.size() < 2) {
+    return;
+  }
+  const auto & candidate = *freespace_full_trajectory_;
+  if (
+    last_candidate_stamp_ && last_candidate_stamp_->sec == candidate.header.stamp.sec &&
+    last_candidate_stamp_->nanosec == candidate.header.stamp.nanosec) {
+    return;  // already looked at
+  }
+  const auto now = this->now();
+  // A plan older than the goal it would be driven to answers an older goal.  Not a verdict
+  // on it -- the one for the new goal is at most one freespace period away.
+  if (
+    freespace_full_at_ <= route_published_at_ ||
+    (now - freespace_full_at_).seconds() > param_.freespace_plan_timeout_sec) {
+    return;
+  }
+  last_candidate_stamp_ = candidate.header.stamp;
+
+  if (!full_plan_is_acceptable(candidate)) {
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000, "[episode %u] not adopting a freespace plan: %s",
+      episode_id_, aeb_reason_.c_str());
+    return;
+  }
+  // Containment is judged here, once, from where the robot stands -- the grace for the ground
+  // it is already on is measured from the plan's start, which is the robot.
+  if (!plan_stays_inside_road(candidate)) {
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000, "[episode %u] not adopting a freespace plan: %s",
+      episode_id_, aeb_reason_.c_str());
+    return;
+  }
+
+  bool flip = false;
+  const double cost_new = plan_cost(candidate, &flip);
+  if (!adopted_plan_) {
+    adopt_plan(candidate, "nothing adopted yet");
+    return;
+  }
+  const double cost_now = freespace_trajectory_ ? plan_obstruction(*freespace_trajectory_, nullptr)
+                                                : std::numeric_limits<double>::infinity();
+  const bool take = cost_new <= cost_now + param_.optimizer_tie_epsilon;
+  RCLCPP_INFO_THROTTLE(
+    get_logger(), *get_clock(), 1000,
+    "[episode %u] optimizer: new plan J=%.3f%s vs current J=%.3f -> %s", episode_id_,
+    cost_new, flip ? " (incl. stop to change direction)" : "", cost_now,
+    take ? "switching" : "keeping the current plan");
+  if (take) {
+    std::ostringstream why;
+    why << std::fixed << std::setprecision(3) << "J " << cost_new << " <= " << cost_now;
+    adopt_plan(candidate, why.str());
+  }
+}
+
+void StuckRecoverySupervisorNode::update_adopted_segment()
+{
+  // Segment execution, formerly freespace's: drive one direction segment at a time, and at a
+  // cusp wait for the robot to stop before starting the next.  The segment is published into
+  // freespace_trajectory_, which everything downstream -- the relay, plan_is_spent(), the
+  // optimizer's current cost -- reads as "the plan being driven".
+  namespace fs_utils = autoware::freespace_planner::utils;
+  if (!adopted_plan_ || adopted_plan_->points.size() < 2 || !odom_) {
+    freespace_trajectory_.reset();
+    return;
+  }
+  const auto & plan = *adopted_plan_;
+  const auto now = this->now();
+  if (seg_target_ + 1 < plan.points.size()) {
+    const double stopped_for = is_stopped_ ? (now - stopped_since_).seconds() : 0.0;
+    const double miss = distance2d(plan.points[seg_target_].pose, odom_->pose.pose);
+    if (stopped_for >= param_.cusp_stopped_sec && miss <= param_.cusp_arrived_distance_m) {
+      if (miss > param_.replan_at_cusp_tolerance_m) {
+        // The next segment was planned to start AT this cusp, with the cusp's heading.
+        // Starting it from here means chasing it with a hard steer.  Drop the rest; the
+        // next freespace plan, made from where the robot actually is, takes over.
+        RCLCPP_WARN(
+          get_logger(),
+          "[episode %u] stopped %.2f m from the cusp (tolerance %.2f m); dropping the rest of "
+          "the plan for a fresh one from here",
+          episode_id_, miss, param_.replan_at_cusp_tolerance_m);
+        drop_adopted_plan();
+        freespace_trajectory_.reset();
+        return;
+      }
+      const auto next =
+        fs_utils::get_next_target_index(plan.points.size(), adopted_reversing_, seg_target_);
+      if (next != seg_target_) {
+        RCLCPP_INFO(
+          get_logger(), "[episode %u] cusp reached (%.2f m off); starting the next segment",
+          episode_id_, miss);
+        seg_prev_ = seg_target_;
+        seg_target_ = next;
+      }
+    }
+  }
+  freespace_trajectory_ = std::make_shared<const autoware_planning_msgs::msg::Trajectory>(
+    fs_utils::get_partial_trajectory(plan, seg_prev_, seg_target_, this->get_clock()));
+  freespace_traj_at_ = now;
+}
+
+std::pair<size_t, size_t> StuckRecoverySupervisorNode::footprint_blocked_count(
+  const geometry_msgs::msg::Pose & pose, double margin, int threshold) const
+{
+  // footprint_is_free_with_margin(), counting instead of stopping at the first hit: how many
+  // footprint samples sit on cells at or above threshold (or off the grid), out of how many.
+  // Same sampling, so 0 blocked means exactly "free" there.
+  if (!costmap_is_fresh() || grid_->info.resolution <= 0.0 || grid_->data.empty()) {
+    return {1, 1};
+  }
+  const double res = grid_->info.resolution;
+  const double yaw = tf2::getYaw(pose.orientation);
+  const double cos_yaw = std::cos(yaw);
+  const double sin_yaw = std::sin(yaw);
+  const double half_width = vehicle_width_m_ * 0.5 + margin;
+  const double front = base_to_front_m_ + margin;
+  const double rear = base_to_rear_m_ + margin;
+  const double step = std::max(res * 0.5, 0.02);
+  size_t total = 0;
+  size_t blocked = 0;
+  for (double lon = -rear; lon <= front; lon += step) {
+    for (double lat = -half_width; lat <= half_width; lat += step) {
+      ++total;
+      const double x = pose.position.x + cos_yaw * lon - sin_yaw * lat;
+      const double y = pose.position.y + sin_yaw * lon + cos_yaw * lat;
+      const int col = static_cast<int>(std::floor((x - grid_->info.origin.position.x) / res));
+      const int row = static_cast<int>(std::floor((y - grid_->info.origin.position.y) / res));
+      if (
+        col < 0 || row < 0 || col >= static_cast<int>(grid_->info.width) ||
+        row >= static_cast<int>(grid_->info.height)) {
+        ++blocked;
+        continue;
+      }
+      const auto value =
+        grid_->data[static_cast<size_t>(row) * grid_->info.width + static_cast<size_t>(col)];
+      if (value < 0 || value >= threshold) {
+        ++blocked;
+      }
+    }
+  }
+  return {blocked, total};
+}
+
+double StuckRecoverySupervisorNode::plan_obstruction(
+  const autoware_planning_msgs::msg::Trajectory & traj,
+  std::optional<std::pair<double, geometry_msgs::msg::Pose>> * first_blocked_out) const
+{
+  // The internal AEB's window, shared by the brake and the optimizer: from the pose nearest
+  // the robot out to aeb_lookahead_m.
+  //
+  // [2026-09-27] What is forgiven: only what the robot is ALREADY standing on, and never more
+  // of it.  A pose counts as obstructed by the footprint samples it has on occupied cells IN
+  // EXCESS of the robot's own footprint right now.  So a robot touching something may back
+  // away from it, or slide along a road edge it half overhangs, but not push further in, at
+  // any distance.  This replaced aeb_skip_ahead_m (anything within 0.3 m ignored) and the
+  // containment grace (an opening blocked run up to 2 m forgiven whenever the robot's own
+  // footprint read blocked).  With an obstacle placed right in front of the robot, on a
+  // 0.15 m grid its footprint already touched the obstacle's cells, the grace forgave the
+  // obstacle itself, and the robot crept into it: brake on, released, crept, brake on.
+  if (!odom_ || traj.points.size() < 2) {
+    return 0.0;
+  }
+  const auto [start_blocked, start_total] =
+    footprint_blocked_count(odom_->pose.pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold);
+  (void)start_total;
+  const auto nearest = std::min_element(
+    traj.points.begin(), traj.points.end(), [this](const auto & a, const auto & b) {
+      return distance2d(a.pose, odom_->pose.pose) < distance2d(b.pose, odom_->pose.pose);
+    });
+  const double min_step =
+    grid_ ? std::max(static_cast<double>(grid_->info.resolution), 0.05) : 0.05;
+  const double max_weight = std::max(1.0, param_.optimizer_max_weight);
+  double arc = 0.0;
+  double cost = 0.0;
+  for (auto it = nearest; it != traj.points.end(); ++it) {
+    const double step = (it != nearest) ? distance2d(std::prev(it)->pose, it->pose) : 0.0;
+    arc += step;
+    if (arc > param_.aeb_lookahead_m) {
+      break;
+    }
+    const auto [blocked, total] =
+      footprint_blocked_count(it->pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold);
+    if (blocked <= start_blocked || total == 0) {
+      continue;  // free, or no deeper into anything than the robot already is
+    }
+    const double o =
+      static_cast<double>(blocked - start_blocked) / static_cast<double>(total);
+    if (first_blocked_out != nullptr && !*first_blocked_out) {
+      *first_blocked_out = std::make_pair(arc, it->pose);
+    }
+    const double w = std::clamp(
+      param_.optimizer_reference_distance_m / std::max(arc, 1e-3), 1.0, max_weight);
+    cost += w * o * std::max(step, min_step);
+  }
+  return cost;
+}
+
+double StuckRecoverySupervisorNode::goal_clearance(const geometry_msgs::msg::Pose & pose) const
+{
+  constexpr double kStep = 0.05;
+  double clear = 0.0;
+  for (double m = kStep; m <= param_.goal_clearance_cap_m + 1e-9; m += kStep) {
+    if (!footprint_is_free_with_margin(pose, m, param_.occupancy_threshold)) {
+      return clear;
+    }
+    clear = m;
+  }
+  return clear;
 }
 
 bool StuckRecoverySupervisorNode::recovery_path_is_blocked(
@@ -2870,6 +3064,7 @@ bool StuckRecoverySupervisorNode::recovery_path_is_blocked(
       "[episode %u] recovery AEB: costmap is stale, holding rather than driving blind",
       episode_id_);
     aeb_reason_ = "costmap is stale";
+    aeb_immediate_ = true;
     return true;
   }
 
@@ -2880,49 +3075,28 @@ bool StuckRecoverySupervisorNode::recovery_path_is_blocked(
 
   // (a) The plan itself.  A freespace path has been seen running straight through
   // occupied cells -- whether the costmap moved under it or the search produced it that
-  // way, driving it is not acceptable either way.
-  //
-  // With one exception, the same one the drivable-area test makes: the ground the robot is
-  // ALREADY standing on is not something braking can fix.  Recovery is often called
-  // because the robot has ended up half off the road, and then the opening stretch of
-  // every plan reads blocked.  Braking there holds the robot in the hole it is trying to
-  // climb out of -- measured on the robot as an endless RECOVERY -> REPLAN cycle with the
-  // brake on throughout.  So an opening blocked run is tolerated up to
-  // containment_grace_m; the moment the plan touches clear ground, everything after it is
-  // judged, which is what the brake is actually for: something new in the way.
-  double arc = 0.0;
-  double travel_sign = 0.0;
-  bool reached_clear_ground = false;
-  for (auto it = nearest; it != traj.points.end(); ++it) {
-    if (it != nearest) {
-      arc += distance2d(std::prev(it)->pose, it->pose);
-    }
-    if (travel_sign == 0.0 && std::abs(it->longitudinal_velocity_mps) > 1e-3) {
-      travel_sign = it->longitudinal_velocity_mps > 0.0 ? 1.0 : -1.0;
-    }
-    if (arc > param_.aeb_lookahead_m) {
-      break;
-    }
-    const bool free =
-      footprint_is_free_with_margin(it->pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold);
-    if (free) {
-      reached_clear_ground = true;
-      continue;
-    }
-    if (arc < param_.aeb_skip_ahead_m) {
-      continue;  // the robot is already here; the planner accepted this clearance
-    }
-    if (!reached_clear_ground && arc <= param_.containment_grace_m) {
-      continue;  // still climbing out of where the robot already stands
-    }
+  // way, driving it is not acceptable either way.  The window, and what inside it is
+  // forgiven (the ground the robot already stands on), live in plan_obstruction(), which
+  // the plan optimizer uses too: the brake and the optimizer look at exactly the same poses.
+  std::optional<std::pair<double, geometry_msgs::msg::Pose>> first_blocked;
+  plan_obstruction(traj, &first_blocked);
+  if (first_blocked) {
     // Say exactly where, so a false brake can be checked against the costmap in rviz
     // instead of argued about.
     std::ostringstream why;
-    why << "plan is blocked " << std::fixed << std::setprecision(2) << arc << " m along it, at ("
-        << it->pose.position.x << ", " << it->pose.position.y << "), footprint margin "
-        << param_.aeb_margin_m << " m, threshold " << param_.aeb_occupancy_threshold;
+    why << "plan is blocked " << std::fixed << std::setprecision(2) << first_blocked->first
+        << " m along it, at (" << first_blocked->second.position.x << ", "
+        << first_blocked->second.position.y << "), footprint margin " << param_.aeb_margin_m
+        << " m, threshold " << param_.aeb_occupancy_threshold;
     aeb_reason_ = why.str();
     return true;
+  }
+  double travel_sign = 0.0;
+  for (auto it = nearest; it != traj.points.end(); ++it) {
+    if (std::abs(it->longitudinal_velocity_mps) > 1e-3) {
+      travel_sign = it->longitudinal_velocity_mps > 0.0 ? 1.0 : -1.0;
+      break;
+    }
   }
 
   // (b) Is the robot still ON the plan?  (a) only vouches for the path, so if tracking
@@ -3179,7 +3353,8 @@ void StuckRecoverySupervisorNode::discard_recovery_state()
   goal_candidates_.clear();
   goal_index_ = 0;
   failed_goal_tries_ = 0;
-  replan_attempts_ = 0;
+  drop_adopted_plan();
+  last_candidate_stamp_.reset();
 }
 
 void StuckRecoverySupervisorNode::publish_recovery_route(const geometry_msgs::msg::Pose & goal)
@@ -3196,10 +3371,10 @@ void StuckRecoverySupervisorNode::publish_recovery_route(const geometry_msgs::ms
   route.goal_pose = goal;
   route.allow_modification = false;
 
-  // Drop the plan we are holding before the new goal goes out: anything freespace
-  // produced so far answers the OLD goal, and must never be relayed after this point.
-  freespace_trajectory_.reset();
-  freespace_traj_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+  // Anything freespace produced so far answers the OLD goal and must not be ADOPTED after
+  // this point (consider_candidate_plan() checks the stamps too).  The adopted plan is kept
+  // and driven until one for the new goal replaces it -- changing goals must not stop the
+  // robot.
   freespace_full_trajectory_.reset();
   freespace_full_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
   full_plan_verdict_.reset();
@@ -3277,28 +3452,40 @@ void StuckRecoverySupervisorNode::record_footprint_debug(
   const autoware_planning_msgs::msg::Trajectory & traj)
 {
   footprint_debug_.clear();
-  if (!param_.publish_footprint_markers || !costmap_is_fresh()) {
+  if (!param_.publish_footprint_markers || !costmap_is_fresh() || !odom_ || traj.points.empty()) {
     return;
   }
-  // Same walk and the same grace rule the drivable-area test applies, so what appears in
-  // rviz is the check's own answer and not a second opinion that could disagree with it.
+  // [2026-09-27] The boxes show the internal AEB's own verdict, with the same walk and the
+  // same rule as plan_obstruction(): from the pose nearest the robot, and red only where the
+  // brake would stop.  They used to show the drivable-area test over the whole plan, so a red
+  // box beyond the brake's lookahead read as "the AEB sees it" while the brake, correctly,
+  // did not act on it.
+  const auto start_blocked =
+    footprint_blocked_count(odom_->pose.pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
+      .first;
+  const auto nearest = std::min_element(
+    traj.points.begin(), traj.points.end(), [this](const auto & a, const auto & b) {
+      return distance2d(a.pose, odom_->pose.pose) < distance2d(b.pose, odom_->pose.pose);
+    });
   double arc = 0.0;
-  bool reached_clear_ground = false;
-  for (size_t i = 0; i < traj.points.size(); ++i) {
-    if (i > 0) {
-      arc += distance2d(traj.points[i - 1].pose, traj.points[i].pose);
+  for (auto it = nearest; it != traj.points.end(); ++it) {
+    if (it != nearest) {
+      arc += distance2d(std::prev(it)->pose, it->pose);
     }
-    const auto & pose = traj.points[i].pose;
+    const auto blocked =
+      footprint_blocked_count(it->pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
+        .first;
     FootprintVerdict verdict = FootprintVerdict::FREE;
-    if (footprint_is_free_with_margin(
-          pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)) {
-      reached_clear_ground = true;
-    } else if (!reached_clear_ground && arc <= param_.containment_grace_m) {
-      verdict = FootprintVerdict::GRACED;
-    } else {
-      verdict = FootprintVerdict::BLOCKING;
+    if (blocked > 0) {
+      if (arc > param_.aeb_lookahead_m) {
+        verdict = FootprintVerdict::BEYOND;
+      } else if (blocked <= start_blocked) {
+        verdict = FootprintVerdict::GRACED;
+      } else {
+        verdict = FootprintVerdict::BLOCKING;
+      }
     }
-    footprint_debug_.emplace_back(pose, verdict);
+    footprint_debug_.emplace_back(it->pose, verdict);
   }
 }
 
@@ -3374,6 +3561,12 @@ void StuckRecoverySupervisorNode::append_footprint_markers(
         markers.markers.push_back(
           make("stuck_recovery_plan_footprints", id++, box(pose, param_.aeb_margin_m), 1.0f, 0.1f,
                0.1f, 1.0f, 0.08));
+        break;
+      case FootprintVerdict::BEYOND:
+        // Occupied, but past the brake's lookahead: grey, so it is visibly not a brake.
+        markers.markers.push_back(
+          make("stuck_recovery_plan_footprints", id++, box(pose, param_.aeb_margin_m), 0.5f, 0.5f,
+               0.5f, 0.6f, 0.04));
         break;
     }
   }

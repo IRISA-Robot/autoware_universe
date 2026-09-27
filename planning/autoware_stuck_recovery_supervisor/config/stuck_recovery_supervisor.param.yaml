@@ -75,6 +75,24 @@
     # centimetres past the obstacle it had just cleared -- no place to come to rest.
     # The search is first-fit: the first point with this much clear path behind it wins.
     goal_min_clear_length_m: 2.0
+    # "first_fit": the first point with goal_min_clear_length_m of clear path behind it.
+    # "top_large_fit": every such point past the obstacle out to the edge of the costmap
+    # (max_goal_search_distance_m does not apply; the mission goal still does), ranked by
+    # lateral clearance -- the largest extra margin, up to goal_clearance_cap_m, at which the
+    # goal footprint stays free.  Widest first; the rest are the fallbacks, in that order.
+    goal_selection: "top_large_fit"
+    goal_clearance_cap_m: 1.0
+    # The escape goal is re-selected all through RECOVERY, not only once at its start: every
+    # goal_reselect_period_sec the search runs again from where the robot is, against the
+    # costmap as it is now, and at once whenever the current goal itself becomes blocked
+    # (2026-09-27: an obstacle dropped onto the original goal was driven straight towards).
+    # The goal moves only for a clearly better one -- goal_reselect_min_gain_m more clearance
+    # with top_large_fit, or goal_reselect_min_shift_m away with first_fit -- so near-equal
+    # spots cannot swap every period.  Moving the goal does not stop the robot: the current
+    # plan is driven until the one for the new goal is adopted.
+    goal_reselect_period_sec: 1.0
+    goal_reselect_min_gain_m: 0.05
+    goal_reselect_min_shift_m: 0.5
     max_goal_search_distance_m: 30.0
     # Must mirror vehicle_shape_margin_m in recovery_freespace_planner.param.yaml.  The
     # escape goal is validated against the same inflated footprint freespace will use,
@@ -146,6 +164,13 @@
     # Ignore anything closer than this: the robot is already there and the planner
     # accepted that clearance.  Without it the brake latches on the inflation around the
     # robot and it can never move at all.
+    # [2026-09-27] No longer used by the brake.  The brake now forgives only what the robot
+    # already stands on, and never more of it: a pose is blocked by the footprint samples it
+    # has on occupied cells IN EXCESS of the robot's own footprint now, at any distance.  The
+    # skip (everything within 0.3 m ignored) and the containment grace (an opening blocked run
+    # up to 2 m forgiven whenever the robot's footprint read blocked) together forgave an
+    # obstacle placed right in front of the robot, and it crept into it.
+    # containment_grace_m still applies to the drivable-area test on a new plan.
     aeb_skip_ahead_m: 0.3
     # How far the robot may drift from the plan it is following before the plan stops
     # describing where it is going.  This replaced a straight-line sweep ahead of the
@@ -162,6 +187,12 @@
     # A brake held this long is not a passing hazard -- the plan is not drivable.
     # Replan instead of holding until the episode times out.
     aeb_hold_replan_sec: 3.0
+    # Internal AEB hysteresis.  Blocked this long before braking (one noisy costmap frame
+    # must not stop the robot), clear this long before releasing (no lurching at the edge of
+    # a detection).  A stale costmap still brakes at once.  This brake is the only thing that
+    # stops the robot in the middle of a plan.
+    aeb_onset_sec: 0.2
+    aeb_release_sec: 0.5
 
     # How much of a plan may begin on ground the costmap calls blocked before the plan is
     # refused outright.  Recovery is often called precisely BECAUSE the robot has ended up
@@ -249,6 +280,14 @@
     # relay, which is the single publisher of the recovery trajectory, so nothing
     # downstream can raise it.
     recovery_speed_limit_mps: 0.278   # 1 km/h
+    # Overspeed governor, a backstop.  The clamp only bounds what is ASKED for: once the robot
+    # deviates by more than the smoother's replan_vel_deviation it re-plans from the robot's
+    # own speed, so a robot pushed faster than asked was then targeted at that speed and ran
+    # away (-0.76 m/s reversing, 1.56 m/s forward, 2026-09-27).  That was the planning
+    # simulator's old acceleration model -- it now steps on velocity, like the robot (see
+    # simulator_model.param.yaml).  Measured speed above this multiple of the limit commands a
+    # stop until the speed is back under the limit.
+    recovery_overspeed_ratio: 1.5
 
     # How long to wait for a usable plan before trying the next goal candidate.  When the
     # candidates run out the robot stops and waits for an operator -- it does not give
@@ -279,19 +318,43 @@
     # Keep it below min_leg_length_m (1.5), or the start of every leg reads as spent.
     min_engageable_stop_distance_m: 1.1
 
-    # Forced replan.  When the robot stops past the live part of freespace's plan, the
-    # nearest trajectory point to it already has zero velocity: the smoother then reads
-    # target_vel = 0 and will never restart it, while freespace sees no reason to replan
-    # (its trajectory is not empty, no obstacle is on the remaining path, and the robot
-    # is still well within th_course_out_distance_m).  Re-publishing the route makes it
-    # reset and plan afresh from where the robot actually is.
-    replan_wait_sec: 5.0        # freespace only plans once the vehicle has stopped
-    max_replan_attempts: 3      # then move on to the next goal candidate
-    # The plan must look spent for this long, continuously, before a replan is forced.
-    # Judging it instantly produced a RECOVERY <-> REPLAN oscillation: a single short
-    # partial from freespace was enough to trigger a forced replan, and that republishes
-    # the route -- which makes freespace reset() and discard the plan it had just made.
+    # [2026-09-27] Continuous execution, Nav2-style.  Freespace is a planner server: it
+    # replans every period from wherever the robot is and publishes whole plans only
+    # (continuous_replan.* in recovery_freespace_planner.param.yaml).  This node is the
+    # executor: it keeps an ADOPTED plan, cuts its direction segments itself, waits at cusps,
+    # and switches plans without stopping.  The REPLAN state and its forced replans are gone
+    # (replan_wait_sec, max_replan_attempts removed): a spent plan just waits for the next
+    # fresh one.  The robot stops mid-plan only for the internal AEB (below), at planned
+    # cusps, or when there is no plan at all.
+    #
+    # The plan is judged spent only after it has looked spent this long, continuously; until
+    # then it still counts as usable for goal_retry_sec.
     spent_hold_sec: 2.0
+
+    # Segment execution at cusps, moved here from freespace.  Stopped cusp_stopped_sec within
+    # cusp_arrived_distance_m of the cusp -> next segment; but stopped further than
+    # replan_at_cusp_tolerance_m from it, the rest of the plan is dropped and the next fresh
+    # plan (from where the robot actually is) taken instead -- the next segment was planned to
+    # start AT the cusp, and starting it from elsewhere meant a hard steer.
+    cusp_arrived_distance_m: 0.5
+    cusp_stopped_sec: 1.0
+    replan_at_cusp_tolerance_m: 0.15
+
+    # Plan optimizer: each new freespace plan vs the plan being driven.
+    #   J = sum over the internal AEB's window (the same poses the brake inspects: from the
+    #       robot out to aeb_lookahead_m, minus aeb_skip_ahead_m and the opening grace run)
+    #       of  w(s) * obstruction * ds,   w(s) = clamp(reference_distance_m / s, 1, max_weight)
+    #     + stop_penalty  if adopting it means stopping now to change direction.
+    # obstruction = fraction of the footprint (aeb_margin_m) on occupied cells.  Only
+    # obstacles the brake would react to count; nearer counts more.  The new plan is adopted
+    # when J_new <= J_current + tie_epsilon: ties go to the newest, made from the newest
+    # costmap, which is what steers around obstacles still beyond the brake's window.
+    # stop_penalty 0.5 = half a metre of fully obstructed footprint at reference_distance_m.
+    optimizer:
+      reference_distance_m: 1.0
+      max_weight: 5.0
+      stop_penalty: 0.5
+      tie_epsilon: 0.01
     # A freespace plan is only acted on if it arrived AFTER this episode's goal was
     # published, and within this long.  /planning/recovery/route has to be
     # transient_local (freespace subscribes latched), so a goal from a previous episode
@@ -416,9 +479,6 @@
     topic_scenario: "/planning/scenario_planning/scenario"
     topic_occupancy_grid: "/planning/recovery/costmap_generator/occupancy_grid"
     topic_recovery_trajectory: "/planning/recovery/trajectory"
-    # freespace publishes here; the supervisor is the single publisher on
-    # topic_out_recovery_trajectory, relaying freespace's plan verbatim.
-    topic_freespace_trajectory: "/planning/recovery/freespace_trajectory"
     # The whole plan the segment above was cut from.  Judged before the first leg moves.
     topic_freespace_full_trajectory: "/planning/recovery/freespace_full_trajectory"
     topic_recovery_is_completed: "/planning/recovery/is_completed"

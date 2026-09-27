@@ -18,6 +18,8 @@ int32 ABORT=6
 # the robot against its own mission direction for as long as the obstacle kept coming.
 # The number stays reserved so bags recorded before the removal still decode.
 int32 BACKOFF_REMOVED=7
+# 8 was REPLAN, stopping to wait for a forced freespace replan.  Freespace now replans
+# continuously and the supervisor switches plans while moving; never published any more.
 int32 REPLAN=8
 # Every road back to lane driving runs through here: drive the reference path at the
 # recovery crawl until the robot actually points along it.  Handing back on lateral
