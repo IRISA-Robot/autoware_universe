@@ -556,6 +556,72 @@ TEST(TestUtils, getAvoidMarginNarrowLaneLanelet)
   }
 }
 
+TEST(TestUtils, getAvoidMarginDisableStaticAvoidanceLanelet)
+{
+  const auto parameters = get_parameters();
+  const auto planner_data = get_planner_data();
+
+  // Two lanelets side by side along x: [0, 100] tagged disable_static_avoidance=true and
+  // [100, 200] tagged disable_static_avoidance=false (an explicit false behaves as untagged).
+  const auto make_lanelet = [](const double x0, const double x1, const std::string & value) {
+    lanelet::LineString3d left(lanelet::utils::getId());
+    left.push_back(lanelet::Point3d(lanelet::utils::getId(), x0, 1.75, 0.0));
+    left.push_back(lanelet::Point3d(lanelet::utils::getId(), x1, 1.75, 0.0));
+    lanelet::LineString3d right(lanelet::utils::getId());
+    right.push_back(lanelet::Point3d(lanelet::utils::getId(), x0, -1.75, 0.0));
+    right.push_back(lanelet::Point3d(lanelet::utils::getId(), x1, -1.75, 0.0));
+    lanelet::Lanelet ll(lanelet::utils::getId(), left, right);
+    ll.attributes()[lanelet::AttributeName::Subtype] = lanelet::AttributeValueString::Road;
+    ll.attributes()["disable_static_avoidance"] = value;
+    return ll;
+  };
+
+  const auto tagged = make_lanelet(0.0, 100.0, "true");
+  const auto map = std::make_shared<lanelet::LaneletMap>();
+  map->add(tagged);
+  map->add(make_lanelet(100.0, 200.0, "false"));
+
+  autoware_map_msgs::msg::LaneletMapBin map_bin_msg;
+  map_bin_msg.header.frame_id = "map";
+  lanelet::utils::conversion::toBinMsg(map, &map_bin_msg);
+
+  auto route_handler = std::make_shared<autoware::route_handler::RouteHandler>();
+  route_handler->setMap(map_bin_msg);
+  planner_data->route_handler = route_handler;
+
+  const auto object_at = [](const double x) {
+    ObjectData object_data;
+    object_data.is_parked = false;
+    object_data.distance_factor = 1.0;
+    object_data.to_road_shoulder_distance = 5.0;
+    object_data.object.classification.emplace_back(
+      autoware_perception_msgs::build<ObjectClassification>()
+        .label(ObjectClassification::TRUCK)
+        .probability(1.0));
+    object_data.object.kinematics.initial_pose_with_covariance.pose =
+      autoware::test_utils::createPose(x, 0.0, 0.0, 0.0, 0.0, 0.0);
+    return object_data;
+  };
+
+  // inside the tagged lanelet -> not avoidable, regardless of otherwise-favorable road width.
+  EXPECT_FALSE(
+    filtering_utils::getAvoidMargin(object_at(50.0), planner_data, parameters).has_value());
+
+  // centre outside every lanelet (road edge), but the lane it blocks is tagged -> not avoidable.
+  {
+    auto object_data = object_at(50.0);
+    object_data.object.kinematics.initial_pose_with_covariance.pose.position.y = 2.0;
+    object_data.overhang_lanelet = map->laneletLayer.get(tagged.id());
+    EXPECT_FALSE(
+      filtering_utils::getAvoidMargin(object_data, planner_data, parameters).has_value());
+  }
+
+  // inside the lanelet tagged false -> unaffected.
+  const auto output = filtering_utils::getAvoidMargin(object_at(150.0), planner_data, parameters);
+  ASSERT_TRUE(output.has_value());
+  EXPECT_DOUBLE_EQ(output.value(), 1.9);
+}
+
 TEST(TestUtils, isAvoidanceOpportunityRunningOut)
 {
   // Keep front-constant-distance computation independent of PlannerData vehicle geometry, which

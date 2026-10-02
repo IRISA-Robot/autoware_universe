@@ -480,6 +480,9 @@ private:
   void classify_stop();
   bool is_operational() const;
   bool is_stuck_candidate() const;
+  /// Id of a lanelet tagged `disable_recovery=true` that contains the robot, if any.  Such a
+  /// lanelet is one the map author does not want recovery manoeuvring in at all.
+  std::optional<lanelet::Id> recovery_disabled_lanelet() const;
 
   // Recovery helpers
   bool capture_reference_path();

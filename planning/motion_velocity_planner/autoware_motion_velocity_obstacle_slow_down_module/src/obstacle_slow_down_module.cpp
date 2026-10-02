@@ -74,13 +74,11 @@ geometry_msgs::msg::Point to_geom_point(const autoware_utils::Point2d & point)
   return geom_point;
 }
 
-// `narrow_lane` lanelet-tag escape hatch (see the static_obstacle_avoidance module's
-// isObjectPositionInNarrowLaneLanelet() and the obstacle_stop_module's mirrored helper): objects
-// positioned inside a lanelet tagged `narrow_lane=yes` are excluded from in-lane avoidance
-// shifting there, relying on this module's dedicated narrow_lane_margin check instead.
-bool is_position_in_narrow_lane_lanelet(
+// Whether `position` lies inside a lanelet whose boolean attribute `tag` is true; a missing
+// attribute counts as false.
+bool is_position_in_tagged_lanelet(
   const std::shared_ptr<route_handler::RouteHandler> & route_handler,
-  const geometry_msgs::msg::Point & position)
+  const geometry_msgs::msg::Point & position, const char * tag)
 {
   if (!route_handler) return false;
   const auto lanelet_map_ptr = route_handler->getLaneletMapPtr();
@@ -93,12 +91,43 @@ bool is_position_in_narrow_lane_lanelet(
     lanelet::BasicPoint2d(position.x + search_margin, position.y + search_margin));
   for (const auto & ll : lanelet_map_ptr->laneletLayer.search(bbox)) {
     if (
-      ll.attributeOr("narrow_lane", false) &&
+      ll.attributeOr(tag, false) &&
       !boost::geometry::disjoint(point, ll.polygon2d().basicPolygon())) {
       return true;
     }
   }
   return false;
+}
+
+// `narrow_lane` lanelet-tag escape hatch (see the static_obstacle_avoidance module's
+// isObjectPositionInTaggedLanelet() and the obstacle_stop_module's mirrored helper): objects
+// positioned inside a lanelet tagged `narrow_lane=yes` are excluded from in-lane avoidance
+// shifting there, relying on this module's dedicated narrow_lane_margin check instead.
+bool is_position_in_narrow_lane_lanelet(
+  const std::shared_ptr<route_handler::RouteHandler> & route_handler,
+  const geometry_msgs::msg::Point & position)
+{
+  return is_position_in_tagged_lanelet(route_handler, position, "narrow_lane");
+}
+
+// `disable_obs_slow_down` lanelet tag: no slow-down for obstacles there.  Checked at the
+// obstacle and at the trajectory point nearest to it, i.e. the stretch that would be slowed:
+// the obstacles this module reacts to sit beside the path, often at the road edge with their
+// centre outside every lanelet, so the obstacle position alone would miss most of them.
+bool is_slow_down_disabled_at(
+  const std::shared_ptr<route_handler::RouteHandler> & route_handler,
+  const std::vector<TrajectoryPoint> & traj_points, const geometry_msgs::msg::Point & position)
+{
+  constexpr const char * tag = "disable_obs_slow_down";
+  if (is_position_in_tagged_lanelet(route_handler, position, tag)) {
+    return true;
+  }
+  if (traj_points.empty()) {
+    return false;
+  }
+  const auto nearest_idx = autoware::motion_utils::findNearestIndex(traj_points, position);
+  return is_position_in_tagged_lanelet(
+    route_handler, traj_points.at(nearest_idx).pose.position, tag);
 }
 
 // TODO(murooka) following two functions are copied from behavior_velocity_planner.
@@ -285,6 +314,9 @@ ObstacleSlowDownModule::convert_point_cloud_to_slow_down_points(
     for (const auto & index : cluster_indices.indices) {
       const auto obstacle_point = autoware::motion_velocity_planner::utils::to_geometry_point(
         filtered_points_ptr->points[index]);
+      if (is_slow_down_disabled_at(route_handler, traj_points, obstacle_point)) {
+        continue;
+      }
       // 1. brief filtering - filters out point-cloud points that are far from the trajectory
       // laterally The lateral distance of the obstacle-point to trajectory is measured below
       const auto current_lat_dist_from_obstacle_to_traj =
@@ -556,6 +588,13 @@ ObstacleSlowDownModule::create_slow_down_obstacle_for_predicted_object(
 
   const auto & obj_pose =
     object->get_predicted_current_pose(clock_->now(), predicted_objects_stamp);
+  if (is_slow_down_disabled_at(route_handler, traj_points, obj_pose.position)) {
+    RCLCPP_DEBUG_THROTTLE(
+      logger_, *clock_, 1000,
+      "[SlowDown] Ignore obstacle (%s) since it is in a disable_obs_slow_down lanelet.",
+      obj_uuid_str.substr(0, 4).c_str());
+    return std::nullopt;
+  }
   const bool is_obstacle_in_narrow_lane =
     is_position_in_narrow_lane_lanelet(route_handler, obj_pose.position);
   RCLCPP_WARN_THROTTLE(

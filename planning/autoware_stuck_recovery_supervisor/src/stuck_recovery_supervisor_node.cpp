@@ -25,10 +25,15 @@
 // omitting it links fine but dies at the first call.
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
+#include <boost/geometry/algorithms/disjoint.hpp>
+#include <lanelet2_core/LaneletMap.h>
+#include <lanelet2_core/geometry/Polygon.h>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -871,6 +876,31 @@ bool StuckRecoverySupervisorNode::is_stuck_candidate() const
   return is_stopped_ && !legit_stop_ && is_operational() && odom_ != nullptr;
 }
 
+std::optional<lanelet::Id> StuckRecoverySupervisorNode::recovery_disabled_lanelet() const
+{
+  if (!map_ready_ || !odom_) {
+    return std::nullopt;
+  }
+  const auto map = route_handler_.getLaneletMapPtr();
+  if (!map) {
+    return std::nullopt;
+  }
+  const auto & p = odom_->pose.pose.position;
+  const lanelet::BasicPoint2d point(p.x, p.y);
+  constexpr double search_margin = 0.1;
+  const lanelet::BoundingBox2d bbox(
+    lanelet::BasicPoint2d(p.x - search_margin, p.y - search_margin),
+    lanelet::BasicPoint2d(p.x + search_margin, p.y + search_margin));
+  for (const auto & ll : map->laneletLayer.search(bbox)) {
+    if (
+      ll.attributeOr("disable_recovery", false) &&
+      !boost::geometry::disjoint(point, ll.polygon2d().basicPolygon())) {
+      return ll.id();
+    }
+  }
+  return std::nullopt;
+}
+
 // ---------------------------------------------------------------------------
 // FSM steps
 // ---------------------------------------------------------------------------
@@ -1064,6 +1094,28 @@ void StuckRecoverySupervisorNode::step_suspect()
   }
 
   if (!(force_requested_ || (timer_elapsed && triggerable))) {
+    return;
+  }
+
+  // `disable_recovery` lanelet tag: the map says no manoeuvring here, so the robot waits in
+  // SUSPECT -- it is stuck, and saying so -- but neither PROBE nor RECOVERY is entered, not even
+  // when an operator forces it.  The episode watchdog still cycles it through COOLDOWN, and
+  // once the robot is somewhere untagged the next episode recovers as usual.
+  if (const auto tagged = recovery_disabled_lanelet()) {
+    if (force_requested_) {
+      force_requested_ = false;
+      RCLCPP_WARN(
+        get_logger(),
+        "[episode %u] forced recovery refused: robot is in lanelet %ld tagged "
+        "disable_recovery",
+        episode_id_, static_cast<long>(*tagged));
+    }
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "[episode %u] stuck for %.1f s (blocked by '%s') in lanelet %ld tagged disable_recovery "
+      "-- waiting instead of recovering",
+      episode_id_, (now - state_since_).seconds(), stop_source_module_.c_str(),
+      static_cast<long>(*tagged));
     return;
   }
 

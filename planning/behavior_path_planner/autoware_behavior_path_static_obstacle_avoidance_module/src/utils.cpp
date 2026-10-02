@@ -1302,13 +1302,16 @@ bool isNoNeedAvoidanceBehavior(
 }
 
 /**
- * @brief check whether the object sits inside a lanelet tagged `narrow_lane=yes`.
+ * @brief check whether the object sits inside a lanelet whose boolean attribute `tag` is true
+ * (e.g. `narrow_lane=yes`, `disable_static_avoidance=true`).
  * @param object data.
  * @param planner data, which includes the route handler / lanelet map.
- * @return true if the object's position falls inside a narrow_lane-tagged lanelet.
+ * @param tag lanelet attribute name; a missing attribute counts as false.
+ * @return true if the object's position falls inside a lanelet with that tag set.
  */
-bool isObjectPositionInNarrowLaneLanelet(
-  const ObjectData & object, const std::shared_ptr<const PlannerData> & planner_data)
+bool isObjectPositionInTaggedLanelet(
+  const ObjectData & object, const std::shared_ptr<const PlannerData> & planner_data,
+  const char * tag)
 {
   const auto & route_handler = planner_data->route_handler;
   if (!route_handler) return false;
@@ -1323,7 +1326,7 @@ bool isObjectPositionInNarrowLaneLanelet(
     lanelet::BasicPoint2d(object_position.x + search_margin, object_position.y + search_margin));
   for (const auto & ll : lanelet_map_ptr->laneletLayer.search(bbox)) {
     if (
-      ll.attributeOr("narrow_lane", false) &&
+      ll.attributeOr(tag, false) &&
       !boost::geometry::disjoint(point, ll.polygon2d().basicPolygon())) {
       return true;
     }
@@ -1345,7 +1348,20 @@ std::optional<double> getAvoidMargin(
   // `narrow_lane` lanelet-tag escape hatch: a user-authored tag for lanelets too narrow for safe
   // in-lane avoidance -- forces zero shift there, relying on obstacle_stop's dedicated
   // narrow-lane margin instead (see autoware_motion_velocity_obstacle_stop_module).
-  if (isObjectPositionInNarrowLaneLanelet(object, planner_data)) {
+  if (isObjectPositionInTaggedLanelet(object, planner_data, "narrow_lane")) {
+    return std::nullopt;
+  }
+
+  // `disable_static_avoidance` lanelet tag: the same "not avoidable" verdict as narrow_lane, but
+  // only that -- obstacle_stop / obstacle_slow_down keep their nominal margins. The object stays
+  // a target (INSUFFICIENT_DRIVABLE_SPACE), so ego yields behind it instead of shifting.
+  // The lane the object blocks (overhang_lanelet, filled by getRoadShoulderDistance()) counts as
+  // well as the lanelet under its centre: an object at the road edge overhangs the lane with its
+  // centre outside every lanelet -- measured live, centre 0.1 m past the bound of a tagged
+  // lanelet, and the centre check alone let the shift through.
+  if (
+    object.overhang_lanelet.attributeOr("disable_static_avoidance", false) ||
+    isObjectPositionInTaggedLanelet(object, planner_data, "disable_static_avoidance")) {
     return std::nullopt;
   }
 
