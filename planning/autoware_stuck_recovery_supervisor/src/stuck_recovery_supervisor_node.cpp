@@ -359,6 +359,7 @@ void StuckRecoverySupervisorNode::setup_interfaces()
     [this](const autoware_map_msgs::msg::LaneletMapBin::ConstSharedPtr msg) {
       route_handler_.setMap(*msg);
       map_ready_ = true;
+      build_tagged_regions();
       // The route may well have arrived first; it could not be fed then, so feed it now.
       if (route_) {
         route_handler_.setRoute(*route_);
@@ -2547,12 +2548,66 @@ bool StuckRecoverySupervisorNode::capture_reference_path_from_trajectory()
   return reference_path_.size() >= 2;
 }
 
+// Tag names this node understands.  One per margin rather than a single "tight here" flag:
+// two gates on one route can then ask for two different numbers, and a tag that is absent
+// simply leaves the yaml value in force.
+namespace tags
+{
+constexpr const char * kAebMargin = "custom_aeb_margin";
+constexpr const char * kGoalShapeMargin = "custom_goal_shape_margin";
+}  // namespace tags
+
+void StuckRecoverySupervisorNode::build_tagged_regions()
+{
+  tagged_regions_.clear();
+  const auto map = route_handler_.getLaneletMapPtr();
+  if (!map) {
+    return;
+  }
+  for (const char * tag : {tags::kAebMargin, tags::kGoalShapeMargin}) {
+    std::vector<TaggedRegion> regions;
+    for (const auto & ll : map->laneletLayer) {
+      if (!ll.hasAttribute(tag)) continue;
+      const auto value = ll.attribute(tag).asDouble();
+      if (!value) {
+        RCLCPP_WARN(
+          get_logger(), "lanelet %ld carries %s but its value is not a number; ignoring",
+          ll.id(), tag);
+        continue;
+      }
+      regions.push_back({ll.id(), ll.polygon2d().basicPolygon(), *value});
+    }
+    if (regions.empty()) continue;
+    for (const auto & r : regions) {
+      RCLCPP_INFO(get_logger(), "%s = %.3f m on lanelet %ld", tag, r.value, r.id);
+    }
+    tagged_regions_.emplace(tag, std::move(regions));
+  }
+}
+
+double StuckRecoverySupervisorNode::margin_at(
+  const geometry_msgs::msg::Pose & pose, const char * tag, double fallback) const
+{
+  const auto itr = tagged_regions_.find(tag);
+  if (itr == tagged_regions_.end()) {
+    return fallback;  // nothing in this map carries the tag: the yaml value stands everywhere
+  }
+  const lanelet::BasicPoint2d point(pose.position.x, pose.position.y);
+  for (const auto & region : itr->second) {
+    if (!boost::geometry::disjoint(point, region.polygon)) {
+      return region.value;
+    }
+  }
+  return fallback;
+}
+
 bool StuckRecoverySupervisorNode::footprint_is_free(const geometry_msgs::msg::Pose & pose) const
 {
   // Goal placement stays on the stricter planning threshold: where the robot is asked
   // to come to REST, a cell that is only probably occupied is reason enough to move on.
   return footprint_is_free_with_margin(
-    pose, param_.goal_shape_margin_m, param_.occupancy_threshold);
+    pose, margin_at(pose, tags::kGoalShapeMargin, param_.goal_shape_margin_m),
+    param_.occupancy_threshold);
 }
 
 bool StuckRecoverySupervisorNode::footprint_is_free_with_margin(
@@ -2901,7 +2956,9 @@ bool StuckRecoverySupervisorNode::plan_stays_inside_road(
       break;
     }
     if (footprint_is_free_with_margin(
-          traj.points[i].pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)) {
+          traj.points[i].pose,
+          margin_at(traj.points[i].pose, tags::kAebMargin, param_.aeb_margin_m),
+          param_.aeb_occupancy_threshold)) {
       reached_clear_ground = true;
       continue;
     }
@@ -3189,9 +3246,13 @@ double StuckRecoverySupervisorNode::plan_obstruction(
   // more occupied cells, "blocked 0.00 m along it" braked the robot, and a braked robot cannot
   // take out heading -- it sat there until the operator stopped it.
   const size_t start_blocked = std::max(
-    footprint_blocked_count(odom_->pose.pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
+    footprint_blocked_count(
+      odom_->pose.pose, margin_at(odom_->pose.pose, tags::kAebMargin, param_.aeb_margin_m),
+      param_.aeb_occupancy_threshold)
       .first,
-    footprint_blocked_count(nearest->pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
+    footprint_blocked_count(
+      nearest->pose, margin_at(nearest->pose, tags::kAebMargin, param_.aeb_margin_m),
+      param_.aeb_occupancy_threshold)
       .first);
   const double min_step =
     grid_ ? std::max(static_cast<double>(grid_->info.resolution), 0.05) : 0.05;
@@ -3205,7 +3266,9 @@ double StuckRecoverySupervisorNode::plan_obstruction(
       break;
     }
     const auto [blocked, total] =
-      footprint_blocked_count(it->pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold);
+      footprint_blocked_count(
+        it->pose, margin_at(it->pose, tags::kAebMargin, param_.aeb_margin_m),
+        param_.aeb_occupancy_threshold);
     if (blocked <= start_blocked || total == 0) {
       continue;  // free, or no deeper into anything than the robot already is
     }
@@ -3655,9 +3718,13 @@ void StuckRecoverySupervisorNode::record_footprint_debug(
       return distance2d(a.pose, odom_->pose.pose) < distance2d(b.pose, odom_->pose.pose);
     });
   const size_t start_blocked = std::max(
-    footprint_blocked_count(odom_->pose.pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
+    footprint_blocked_count(
+      odom_->pose.pose, margin_at(odom_->pose.pose, tags::kAebMargin, param_.aeb_margin_m),
+      param_.aeb_occupancy_threshold)
       .first,
-    footprint_blocked_count(nearest->pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
+    footprint_blocked_count(
+      nearest->pose, margin_at(nearest->pose, tags::kAebMargin, param_.aeb_margin_m),
+      param_.aeb_occupancy_threshold)
       .first);
   double arc = 0.0;
   for (auto it = nearest; it != traj.points.end(); ++it) {
@@ -3665,7 +3732,9 @@ void StuckRecoverySupervisorNode::record_footprint_debug(
       arc += distance2d(std::prev(it)->pose, it->pose);
     }
     const auto blocked =
-      footprint_blocked_count(it->pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
+      footprint_blocked_count(
+        it->pose, margin_at(it->pose, tags::kAebMargin, param_.aeb_margin_m),
+        param_.aeb_occupancy_threshold)
         .first;
     FootprintVerdict verdict = FootprintVerdict::FREE;
     if (blocked > 0) {
@@ -3739,25 +3808,25 @@ void StuckRecoverySupervisorNode::append_footprint_markers(
     switch (verdict) {
       case FootprintVerdict::FREE:
         markers.markers.push_back(
-          make("stuck_recovery_plan_footprints", id++, box(pose, param_.aeb_margin_m), 0.2f, 0.9f,
+          make("stuck_recovery_plan_footprints", id++, box(pose, margin_at(pose, tags::kAebMargin, param_.aeb_margin_m)), 0.2f, 0.9f,
                0.3f, 0.5f, 0.03));
         break;
       case FootprintVerdict::GRACED:
         // Blocked, but this is the ground the robot already stands on -- drawn so it is
         // obvious the check saw it and deliberately let it pass.
         markers.markers.push_back(
-          make("stuck_recovery_plan_footprints", id++, box(pose, param_.aeb_margin_m), 1.0f, 0.7f,
+          make("stuck_recovery_plan_footprints", id++, box(pose, margin_at(pose, tags::kAebMargin, param_.aeb_margin_m)), 1.0f, 0.7f,
                0.0f, 0.9f, 0.05));
         break;
       case FootprintVerdict::BLOCKING:
         markers.markers.push_back(
-          make("stuck_recovery_plan_footprints", id++, box(pose, param_.aeb_margin_m), 1.0f, 0.1f,
+          make("stuck_recovery_plan_footprints", id++, box(pose, margin_at(pose, tags::kAebMargin, param_.aeb_margin_m)), 1.0f, 0.1f,
                0.1f, 1.0f, 0.08));
         break;
       case FootprintVerdict::BEYOND:
         // Occupied, but past the brake's lookahead: grey, so it is visibly not a brake.
         markers.markers.push_back(
-          make("stuck_recovery_plan_footprints", id++, box(pose, param_.aeb_margin_m), 0.5f, 0.5f,
+          make("stuck_recovery_plan_footprints", id++, box(pose, margin_at(pose, tags::kAebMargin, param_.aeb_margin_m)), 0.5f, 0.5f,
                0.5f, 0.6f, 0.04));
         break;
     }
@@ -3767,9 +3836,10 @@ void StuckRecoverySupervisorNode::append_footprint_markers(
   // row, so it is worth seeing on its own rather than buried among the plan's boxes.
   if (odom_ && costmap_is_fresh()) {
     const bool ego_free = footprint_is_free_with_margin(
-      odom_->pose.pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold);
+      odom_->pose.pose, margin_at(odom_->pose.pose, tags::kAebMargin, param_.aeb_margin_m),
+      param_.aeb_occupancy_threshold);
     markers.markers.push_back(make(
-      "stuck_recovery_ego_footprint", 0, box(odom_->pose.pose, param_.aeb_margin_m),
+      "stuck_recovery_ego_footprint", 0, box(odom_->pose.pose, margin_at(odom_->pose.pose, tags::kAebMargin, param_.aeb_margin_m)),
       ego_free ? 0.2f : 1.0f, ego_free ? 0.9f : 0.4f, ego_free ? 1.0f : 0.0f, 1.0f, 0.06));
   }
 

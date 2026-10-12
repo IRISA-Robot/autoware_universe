@@ -51,6 +51,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -689,6 +690,35 @@ private:
   rclcpp::Subscription<autoware_map_msgs::msg::LaneletMapBin>::SharedPtr sub_map_{};
   autoware::route_handler::RouteHandler route_handler_{};
   bool map_ready_{false};
+
+  // --- per-position margin overrides from the map -------------------------------------
+  //
+  // A margin is a property of WHERE A POSE IS, not of what state the robot is in.  Every
+  // check below already iterates pose by pose, so each pose is judged against the lanelet it
+  // actually sits in: a lanelet carrying the tag uses the tagged value, every other lanelet
+  // uses the yaml default unchanged.
+  //
+  // This replaces the alternatives we rejected: no parameter callbacks, no remote parameter
+  // setting, no per-episode latch, no second planner instance.  It also removes the hazard
+  // those would have carried -- a robot that entered a tagged region under a relaxed margin
+  // cannot be stranded there by the margin tightening behind it, because the poses inside the
+  // region keep their relaxed value no matter where the robot has got to.
+  //
+  // The tagged lanelets are few and the map is static, so their polygons are collected once
+  // when the map arrives and every lookup is a handful of point-in-polygon tests.
+  struct TaggedRegion
+  {
+    lanelet::Id id{};
+    lanelet::BasicPolygon2d polygon{};
+    double value{};
+  };
+  /// Tag name -> the regions carrying it, built once in the map callback.
+  std::unordered_map<std::string, std::vector<TaggedRegion>> tagged_regions_{};
+  /// Collect the lanelets carrying any tag this node understands.  Called once per map.
+  void build_tagged_regions();
+  /// The value in force at `pose` for `tag`, or `fallback` when no tagged lanelet covers it.
+  double margin_at(
+    const geometry_msgs::msg::Pose & pose, const char * tag, double fallback) const;
   bool route_handler_ready_{false};
   autoware_planning_msgs::msg::LaneletRoute::ConstSharedPtr route_{};
   autoware_adapi_v1_msgs::msg::RouteState::ConstSharedPtr route_state_{};
