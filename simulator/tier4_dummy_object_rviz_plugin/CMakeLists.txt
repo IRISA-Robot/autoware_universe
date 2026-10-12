@@ -19,10 +19,12 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/tools/unknown_pose.cpp
   src/tools/delete_all_objects.cpp
   src/tools/delete_nearest_object.cpp
+  src/panels/dummy_object_scenario_panel.cpp
 )
 
 target_link_libraries(${PROJECT_NAME}
-  ${QT_LIBRARIES})
+  ${QT_LIBRARIES}
+  yaml-cpp)
 
 # Export the plugin to be imported by rviz2
 pluginlib_export_plugin_description_file(rviz_common plugins/plugin_description.xml)

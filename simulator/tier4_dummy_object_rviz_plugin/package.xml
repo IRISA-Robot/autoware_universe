@@ -21,6 +21,7 @@
   <depend>tf2_ros</depend>
   <depend>autoware_perception_msgs</depend>
   <depend>tier4_simulation_msgs</depend>
+  <depend>yaml_cpp_vendor</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>autoware_lint_common</test_depend>

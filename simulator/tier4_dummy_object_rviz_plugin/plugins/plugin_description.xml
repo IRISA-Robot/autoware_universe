@@ -33,4 +33,9 @@
          type="rviz_plugins::DeleteAllObjectsTool"
          base_class_type="rviz_common::Tool">
   </class>
+  <class name="rviz_plugins/DummyObjectScenarioPanel"
+         type="rviz_plugins::DummyObjectScenarioPanel"
+         base_class_type="rviz_common::Panel">
+    <description>Save the placed dummy objects to a YAML scenario and load it back on later runs.</description>
+  </class>
 </library>
