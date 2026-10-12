@@ -1335,53 +1335,6 @@ bool isObjectPositionInTaggedLanelet(
 }
 
 /**
- * @brief read a NUMERIC lanelet attribute for the lane this object blocks.
- * @param object data.
- * @param planner data, which includes the route handler / lanelet map.
- * @param tag lanelet attribute name, e.g. `custom_avoidance_margin`.
- * @return the value when the tag is found, std::nullopt otherwise.
- *
- * Same dual lookup as the `disable_static_avoidance` check below, and for the same reason: an
- * object that defines a narrow gate sits at (or just past) the lane edge, so its own centre is
- * outside every lanelet.  Measured on the Higashida gate: both gate objects lie outside lanelet
- * 789, one of them by 7 mm, and a position-only lookup flickered in and out with perception
- * jitter (std_dev 0.03 m in the scenario).  overhang_lanelet is the lane the object overhangs,
- * taken from its closest pose ON THE PATH, so it is stable for exactly this case.
- */
-std::optional<double> getTaggedLaneletValue(
-  const ObjectData & object, const std::shared_ptr<const PlannerData> & planner_data,
-  const char * tag)
-{
-  const auto read = [&tag](const lanelet::ConstLanelet & ll) -> std::optional<double> {
-    if (!ll.hasAttribute(tag)) return std::nullopt;
-    const auto value = ll.attribute(tag).asDouble();
-    if (!value) return std::nullopt;  // tag present but not a number: ignore rather than guess
-    return *value;
-  };
-
-  if (const auto value = read(object.overhang_lanelet)) {
-    return value;
-  }
-
-  const auto & route_handler = planner_data->route_handler;
-  if (!route_handler) return std::nullopt;
-  const auto lanelet_map_ptr = route_handler->getLaneletMapPtr();
-  if (!lanelet_map_ptr) return std::nullopt;
-
-  const auto object_position = object.getPosition();
-  const lanelet::BasicPoint2d point(object_position.x, object_position.y);
-  constexpr double search_margin = 0.1;
-  const lanelet::BoundingBox2d bbox(
-    lanelet::BasicPoint2d(object_position.x - search_margin, object_position.y - search_margin),
-    lanelet::BasicPoint2d(object_position.x + search_margin, object_position.y + search_margin));
-  for (const auto & ll : lanelet_map_ptr->laneletLayer.search(bbox)) {
-    if (boost::geometry::disjoint(point, ll.polygon2d().basicPolygon())) continue;
-    if (const auto value = read(ll)) return value;
-  }
-  return std::nullopt;
-}
-
-/**
  * @brief get avoidance lateral margin based on road width.
  * @param object data.
  * @param planner data, which includes ego vehicle footprint info.
@@ -1406,55 +1359,21 @@ std::optional<double> getAvoidMargin(
   // well as the lanelet under its centre: an object at the road edge overhangs the lane with its
   // centre outside every lanelet -- measured live, centre 0.1 m past the bound of a tagged
   // lanelet, and the centre check alone let the shift through.
-  // `custom_avoidance_margin` lanelet tag: a per-lanelet override of this object class's
-  // hard+soft lateral margin, carrying its own VALUE (e.g. custom_avoidance_margin=0.15).
-  //
-  // WHY A SMALLER MARGIN IS WHAT MAKES A NARROW GATE PASSABLE, not a bigger one.  The shift this
-  // module asks for is (hard + soft + 0.5*W) - (distance from the path to the object's near
-  // edge).  Two objects flanking the path each ask for that, in opposite directions, and when
-  // the two demands cannot both be met the module declares one of them unavoidable and stops.
-  // Measured on the Higashida gate (lanelets 789/777): free gap 1.057 m, lane 1.500 m wide, gate
-  // centre 0.172 m off the lane centreline, so the near edges sit 0.357 m and 0.700 m from it.
-  // At the default 0.36+0.14 the module wanted to shift 0.493 m, which drives the far side of
-  // the vehicle straight through the other object -- that is the "it shifted too far towards the
-  // edge and then stopped" this tag exists to fix.
-  //
-  // The value that works is bounded by the geometry itself: the most clearance obtainable on
-  // both sides at once is half the free gap minus half the vehicle, 1.057/2 - 0.35 = 0.178 m.
-  // Tag a little under that (0.15) and both demands are satisfiable at the same time, with the
-  // path landing near the gate centre.
-  //
-  // PRECEDENCE, in the order the checks above and below run:
-  //   narrow_lane              -> nullopt, wins over everything (it claims no shift fits at all)
-  //   custom_avoidance_margin  -> overrides disable_static_avoidance on the same lanelet, since
-  //                               an explicit margin is a more specific instruction than a
-  //                               blanket disable
-  //   disable_static_avoidance -> nullopt
-  const auto custom_avoidance_margin =
-    getTaggedLaneletValue(object, planner_data, "custom_avoidance_margin");
-
   if (
-    !custom_avoidance_margin &&
-    (object.overhang_lanelet.attributeOr("disable_static_avoidance", false) ||
-     isObjectPositionInTaggedLanelet(object, planner_data, "disable_static_avoidance"))) {
+    object.overhang_lanelet.attributeOr("disable_static_avoidance", false) ||
+    isObjectPositionInTaggedLanelet(object, planner_data, "disable_static_avoidance")) {
     return std::nullopt;
   }
 
   const auto & vehicle_width = planner_data->parameters.vehicle_width;
   const auto object_type = utils::getHighestProbLabel(object.object.classification);
   const auto object_parameter = parameters->object_parameters.at(object_type);
-  // The tag replaces hard+soft outright: hard takes the tagged value and soft goes to zero, so
-  // the margin is exactly what the map asked for rather than the tag plus a leftover soft term.
-  const auto lateral_hard_margin =
-    custom_avoidance_margin
-      ? *custom_avoidance_margin
-      : (object.is_parked ? object_parameter.lateral_hard_margin_for_parked_vehicle
-                          : object_parameter.lateral_hard_margin);
-  const auto lateral_soft_margin =
-    custom_avoidance_margin ? 0.0 : object_parameter.lateral_soft_margin;
+  const auto lateral_hard_margin = object.is_parked
+                                     ? object_parameter.lateral_hard_margin_for_parked_vehicle
+                                     : object_parameter.lateral_hard_margin;
 
-  const auto max_avoid_margin =
-    lateral_hard_margin * object.distance_factor + lateral_soft_margin + 0.5 * vehicle_width;
+  const auto max_avoid_margin = lateral_hard_margin * object.distance_factor +
+                                object_parameter.lateral_soft_margin + 0.5 * vehicle_width;
   const auto min_avoid_margin = lateral_hard_margin + 0.5 * vehicle_width;
   const auto soft_lateral_distance_limit =
     object.to_road_shoulder_distance - parameters->soft_drivable_bound_margin - 0.5 * vehicle_width;
