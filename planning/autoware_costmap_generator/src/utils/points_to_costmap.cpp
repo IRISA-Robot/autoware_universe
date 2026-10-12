@@ -82,8 +82,35 @@ grid_map::Index PointsToCostmap::fetchGridIndexFromPoint(const pcl::PointXYZ & p
   double mapped_x = (grid_length_x_ - origin_x_offset - point.x) / grid_resolution_;
   double mapped_y = (grid_length_y_ - origin_y_offset - point.y) / grid_resolution_;
 
-  int mapped_x_ind = std::ceil(mapped_x);
-  int mapped_y_ind = std::ceil(mapped_y);
+  // [2026-10-12] std::ceil -> std::floor.  mapped_x/mapped_y are the point's distance from the
+  // grid's upper edge measured in cells, and grid_map's own getIndexFromPosition() floors that
+  // quantity.  ceil() is floor()+1 for every non-integer value, so every point was filed one
+  // cell further along the index, i.e. one cell toward DECREASING x and y in the map frame --
+  // a fixed 0.05 m bias at our resolution, in a fixed map direction, independent of where the
+  // robot is looking.
+  //
+  // MEASURED on the Higashida gate before this change, against the very pointcloud the costmap
+  // was built from (perception polygons agreed with the points to within a cell):
+  //
+  //   raw points       gap 246.719 .. 247.637   centre 247.178
+  //   costmap produced free 246.600 .. 247.550   centre 247.075
+  //
+  // Same width, centre 0.08 m to the left.  The corridor the planner saw was displaced, so a
+  // path centred in it sat ~0.10 m left of the true centre and the footprint reached 0.045 m
+  // INTO the left obstacle -- while both A* and the supervisor's brake read it as clear,
+  // because they read this same grid.  Nothing downstream could catch it.
+  //
+  // Lanelet/wayarea polygons were never affected: they go through
+  // object_map::fill_polygon_areas(), which uses grid_map_utils::PolygonIterator.  Only the
+  // point layer was shifted, which is why the error showed up as an ASYMMETRY -- the wall made
+  // of points moved while the wall made of the lane boundary stayed put.
+  //
+  // This is a translation, not a resize: the painted obstacle keeps its shape and area, it just
+  // lands where the points actually are.  No expansion parameter compensates for it -- the
+  // point layer takes none (expand_polygon_size and size_of_expansion_kernel feed
+  // generateObjectsCostmap only, and use_objects is false here).
+  int mapped_x_ind = std::floor(mapped_x);
+  int mapped_y_ind = std::floor(mapped_y);
   grid_map::Index index(mapped_x_ind, mapped_y_ind);
   return index;
 }
