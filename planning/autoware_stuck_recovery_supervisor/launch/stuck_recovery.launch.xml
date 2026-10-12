@@ -23,6 +23,10 @@
        default="$(find-pkg-share autoware_stuck_recovery_supervisor)/config/stuck_recovery_supervisor.param.yaml"/>
   <arg name="recovery_costmap_generator_param_path"/>
   <arg name="recovery_freespace_planner_param_path"/>
+  <!-- NARROW preset: an OVERRIDE file layered on top of the base one above. ROS 2 merges
+       parameter files per dotted key, later file wins, so this holds only the handful of
+       keys that differ. -->
+  <arg name="recovery_freespace_planner_narrow_param_path"/>
 
   <group>
     <push-ros-namespace namespace="/planning"/>
@@ -42,8 +46,12 @@
         <remap from="~/input/objects" to="$(var input_objects_topic_name)"/>
         <remap from="~/input/points_no_ground" to="$(var input_pointcloud_topic_name)"/>
         <remap from="~/input/vector_map" to="/map/vector_map"/>
-        <!-- private scenario topic: armed by the supervisor, invisible to the rest of the stack -->
-        <remap from="~/input/scenario" to="/planning/recovery/scenario"/>
+        <!-- Private scenario topic: armed by the supervisor, invisible to the rest of the stack.
+             The costmap is shared by every preset, so it is armed by recovery itself rather
+             than by any one preset. If it listened on a preset topic, selecting a different
+             preset would publish EMPTY there and take the grid away from the preset that was
+             actually chosen. -->
+        <remap from="~/input/scenario" to="/planning/recovery/costmap_scenario"/>
         <!-- The MISSION route, not the supervisor's synthetic one.  With
              wayarea_from_route the free area shrinks to the lanelets this route drives
              through, so recovery can no longer plan through a road that happens to
@@ -80,6 +88,33 @@
         <remap from="is_completed" to="/planning/recovery/is_completed"/>
         <param from="$(var vehicle_param_file)"/>
         <param from="$(var recovery_freespace_planner_param_path)"/>
+        <param name="planning_algorithm" value="$(var recovery_freespace_algorithm)"/>
+        <extra_arg name="use_intra_process_comms" value="false"/>
+      </composable_node>
+
+      <!-- NARROW preset instance.
+           Same plugin and the same shared costmap; its own topics, footprint and lattice.
+           Selection IS arming: the supervisor publishes the "Parking" scenario to exactly one
+           preset's scenario topic, and a planner that is not armed does not plan at all
+           (freespace utils.cpp is_active), so the idle instance costs nothing.
+           No second costmap: grid_resolution is identical in both presets by design, because
+           resolution is accuracy rather than permissiveness and both presets want it accurate.
+           Its own ROUTE topic matters as much as its own scenario topic. /planning/recovery/route
+           is transient_local (freespace subscribes latched), so a goal left on a SHARED route
+           topic would be answered by whichever instance is armed next. That has already sent the
+           robot to a previous scenario's goal once; separate topics stop the two instances
+           inheriting each other's stale goals. -->
+      <composable_node pkg="autoware_freespace_planner" plugin="autoware::freespace_planner::FreespacePlannerNode" name="freespace_planner_narrow" namespace="">
+        <remap from="~/input/route" to="/planning/recovery/narrow/route"/>
+        <remap from="~/input/scenario" to="/planning/recovery/narrow/scenario"/>
+        <remap from="~/input/occupancy_grid" to="costmap_generator/occupancy_grid"/>
+        <remap from="~/input/odometry" to="/localization/kinematic_state"/>
+        <remap from="~/output/trajectory" to="/planning/recovery/narrow/freespace_trajectory"/>
+        <remap from="~/output/full_trajectory" to="/planning/recovery/narrow/freespace_full_trajectory"/>
+        <remap from="is_completed" to="/planning/recovery/narrow/is_completed"/>
+        <param from="$(var vehicle_param_file)"/>
+        <param from="$(var recovery_freespace_planner_param_path)"/>
+        <param from="$(var recovery_freespace_planner_narrow_param_path)"/>
         <param name="planning_algorithm" value="$(var recovery_freespace_algorithm)"/>
         <extra_arg name="use_intra_process_comms" value="false"/>
       </composable_node>

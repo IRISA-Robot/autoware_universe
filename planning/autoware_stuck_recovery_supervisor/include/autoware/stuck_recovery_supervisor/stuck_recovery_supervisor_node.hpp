@@ -689,6 +689,59 @@ private:
   rclcpp::Subscription<autoware_map_msgs::msg::LaneletMapBin>::SharedPtr sub_map_{};
   autoware::route_handler::RouteHandler route_handler_{};
   bool map_ready_{false};
+
+  // --- recovery presets -----------------------------------------------------------------
+  //
+  // One freespace_planner instance per preset, each launched with its own footprint and
+  // lattice, each on its own topics.  SELECTION IS ARMING: the supervisor publishes the
+  // "Parking" scenario to exactly one preset's scenario topic and EMPTY to the rest, and a
+  // planner that is not armed does not plan at all (freespace utils.cpp is_active).  No
+  // parameter is ever mutated, nothing is set on a remote node, and the two instances cannot
+  // inherit each other's stale goals because their route topics are separate -- that matters,
+  // the route topic is transient_local and a latched goal has sent the robot to a previous
+  // scenario's destination before.
+  //
+  // The costmap is shared: resolution is accuracy, not permissiveness, so every preset wants
+  // it equally sharp.  It therefore has its OWN arming topic, armed whenever recovery runs,
+  // independent of which preset is selected.
+  //
+  // The preset is chosen ONCE per episode and held.  Choosing per cycle would mean a robot
+  // that entered a tagged region under a relaxed margin loses it the moment it crosses out --
+  // and then every plan out of where it already is gets rejected.  Stranded by a permission
+  // withdrawn after it was used.
+  struct RecoveryPreset
+  {
+    std::string name{};
+    double aeb_margin_m{};
+    double goal_shape_margin_m{};
+    /// How long a goal is given to produce a usable plan before it is abandoned.  Per preset
+    /// because it is really a budget for the freespace instance behind the preset, and those
+    /// instances are deliberately not equally fast: the narrow instance runs turning_steps 3,
+    /// which triples A*'s branching factor, so the same wall clock buys it far fewer
+    /// expansions.  Measured on the gate, the narrow instance spent 650 ms per cycle against a
+    /// shared 2.0 s budget -- barely three attempts before the goal was thrown away, out of a
+    /// 60 s episode.  A slower searcher needs a longer leash, not a shorter episode.
+    double goal_retry_sec{};
+    rclcpp::Publisher<autoware_internal_planning_msgs::msg::Scenario>::SharedPtr pub_scenario{};
+    rclcpp::Publisher<autoware_planning_msgs::msg::LaneletRoute>::SharedPtr pub_route{};
+    rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr sub_full_traj{};
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_completed{};
+  };
+  /// Arms the shared costmap.  Separate from every preset's scenario topic precisely so
+  /// that disarming a preset never disarms the grid the other preset needs.
+  rclcpp::Publisher<autoware_internal_planning_msgs::msg::Scenario>::SharedPtr
+    pub_costmap_scenario_{};
+  std::vector<RecoveryPreset> presets_{};
+  /// Index into presets_, latched for the whole episode.  0 is always the fallback.
+  size_t active_preset_{0};
+  /// Build presets_ from parameters.  With no preset list configured this makes a single
+  /// preset from the legacy topic_out_* parameters, i.e. exactly the previous behaviour.
+  void build_recovery_presets();
+  /// Pick the preset for the episode about to start, from the lanelet under ego.  Latches
+  /// active_preset_ and logs the choice; falls back to index 0 when the tag is absent,
+  /// unparsable, or names a preset that was not configured.
+  void select_preset_for_episode();
+  const RecoveryPreset & preset() const { return presets_.at(active_preset_); }
   bool route_handler_ready_{false};
   autoware_planning_msgs::msg::LaneletRoute::ConstSharedPtr route_{};
   autoware_adapi_v1_msgs::msg::RouteState::ConstSharedPtr route_state_{};

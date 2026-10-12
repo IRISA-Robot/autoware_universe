@@ -485,6 +485,13 @@ void StuckRecoverySupervisorNode::setup_interfaces()
     param_.topic_out_scenario, rclcpp::QoS{1});
   pub_route_ = create_publisher<autoware_planning_msgs::msg::LaneletRoute>(
     param_.topic_out_route, latched);
+  // The shared costmap gets its own arming topic.  If it shared a preset's topic, selecting
+  // any other preset would publish EMPTY there and disarm the grid that every preset needs.
+  pub_costmap_scenario_ = create_publisher<autoware_internal_planning_msgs::msg::Scenario>(
+    declare_parameter<std::string>(
+      "topic_out_costmap_scenario", "/planning/recovery/costmap_scenario"),
+    rclcpp::QoS{1});
+  build_recovery_presets();
   pub_force_recovery_ =
     create_publisher<std_msgs::msg::Bool>(param_.topic_out_force_recovery, rclcpp::QoS{1});
   pub_state_ = create_publisher<autoware_stuck_recovery_msgs::msg::RecoveryState>(
@@ -975,6 +982,8 @@ void StuckRecoverySupervisorNode::step_nominal()
   entry_pose_ = odom_->pose.pose;
   furthest_pose_ = odom_->pose.pose;
   ground_given_m_ = 0.0;
+  // Chosen here, with the rest of the per-episode state, and held until the episode ends.
+  select_preset_for_episode();
   capture_reference_path();
   transition(State::SUSPECT, "ego stopped without a legitimate reason");
 }
@@ -1477,14 +1486,16 @@ void StuckRecoverySupervisorNode::step_recovery()
 
   // A plan counts as usable while one is adopted and not spent.  A spent plan needs no forced
   // replan: the next freespace plan, made from where the robot now stands, is adopted as soon
-  // as it arrives.  Only when none has been usable for goal_retry_sec is the goal changed.
+  // as it arrives.  Only when none has been usable for the preset's goal_retry_sec is the goal
+  // changed -- per preset, because the budget has to match how fast that preset's freespace
+  // instance actually searches.
   if (adopted_plan_ && !plan_is_spent_confirmed()) {
     last_valid_plan_ = now;
   } else if (!escape_goal_) {
     // No goal published yet (none fits right now): nothing freespace could have answered, so
     // the retry clock does not run.  recovery_timeout_sec still bounds the wait.
     last_valid_plan_ = now;
-  } else if ((now - last_valid_plan_).seconds() > param_.goal_retry_sec) {
+  } else if ((now - last_valid_plan_).seconds() > preset().goal_retry_sec) {
     if (start_blocked_) {
       // Freespace rejects the START pose even with its escape margin: the robot's own
       // footprint is in the obstacle, not merely inside the margin around it.  No plan
@@ -2552,7 +2563,7 @@ bool StuckRecoverySupervisorNode::footprint_is_free(const geometry_msgs::msg::Po
   // Goal placement stays on the stricter planning threshold: where the robot is asked
   // to come to REST, a cell that is only probably occupied is reason enough to move on.
   return footprint_is_free_with_margin(
-    pose, param_.goal_shape_margin_m, param_.occupancy_threshold);
+    pose, preset().goal_shape_margin_m, param_.occupancy_threshold);
 }
 
 bool StuckRecoverySupervisorNode::footprint_is_free_with_margin(
@@ -2901,7 +2912,7 @@ bool StuckRecoverySupervisorNode::plan_stays_inside_road(
       break;
     }
     if (footprint_is_free_with_margin(
-          traj.points[i].pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)) {
+          traj.points[i].pose, preset().aeb_margin_m, param_.aeb_occupancy_threshold)) {
       reached_clear_ground = true;
       continue;
     }
@@ -3189,9 +3200,9 @@ double StuckRecoverySupervisorNode::plan_obstruction(
   // more occupied cells, "blocked 0.00 m along it" braked the robot, and a braked robot cannot
   // take out heading -- it sat there until the operator stopped it.
   const size_t start_blocked = std::max(
-    footprint_blocked_count(odom_->pose.pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
+    footprint_blocked_count(odom_->pose.pose, preset().aeb_margin_m, param_.aeb_occupancy_threshold)
       .first,
-    footprint_blocked_count(nearest->pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
+    footprint_blocked_count(nearest->pose, preset().aeb_margin_m, param_.aeb_occupancy_threshold)
       .first);
   const double min_step =
     grid_ ? std::max(static_cast<double>(grid_->info.resolution), 0.05) : 0.05;
@@ -3205,7 +3216,7 @@ double StuckRecoverySupervisorNode::plan_obstruction(
       break;
     }
     const auto [blocked, total] =
-      footprint_blocked_count(it->pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold);
+      footprint_blocked_count(it->pose, preset().aeb_margin_m, param_.aeb_occupancy_threshold);
     if (blocked <= start_blocked || total == 0) {
       continue;  // free, or no deeper into anything than the robot already is
     }
@@ -3275,7 +3286,7 @@ bool StuckRecoverySupervisorNode::recovery_path_is_blocked(
     std::ostringstream why;
     why << "plan is blocked " << std::fixed << std::setprecision(2) << first_blocked->first
         << " m along it, at (" << first_blocked->second.position.x << ", "
-        << first_blocked->second.position.y << "), footprint margin " << param_.aeb_margin_m
+        << first_blocked->second.position.y << "), footprint margin " << preset().aeb_margin_m
         << " m, threshold " << param_.aeb_occupancy_threshold;
     aeb_reason_ = why.str();
     return true;
@@ -3495,6 +3506,133 @@ bool StuckRecoverySupervisorNode::path_yaw_opposes_ego() const
   return std::cos(path_yaw - ego_yaw) < 0.0;
 }
 
+void StuckRecoverySupervisorNode::build_recovery_presets()
+{
+  presets_.clear();
+  const auto names =
+    declare_parameter<std::vector<std::string>>("recovery_preset_names", std::vector<std::string>{});
+
+  const auto subscribe = [this](RecoveryPreset & preset, const std::string & full_traj_topic,
+                                const std::string & completed_topic) {
+    const rclcpp::QoS qos{1};
+    // Every preset is subscribed all the time; the callbacks drop anything that did not come
+    // from the preset currently in force.  Subscribing only to the active one would mean
+    // tearing subscriptions up and down inside an episode, which is a worse failure mode than
+    // ignoring a message.
+    const std::string name = preset.name;
+    preset.sub_full_traj = create_subscription<autoware_planning_msgs::msg::Trajectory>(
+      full_traj_topic, qos,
+      [this, name](const autoware_planning_msgs::msg::Trajectory::ConstSharedPtr msg) {
+        if (presets_.at(active_preset_).name != name) {
+          return;  // a plan from a preset that is not driving right now
+        }
+        freespace_full_trajectory_ = msg;
+        freespace_full_at_ = this->now();
+      });
+    preset.sub_completed = create_subscription<std_msgs::msg::Bool>(
+      completed_topic, qos, [this, name](const std_msgs::msg::Bool::ConstSharedPtr msg) {
+        if (presets_.at(active_preset_).name != name) {
+          return;
+        }
+        recovery_completed_ = msg->data;
+      });
+  };
+
+  if (names.empty()) {
+    // No preset list configured: one implicit preset on the legacy topics, with the legacy
+    // margins.  This is byte-for-byte the behaviour this node had before presets existed.
+    RecoveryPreset preset;
+    preset.name = "normal";
+    preset.aeb_margin_m = param_.aeb_margin_m;
+    preset.goal_shape_margin_m = param_.goal_shape_margin_m;
+    preset.goal_retry_sec = param_.goal_retry_sec;
+    preset.pub_scenario = pub_scenario_;
+    preset.pub_route = pub_route_;
+    subscribe(preset, param_.topic_freespace_full_trajectory, param_.topic_recovery_is_completed);
+    presets_.push_back(preset);
+    RCLCPP_INFO(get_logger(), "recovery presets: none configured, using the legacy single path");
+    return;
+  }
+
+  // Presets own the inputs from here on.  The legacy subscriptions created in the constructor
+  // listen on the same default topics with no preset guard, so leaving them alive would give a
+  // disarmed preset's plan an unguarded way in.
+  sub_freespace_full_traj_.reset();
+  sub_recovery_completed_.reset();
+
+  const rclcpp::QoS latched = rclcpp::QoS{1}.transient_local();
+  for (const auto & name : names) {
+    const std::string ns = "recovery_preset." + name + ".";
+    RecoveryPreset preset;
+    preset.name = name;
+    preset.aeb_margin_m =
+      declare_parameter<double>(ns + "aeb_margin_m", param_.aeb_margin_m);
+    preset.goal_shape_margin_m =
+      declare_parameter<double>(ns + "goal_shape_margin_m", param_.goal_shape_margin_m);
+    preset.goal_retry_sec =
+      declare_parameter<double>(ns + "goal_retry_sec", param_.goal_retry_sec);
+    preset.pub_scenario = create_publisher<autoware_internal_planning_msgs::msg::Scenario>(
+      declare_parameter<std::string>(ns + "scenario_topic", param_.topic_out_scenario),
+      rclcpp::QoS{1});
+    preset.pub_route = create_publisher<autoware_planning_msgs::msg::LaneletRoute>(
+      declare_parameter<std::string>(ns + "route_topic", param_.topic_out_route), latched);
+    subscribe(
+      preset,
+      declare_parameter<std::string>(
+        ns + "full_trajectory_topic", param_.topic_freespace_full_trajectory),
+      declare_parameter<std::string>(
+        ns + "is_completed_topic", param_.topic_recovery_is_completed));
+    RCLCPP_INFO(
+      get_logger(),
+      "recovery preset [%zu] \"%s\": aeb_margin %.3f m, goal_shape_margin %.3f m, goal_retry "
+      "%.1f s",
+      presets_.size(), name.c_str(), preset.aeb_margin_m, preset.goal_shape_margin_m,
+      preset.goal_retry_sec);
+    presets_.push_back(preset);
+  }
+}
+
+void StuckRecoverySupervisorNode::select_preset_for_episode()
+{
+  active_preset_ = 0;  // the fallback, and what an untagged lanelet gets
+  if (presets_.size() < 2 || !odom_ || !map_ready_) {
+    return;
+  }
+  constexpr const char * kTag = "recovery_used";
+
+  lanelet::ConstLanelet ego_lanelet;
+  if (!route_handler_.getClosestLaneletWithinRoute(odom_->pose.pose, &ego_lanelet)) {
+    RCLCPP_INFO(
+      get_logger(), "[episode %u] no lanelet under ego; recovery preset \"%s\"", episode_id_,
+      presets_.front().name.c_str());
+    return;
+  }
+  const std::string wanted = ego_lanelet.attributeOr(kTag, std::string());
+  if (wanted.empty()) {
+    RCLCPP_INFO(
+      get_logger(), "[episode %u] lanelet %ld has no %s; recovery preset \"%s\"", episode_id_,
+      ego_lanelet.id(), kTag, presets_.front().name.c_str());
+    return;
+  }
+  for (size_t i = 0; i < presets_.size(); ++i) {
+    if (presets_[i].name == wanted) {
+      active_preset_ = i;
+      RCLCPP_INFO(
+        get_logger(),
+        "[episode %u] lanelet %ld says %s=%s; recovery preset \"%s\" (aeb_margin %.3f m, "
+        "goal_shape_margin %.3f m, goal_retry %.1f s) -- held for the whole episode",
+        episode_id_, ego_lanelet.id(), kTag, wanted.c_str(), presets_[i].name.c_str(),
+        presets_[i].aeb_margin_m, presets_[i].goal_shape_margin_m, presets_[i].goal_retry_sec);
+      return;
+    }
+  }
+  RCLCPP_WARN(
+    get_logger(),
+    "[episode %u] lanelet %ld asks for recovery preset \"%s\" but no such preset is configured; "
+    "falling back to \"%s\"",
+    episode_id_, ego_lanelet.id(), wanted.c_str(), presets_.front().name.c_str());
+}
+
 void StuckRecoverySupervisorNode::publish_recovery_arming(bool active)
 {
   autoware_internal_planning_msgs::msg::Scenario msg;
@@ -3508,7 +3646,24 @@ void StuckRecoverySupervisorNode::publish_recovery_arming(bool active)
   if (active) {
     msg.activating_scenarios.push_back(autoware_internal_planning_msgs::msg::Scenario::PARKING);
   }
-  pub_scenario_->publish(msg);
+
+  // The shared costmap follows recovery itself, never a preset: disarming it along with an
+  // unselected preset would take the grid away from the preset that IS selected.
+  if (pub_costmap_scenario_) {
+    pub_costmap_scenario_->publish(msg);
+  }
+
+  // Exactly one preset is armed.  Every other preset is explicitly told EMPTY rather than
+  // simply left alone, so a preset armed earlier in the run cannot keep planning in the
+  // background against a goal still latched on its own route topic.
+  autoware_internal_planning_msgs::msg::Scenario idle;
+  idle.current_scenario = autoware_internal_planning_msgs::msg::Scenario::EMPTY;
+  for (size_t i = 0; i < presets_.size(); ++i) {
+    if (!presets_[i].pub_scenario) {
+      continue;
+    }
+    presets_[i].pub_scenario->publish((active && i == active_preset_) ? msg : idle);
+  }
 }
 
 void StuckRecoverySupervisorNode::reset_for_new_mission(const std::string & why)
@@ -3569,7 +3724,10 @@ void StuckRecoverySupervisorNode::publish_recovery_route(const geometry_msgs::ms
   freespace_full_at_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
   full_plan_verdict_.reset();
   route_published_at_ = this->now();
-  pub_route_->publish(route);
+  // To the armed preset's own route topic.  These are transient_local, so a goal published
+  // to the wrong one would sit there latched and be answered the next time that preset is
+  // armed -- which is how the robot was once sent to a previous scenario's goal.
+  preset().pub_route->publish(route);
 
   RCLCPP_INFO(
     get_logger(), "[episode %u] escape goal published at (%.2f, %.2f)", episode_id_,
@@ -3655,9 +3813,9 @@ void StuckRecoverySupervisorNode::record_footprint_debug(
       return distance2d(a.pose, odom_->pose.pose) < distance2d(b.pose, odom_->pose.pose);
     });
   const size_t start_blocked = std::max(
-    footprint_blocked_count(odom_->pose.pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
+    footprint_blocked_count(odom_->pose.pose, preset().aeb_margin_m, param_.aeb_occupancy_threshold)
       .first,
-    footprint_blocked_count(nearest->pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
+    footprint_blocked_count(nearest->pose, preset().aeb_margin_m, param_.aeb_occupancy_threshold)
       .first);
   double arc = 0.0;
   for (auto it = nearest; it != traj.points.end(); ++it) {
@@ -3665,7 +3823,7 @@ void StuckRecoverySupervisorNode::record_footprint_debug(
       arc += distance2d(std::prev(it)->pose, it->pose);
     }
     const auto blocked =
-      footprint_blocked_count(it->pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold)
+      footprint_blocked_count(it->pose, preset().aeb_margin_m, param_.aeb_occupancy_threshold)
         .first;
     FootprintVerdict verdict = FootprintVerdict::FREE;
     if (blocked > 0) {
@@ -3739,25 +3897,25 @@ void StuckRecoverySupervisorNode::append_footprint_markers(
     switch (verdict) {
       case FootprintVerdict::FREE:
         markers.markers.push_back(
-          make("stuck_recovery_plan_footprints", id++, box(pose, param_.aeb_margin_m), 0.2f, 0.9f,
+          make("stuck_recovery_plan_footprints", id++, box(pose, preset().aeb_margin_m), 0.2f, 0.9f,
                0.3f, 0.5f, 0.03));
         break;
       case FootprintVerdict::GRACED:
         // Blocked, but this is the ground the robot already stands on -- drawn so it is
         // obvious the check saw it and deliberately let it pass.
         markers.markers.push_back(
-          make("stuck_recovery_plan_footprints", id++, box(pose, param_.aeb_margin_m), 1.0f, 0.7f,
+          make("stuck_recovery_plan_footprints", id++, box(pose, preset().aeb_margin_m), 1.0f, 0.7f,
                0.0f, 0.9f, 0.05));
         break;
       case FootprintVerdict::BLOCKING:
         markers.markers.push_back(
-          make("stuck_recovery_plan_footprints", id++, box(pose, param_.aeb_margin_m), 1.0f, 0.1f,
+          make("stuck_recovery_plan_footprints", id++, box(pose, preset().aeb_margin_m), 1.0f, 0.1f,
                0.1f, 1.0f, 0.08));
         break;
       case FootprintVerdict::BEYOND:
         // Occupied, but past the brake's lookahead: grey, so it is visibly not a brake.
         markers.markers.push_back(
-          make("stuck_recovery_plan_footprints", id++, box(pose, param_.aeb_margin_m), 0.5f, 0.5f,
+          make("stuck_recovery_plan_footprints", id++, box(pose, preset().aeb_margin_m), 0.5f, 0.5f,
                0.5f, 0.6f, 0.04));
         break;
     }
@@ -3767,9 +3925,9 @@ void StuckRecoverySupervisorNode::append_footprint_markers(
   // row, so it is worth seeing on its own rather than buried among the plan's boxes.
   if (odom_ && costmap_is_fresh()) {
     const bool ego_free = footprint_is_free_with_margin(
-      odom_->pose.pose, param_.aeb_margin_m, param_.aeb_occupancy_threshold);
+      odom_->pose.pose, preset().aeb_margin_m, param_.aeb_occupancy_threshold);
     markers.markers.push_back(make(
-      "stuck_recovery_ego_footprint", 0, box(odom_->pose.pose, param_.aeb_margin_m),
+      "stuck_recovery_ego_footprint", 0, box(odom_->pose.pose, preset().aeb_margin_m),
       ego_free ? 0.2f : 1.0f, ego_free ? 0.9f : 0.4f, ego_free ? 1.0f : 0.0f, 1.0f, 0.06));
   }
 
@@ -3777,7 +3935,7 @@ void StuckRecoverySupervisorNode::append_footprint_markers(
   // than the brake's, which is why a goal can be rejected on ground the brake would accept.
   if (escape_goal_) {
     markers.markers.push_back(make(
-      "stuck_recovery_goal_footprint", 0, box(*escape_goal_, param_.goal_shape_margin_m), 0.2f,
+      "stuck_recovery_goal_footprint", 0, box(*escape_goal_, preset().goal_shape_margin_m), 0.2f,
       0.4f, 1.0f, 0.8f, 0.05));
   }
 }
