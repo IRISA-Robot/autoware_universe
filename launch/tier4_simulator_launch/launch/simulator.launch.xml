@@ -69,6 +69,21 @@
       </include>
     </group>
 
+    <!-- Timed fake traffic signals (e.g. pedestrian green / green flashing / red), driven by the
+         DummyObjectScenarioPanel in rviz.  Only when no real recognition owns the topic.
+         tf_pedestrian lights in the routine also stand in for the road_crossing
+         pedestrian_light_detector, so don't run that detector at the same time. -->
+    <group if="$(var launch_dummy_perception)">
+      <group unless="$(var perception/enable_traffic_light)">
+        <node pkg="autoware_dummy_perception_publisher" exec="traffic_light_sequencer" name="traffic_light_sequencer" namespace="simulation" output="screen">
+          <remap from="~/output/traffic_signals" to="/perception/traffic_light_recognition/traffic_signals"/>
+          <remap from="~/output/pedestrian_light" to="/perception/road_crossing/pedestrian_light"/>
+          <remap from="~/input/vector_map" to="/map/vector_map"/>
+          <remap from="~/input/target_light" to="/planning/road_crossing/target_light"/>
+        </node>
+      </group>
+    </group>
+
     <group unless="$(var scenario_simulation)">
       <!-- Occupancy Grid -->
       <push-ros-namespace namespace="occupancy_grid_map"/>

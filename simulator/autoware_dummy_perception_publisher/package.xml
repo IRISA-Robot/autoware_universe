@@ -21,8 +21,11 @@
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>autoware_lint_common</test_depend>
 
+  <depend>autoware_lanelet2_extension</depend>
+  <depend>autoware_map_msgs</depend>
   <depend>autoware_perception_msgs</depend>
   <depend>autoware_point_types</depend>
+  <depend>autoware_road_crossing_msgs</depend>
   <depend>autoware_trajectory</depend>
   <depend>autoware_utils_geometry</depend>
   <depend>autoware_utils_rclcpp</depend>
@@ -38,6 +41,7 @@
   <depend>tier4_perception_msgs</depend>
   <depend>tier4_simulation_msgs</depend>
   <depend>unique_identifier_msgs</depend>
+  <depend>yaml_cpp_vendor</depend>
 
   <export>
     <build_type>ament_cmake</build_type>

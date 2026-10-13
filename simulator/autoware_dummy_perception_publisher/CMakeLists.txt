@@ -64,6 +64,11 @@ ament_auto_add_executable(empty_objects_publisher
   src/empty_objects_publisher.cpp
 )
 
+ament_auto_add_executable(traffic_light_sequencer
+  src/traffic_light_sequencer.cpp
+)
+target_link_libraries(traffic_light_sequencer yaml-cpp)
+
 if(BUILD_TESTING)
   ament_add_ros_isolated_gtest(signed_distance_function-test
     test/src/test_signed_distance_function.cpp

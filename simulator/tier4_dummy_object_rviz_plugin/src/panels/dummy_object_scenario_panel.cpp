@@ -17,25 +17,37 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QGroupBox>
 #include <QHBoxLayout>
+#include <QHeaderView>
 #include <QInputDialog>
 #include <QMessageBox>
 #include <QVBoxLayout>
+#include <autoware_lanelet2_extension/utility/message_conversion.hpp>
+#include <autoware_lanelet2_extension/utility/query.hpp>
 #include <rviz_common/display_context.hpp>
 
 #include <autoware_perception_msgs/msg/object_classification.hpp>
 #include <autoware_perception_msgs/msg/shape.hpp>
+#include <autoware_perception_msgs/msg/traffic_light_element.hpp>
 
+#include <lanelet2_core/LaneletMap.h>
+#include <lanelet2_core/primitives/BasicRegulatoryElements.h>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <fstream>
 #include <map>
+#include <memory>
+#include <optional>
 #include <random>
+#include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace rviz_plugins
@@ -45,7 +57,40 @@ namespace
 using autoware_perception_msgs::msg::ObjectClassification;
 using autoware_perception_msgs::msg::Shape;
 
+using autoware_perception_msgs::msg::TrafficLightElement;
+
 constexpr const char * kObjectInfoTopic = "/simulation/dummy_perception_publisher/object_info";
+constexpr const char * kRoutineTopic = "/simulation/traffic_light_sequencer/input/routine";
+constexpr const char * kSignalsTopic = "/perception/traffic_light_recognition/traffic_signals";
+constexpr const char * kMapTopic = "/map/vector_map";
+constexpr const char * kPedestrianLightTopic = "/perception/road_crossing/pedestrian_light";
+
+enum LightColumn {
+  kColId,
+  kColGreen,
+  kColGreenFlashing,
+  kColRed,
+  kColRedFlashing,
+  kColStart,
+  kColLoop,
+  kColNow
+};
+
+// The pedestrian light cycle a table row stands for, one phase per duration column.
+// A phase can be 0 s long (e.g. no red flashing at this crossing): it is then skipped.
+struct PatternPhase
+{
+  int column;
+  const char * color;
+  const char * status;
+  const char * name;  // in the Start combo
+};
+const std::array<PatternPhase, 4> kPattern{{
+  {kColGreen, "GREEN", "SOLID_ON", "Green"},
+  {kColGreenFlashing, "GREEN", "FLASHING", "Green flash"},
+  {kColRed, "RED", "SOLID_ON", "Red"},
+  {kColRedFlashing, "RED", "FLASHING", "Red flash"},
+}};
 
 const std::map<uint8_t, std::string> kLabelNames = {
   {ObjectClassification::UNKNOWN, "UNKNOWN"},       {ObjectClassification::CAR, "CAR"},
@@ -177,6 +222,7 @@ DummyObject fromYaml(const YAML::Node & node)
 }
 }  // namespace
 
+
 DummyObjectScenarioPanel::DummyObjectScenarioPanel(QWidget * parent) : rviz_common::Panel(parent)
 {
   dir_edit_ = new QLineEdit(QDir::home().filePath("dummy_object_scenarios"));
@@ -208,12 +254,62 @@ DummyObjectScenarioPanel::DummyObjectScenarioPanel(QWidget * parent) : rviz_comm
   status_label_ = new QLabel;
   status_label_->setWordWrap(true);
 
+  // Traffic light routine: one row per light, green -> green flashing -> red -> red flashing.
+  map_light_combo_ = new QComboBox;
+  map_light_combo_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+  map_light_combo_->setToolTip(
+    "Lights in the lanelet map: tf_pedestrian ways (read by the road_crossing FSM) and "
+    "traffic light regulatory elements on crosswalks (read by the crosswalk module)");
+  auto * add_light_button = new QPushButton("Add");
+  add_light_button->setToolTip("Add the selected light, or an empty row to type an ID");
+  auto * map_light_layout = new QHBoxLayout;
+  map_light_layout->addWidget(new QLabel("Light"));
+  map_light_layout->addWidget(map_light_combo_);
+  map_light_layout->addWidget(add_light_button);
+
+  light_table_ = new QTableWidget(0, 8);
+  light_table_->setHorizontalHeaderLabels(
+    {"ID", "Green [s]", "G flash [s]", "Red [s]", "R flash [s]", "Start", "Loop", "Now"});
+  light_table_->horizontalHeaderItem(kColGreenFlashing)->setToolTip("Green flashing");
+  light_table_->horizontalHeaderItem(kColRedFlashing)
+    ->setToolTip("Red flashing; leave 0 where the light has none");
+  light_table_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+  light_table_->horizontalHeader()->setStretchLastSection(true);
+  light_table_->verticalHeader()->setVisible(false);
+  light_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
+  light_table_->setMaximumHeight(140);
+
+  auto * remove_light_button = new QPushButton("Remove");
+  auto * start_lights_button = new QPushButton("Start / Restart");
+  start_lights_button->setToolTip("Restart the routine at time zero with the table as it is now");
+  auto * stop_lights_button = new QPushButton("Stop");
+  auto * light_button_layout = new QHBoxLayout;
+  light_button_layout->addWidget(remove_light_button);
+  light_button_layout->addWidget(start_lights_button);
+  light_button_layout->addWidget(stop_lights_button);
+
+  custom_label_ = new QLabel;
+  custom_label_->setWordWrap(true);
+  custom_label_->setVisible(false);
+  pedestrian_light_label_ = new QLabel;
+  pedestrian_light_label_->setToolTip(QString("Last %1").arg(kPedestrianLightTopic));
+
+  auto * light_layout = new QVBoxLayout;
+  light_layout->addLayout(map_light_layout);
+  light_layout->addWidget(light_table_);
+  light_layout->addLayout(light_button_layout);
+  light_layout->addWidget(custom_label_);
+  light_layout->addWidget(pedestrian_light_label_);
+  auto * light_group = new QGroupBox("Traffic lights");
+  light_group->setLayout(light_layout);
+
   auto * layout = new QVBoxLayout;
   layout->addLayout(dir_layout);
   layout->addLayout(scenario_layout);
   layout->addLayout(button_layout);
   layout->addWidget(clear_before_load_);
   layout->addWidget(count_label_);
+  layout->addWidget(light_group);
   layout->addWidget(status_label_);
   setLayout(layout);
 
@@ -223,6 +319,12 @@ DummyObjectScenarioPanel::DummyObjectScenarioPanel(QWidget * parent) : rviz_comm
   connect(save_button, &QPushButton::clicked, this, &DummyObjectScenarioPanel::onSave);
   connect(load_button, &QPushButton::clicked, this, &DummyObjectScenarioPanel::onLoad);
   connect(clear_button, &QPushButton::clicked, this, &DummyObjectScenarioPanel::onClear);
+  connect(add_light_button, &QPushButton::clicked, this, &DummyObjectScenarioPanel::onAddLight);
+  connect(
+    remove_light_button, &QPushButton::clicked, this, &DummyObjectScenarioPanel::onRemoveLight);
+  connect(
+    start_lights_button, &QPushButton::clicked, this, &DummyObjectScenarioPanel::onStartLights);
+  connect(stop_lights_button, &QPushButton::clicked, this, &DummyObjectScenarioPanel::onStopLights);
 
   // The subscription callback runs on the ROS executor; the label is refreshed from the
   // Qt side instead of touching widgets from there.
@@ -233,11 +335,26 @@ DummyObjectScenarioPanel::DummyObjectScenarioPanel(QWidget * parent) : rviz_comm
 void DummyObjectScenarioPanel::onInitialize()
 {
   raw_node_ = getDisplayContext()->getRosNodeAbstraction().lock()->get_raw_node();
+  live_signals_stamp_ = raw_node_->now();  // same clock type as the ages taken from it
   // Load publishes a burst (DELETEALL + every object); a depth-1 queue would drop most of it.
   pub_ = raw_node_->create_publisher<DummyObject>(kObjectInfoTopic, rclcpp::QoS{100});
   sub_ = raw_node_->create_subscription<DummyObject>(
     kObjectInfoTopic, rclcpp::QoS{100},
     [this](const DummyObject::ConstSharedPtr msg) { onObjectInfo(msg); });
+  // transient_local so the sequencer still gets the routine if it starts after the Load.
+  routine_pub_ = raw_node_->create_publisher<std_msgs::msg::String>(
+    kRoutineTopic, rclcpp::QoS{1}.transient_local());
+  map_sub_ = raw_node_->create_subscription<LaneletMapBin>(
+    kMapTopic, rclcpp::QoS{1}.transient_local(),
+    [this](const LaneletMapBin::ConstSharedPtr msg) { onMap(msg); });
+  signals_sub_ = raw_node_->create_subscription<TrafficLightGroupArray>(
+    kSignalsTopic, rclcpp::QoS{10},
+    [this](const TrafficLightGroupArray::ConstSharedPtr msg) { onSignals(msg); });
+  pedestrian_light_sub_ = raw_node_->create_subscription<PedestrianLightState>(
+    kPedestrianLightTopic, rclcpp::QoS{1}, [this](const PedestrianLightState::ConstSharedPtr msg) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pedestrian_light_ = msg;
+    });
   onRefresh();
   onTick();
   tick_->start(500);
@@ -351,8 +468,14 @@ void DummyObjectScenarioPanel::onSave()
     std::lock_guard<std::mutex> lock(mutex_);
     scene = scene_;
   }
-  if (scene.empty()) {
-    setStatus("Nothing to save: no dummy objects have been placed since the panel started.", true);
+  const auto lights = lightsToYaml();
+  if (!lights) {
+    return;
+  }
+  if (scene.empty() && lights->size() == 0) {
+    setStatus(
+      "Nothing to save: no dummy objects placed since the panel started and no traffic lights.",
+      true);
     return;
   }
 
@@ -378,6 +501,9 @@ void DummyObjectScenarioPanel::onSave()
   for (const auto & object : scene) {
     root["objects"].push_back(toYaml(object));
   }
+  if (lights->size() > 0) {
+    root["traffic_lights"] = *lights;
+  }
   // 10 significant digits: short numbers stay short (0.6, not 0.59999999999999998) while
   // map coordinates in the 1e5 m range still keep sub-millimetre resolution.
   YAML::Emitter emitter;
@@ -388,6 +514,8 @@ void DummyObjectScenarioPanel::onSave()
   std::ofstream out(path);
   out << "# Dummy object scenario, saved by the DummyObjectScenarioPanel.\n"
          "# Hand-editable: yaw in rad, velocity/accel along the object's heading.\n"
+         "# traffic_lights: id is the traffic light regulatory element id; phases play in\n"
+         "# order from start_phase, colors RED/AMBER/GREEN, status SOLID_ON/FLASHING/SOLID_OFF.\n"
       << emitter.c_str() << "\n";
   if (!out) {
     setStatus(QString("Failed to write %1").arg(QString::fromStdString(path)), true);
@@ -397,7 +525,10 @@ void DummyObjectScenarioPanel::onSave()
   onRefresh();
   scenario_combo_->setCurrentText(QFileInfo(QString::fromStdString(path)).completeBaseName());
   Q_EMIT configChanged();
-  setStatus(QString("Saved %1 object(s) to %2").arg(scene.size()).arg(QString::fromStdString(path)));
+  setStatus(QString("Saved %1 object(s) and %2 traffic light(s) to %3")
+              .arg(scene.size())
+              .arg(lights->size())
+              .arg(QString::fromStdString(path)));
 }
 
 void DummyObjectScenarioPanel::onLoad()
@@ -412,9 +543,12 @@ void DummyObjectScenarioPanel::onLoad()
   std::vector<DummyObject> objects;
   try {
     const auto root = YAML::LoadFile(path);
-    for (const auto & node : root["objects"]) {
-      objects.push_back(fromYaml(node));
+    if (root["objects"]) {
+      for (const auto & node : root["objects"]) {
+        objects.push_back(fromYaml(node));
+      }
     }
+    lightsFromYaml(root["traffic_lights"] ? root["traffic_lights"] : YAML::Node{});
   } catch (const std::exception & e) {
     setStatus(QString("Failed to load %1: %2").arg(QString::fromStdString(path), e.what()), true);
     return;
@@ -437,8 +571,21 @@ void DummyObjectScenarioPanel::onLoad()
     pub_->publish(object);
   }
 
+  // The routine restarts at zero together with the objects, so signal timing relative to
+  // the scene is the same on every run.  A file without lights stops the previous routine.
+  const auto lights = lightsToYaml();
+  const size_t light_count = lights ? lights->size() : 0;
+  if (lights) {
+    sendRoutine(*lights);
+  }
+
   Q_EMIT configChanged();
-  setStatus(QString("Loaded %1 object(s) from '%2'").arg(objects.size()).arg(name));
+  if (lights) {
+    setStatus(QString("Loaded %1 object(s) and %2 traffic light(s) from '%3'")
+                .arg(objects.size())
+                .arg(light_count)
+                .arg(name));
+  }
 }
 
 void DummyObjectScenarioPanel::onClear()
@@ -451,14 +598,328 @@ void DummyObjectScenarioPanel::onClear()
   setStatus("Cleared all dummy objects.");
 }
 
+void DummyObjectScenarioPanel::onMap(const LaneletMapBin::ConstSharedPtr msg)
+{
+  auto map = std::make_shared<lanelet::LaneletMap>();
+  lanelet::utils::conversion::fromBinMsg(*msg, map);
+  std::map<int64_t, std::string> lights;
+  // The IRISA pedestrian lights: ways tagged tf_pedestrian=true, as the
+  // pedestrian_light_detector reads them.
+  for (const auto & way : map->lineStringLayer) {
+    if (way.attributeOr("tf_pedestrian", "") == std::string("true")) {
+      lights[way.id()] = "pedestrian light";
+    }
+  }
+  // Name the road_crossing each one is paired with (forward_pedestrian_tf), so the right
+  // light is picked for the crossing under test.
+  for (const auto & lanelet : map->laneletLayer) {
+    std::stringstream ss(lanelet.attributeOr("forward_pedestrian_tf", ""));
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+      int64_t id = 0;
+      try {
+        id = std::stoll(token);
+      } catch (const std::exception &) {
+        continue;
+      }
+      const auto it = lights.find(id);
+      if (it != lights.end()) {
+        it->second += ", crossing " + std::to_string(lanelet.id());
+      }
+    }
+  }
+  // Same lookup the crosswalk module does: the traffic lights regulating the crosswalk
+  // lanelet are the pedestrian signals it obeys.
+  std::map<int64_t, std::vector<int64_t>> crosswalk_lights;
+  const auto crosswalks =
+    lanelet::utils::query::crosswalkLanelets(lanelet::utils::query::laneletLayer(map));
+  for (const auto & crosswalk : crosswalks) {
+    for (const auto & light : crosswalk.regulatoryElementsAs<const lanelet::TrafficLight>()) {
+      crosswalk_lights[light->id()].push_back(crosswalk.id());
+    }
+  }
+  for (const auto & [light_id, crosswalk_ids] : crosswalk_lights) {
+    std::string text = "crosswalk";
+    for (const auto crosswalk_id : crosswalk_ids) {
+      text += " " + std::to_string(crosswalk_id);
+    }
+    lights[light_id] = text;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  map_lights_ = lights;
+  map_lights_changed_ = true;
+}
+
+void DummyObjectScenarioPanel::onSignals(const TrafficLightGroupArray::ConstSharedPtr msg)
+{
+  const auto color_name = [](uint8_t color) -> std::string {
+    switch (color) {
+      case TrafficLightElement::RED:
+        return "RED";
+      case TrafficLightElement::AMBER:
+        return "AMBER";
+      case TrafficLightElement::GREEN:
+        return "GREEN";
+      case TrafficLightElement::WHITE:
+        return "WHITE";
+      default:
+        return "UNKNOWN";
+    }
+  };
+  std::map<int64_t, std::string> states;
+  for (const auto & group : msg->traffic_light_groups) {
+    std::string text;
+    for (const auto & element : group.elements) {
+      text += (text.empty() ? "" : " + ") + color_name(element.color);
+      if (element.status == TrafficLightElement::FLASHING) {
+        text += " (flashing)";
+      } else if (element.status == TrafficLightElement::SOLID_OFF) {
+        text += " (off)";
+      }
+    }
+    states[group.traffic_light_group_id] = text;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  live_signals_ = states;
+  live_signals_stamp_ = raw_node_->now();
+}
+
+void DummyObjectScenarioPanel::addLightRow(
+  int64_t id, const std::array<double, 4> & durations, int start, bool loop)
+{
+  const int row = light_table_->rowCount();
+  light_table_->insertRow(row);
+  light_table_->setItem(row, kColId, new QTableWidgetItem(QString::number(id)));
+  auto * start_combo = new QComboBox;
+  for (size_t i = 0; i < kPattern.size(); ++i) {
+    light_table_->setItem(
+      row, kPattern[i].column, new QTableWidgetItem(QString::number(durations[i])));
+    start_combo->addItem(kPattern[i].name);
+  }
+  start_combo->setCurrentIndex(start);
+  light_table_->setCellWidget(row, kColStart, start_combo);
+
+  auto * loop_item = new QTableWidgetItem;
+  loop_item->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+  loop_item->setCheckState(loop ? Qt::Checked : Qt::Unchecked);
+  light_table_->setItem(row, kColLoop, loop_item);
+
+  auto * now_item = new QTableWidgetItem("-");
+  now_item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+  light_table_->setItem(row, kColNow, now_item);
+}
+
+std::optional<YAML::Node> DummyObjectScenarioPanel::lightsToYaml()
+{
+  YAML::Node lights(YAML::NodeType::Sequence);
+  for (int row = 0; row < light_table_->rowCount(); ++row) {
+    bool ok{};
+    const auto id = light_table_->item(row, kColId)->text().toLongLong(&ok);
+    if (!ok || id <= 0) {
+      setStatus(
+        QString(
+          "Traffic light row %1: '%2' is not a valid ID. Double-click the ID cell and type the "
+          "traffic light regulatory element id from the lanelet map.")
+          .arg(row + 1)
+          .arg(light_table_->item(row, kColId)->text()),
+        true);
+      return std::nullopt;
+    }
+
+    std::array<double, kPattern.size()> durations{};
+    double total = 0.0;
+    for (size_t i = 0; i < kPattern.size(); ++i) {
+      durations[i] = light_table_->item(row, kPattern[i].column)->text().toDouble(&ok);
+      if (!ok || durations[i] < 0.0) {
+        setStatus(
+          QString("Traffic light %1: durations must be numbers >= 0 [s].").arg(id), true);
+        return std::nullopt;
+      }
+      total += durations[i];
+    }
+    if (total <= 0.0) {
+      setStatus(QString("Traffic light %1: all durations are zero.").arg(id), true);
+      return std::nullopt;
+    }
+
+    YAML::Node light;
+    light["id"] = id;
+    light["start_phase"] =
+      static_cast<QComboBox *>(light_table_->cellWidget(row, kColStart))->currentIndex();
+    light["loop"] = light_table_->item(row, kColLoop)->checkState() == Qt::Checked;
+    for (size_t i = 0; i < kPattern.size(); ++i) {
+      YAML::Node phase;
+      phase.SetStyle(YAML::EmitterStyle::Flow);
+      phase["color"] = kPattern[i].color;
+      phase["status"] = kPattern[i].status;
+      phase["duration"] = durations[i];
+      light["phases"].push_back(phase);
+    }
+    lights.push_back(light);
+  }
+  for (const auto & light : custom_lights_) {
+    lights.push_back(light);
+  }
+  return lights;
+}
+
+void DummyObjectScenarioPanel::lightsFromYaml(const YAML::Node & lights)
+{
+  light_table_->setRowCount(0);
+  custom_lights_.clear();
+  if (lights) {
+    for (const auto & light : lights) {
+      // The table only shows the plain pedestrian pattern; anything else (vehicle lights,
+      // offsets, extra phases) is kept as written and still played and saved.
+      // Files from before red flashing existed have only the first three phases; they
+      // load with red flashing at 0.
+      const auto & phases = light["phases"];
+      const auto is = [&](size_t i) {
+        const auto & p = phases[i];
+        return p["color"].as<std::string>("") == kPattern[i].color &&
+               p["status"].as<std::string>("SOLID_ON") == kPattern[i].status &&
+               p["shape"].as<std::string>("CIRCLE") == "CIRCLE";
+      };
+      const auto start = light["start_phase"].as<int>(0);
+      bool matches = phases.IsSequence() && phases.size() >= kPattern.size() - 1 &&
+                     phases.size() <= kPattern.size() &&
+                     light["offset"].as<double>(0.0) == 0.0 && start >= 0 &&
+                     start < static_cast<int>(phases.size());
+      for (size_t i = 0; matches && i < phases.size(); ++i) {
+        matches = is(i);
+      }
+      if (matches) {
+        std::array<double, kPattern.size()> durations{};
+        for (size_t i = 0; i < phases.size(); ++i) {
+          durations[i] = phases[i]["duration"].as<double>();
+        }
+        addLightRow(light["id"].as<int64_t>(), durations, start, light["loop"].as<bool>(true));
+      } else {
+        custom_lights_.push_back(light);
+      }
+    }
+  }
+  custom_label_->setVisible(!custom_lights_.empty());
+  custom_label_->setText(
+    QString("+ %1 custom light(s) from the file, played as written (edit them in the YAML).")
+      .arg(custom_lights_.size()));
+}
+
+void DummyObjectScenarioPanel::sendRoutine(const YAML::Node & lights)
+{
+  YAML::Node root;
+  root["traffic_lights"] = lights;
+  std_msgs::msg::String msg;
+  msg.data = YAML::Dump(root);
+  routine_pub_->publish(msg);
+}
+
+void DummyObjectScenarioPanel::onAddLight()
+{
+  // No map light picked: an empty row whose ID is typed in by hand.
+  const auto id = map_light_combo_->currentData().isValid()
+                    ? map_light_combo_->currentData().toLongLong()
+                    : 0;
+  addLightRow(id, {10.0, 5.0, 15.0, 0.0}, 0, true);
+  if (id == 0) {
+    // Say why the row is blank: a map without lights is the usual cause, and nothing
+    // reacts to an id that is not a light in the map.
+    setStatus(
+      map_light_combo_->count() == 0
+        ? "The loaded map has no tf_pedestrian lights or crosswalk traffic lights. Type an ID "
+          "into the new row; only ids of lights in the map have any effect."
+        : "Type the light id (tf_pedestrian way or traffic light regulatory element) into the "
+          "new row.",
+      true);
+  }
+}
+
+void DummyObjectScenarioPanel::onRemoveLight()
+{
+  const auto rows = light_table_->selectionModel()->selectedRows();
+  std::vector<int> indices;
+  for (const auto & index : rows) {
+    indices.push_back(index.row());
+  }
+  std::sort(indices.rbegin(), indices.rend());
+  for (const auto row : indices) {
+    light_table_->removeRow(row);
+  }
+}
+
+void DummyObjectScenarioPanel::onStartLights()
+{
+  const auto lights = lightsToYaml();
+  if (!lights) {
+    return;
+  }
+  if (lights->size() == 0) {
+    setStatus("No traffic lights to start. Add a row first.", true);
+    return;
+  }
+  sendRoutine(*lights);
+  setStatus(QString("Traffic light routine started for %1 light(s).").arg(lights->size()));
+}
+
+void DummyObjectScenarioPanel::onStopLights()
+{
+  sendRoutine(YAML::Node(YAML::NodeType::Sequence));
+  setStatus("Traffic light routine stopped.");
+}
+
 void DummyObjectScenarioPanel::onTick()
 {
   size_t count{};
+  std::optional<std::map<int64_t, std::string>> map_lights;
+  std::map<int64_t, std::string> live_signals;
+  PedestrianLightState::ConstSharedPtr pedestrian_light;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     count = scene_.size();
+    if (map_lights_changed_) {
+      map_lights = map_lights_;
+      map_lights_changed_ = false;
+    }
+    pedestrian_light = pedestrian_light_;
+    // Older than the planner's own timeout means nobody is publishing any more.
+    if (raw_node_ && (raw_node_->now() - live_signals_stamp_).seconds() < 1.0) {
+      live_signals = live_signals_;
+    }
   }
   count_label_->setText(QString("Objects in scene: %1").arg(count));
+
+  if (map_lights) {
+    map_light_combo_->clear();
+    for (const auto & [light_id, text] : *map_lights) {
+      map_light_combo_->addItem(
+        QString("%1 (%2)").arg(light_id).arg(QString::fromStdString(text)),
+        QVariant::fromValue<qlonglong>(light_id));
+    }
+    if (map_lights->empty()) {
+      map_light_combo_->setPlaceholderText("no lights in the map");
+    }
+  }
+
+  // What the road_crossing FSM is being told right now.
+  QString pedestrian_text = "-";
+  if (
+    pedestrian_light && raw_node_ &&
+    (raw_node_->now() - rclcpp::Time(pedestrian_light->header.stamp, RCL_ROS_TIME)).seconds() <
+      1.0) {
+    static const char * names[] = {"NONE", "RED", "GREEN", "COUNTDOWN_GREEN", "COUNTDOWN_BLANK"};
+    pedestrian_text = pedestrian_light->state < 5 ? names[pedestrian_light->state] : "?";
+    if (pedestrian_light->light_id != 0) {
+      pedestrian_text += QString(" (light %1)").arg(pedestrian_light->light_id);
+    }
+  }
+  pedestrian_light_label_->setText(QString("Road-crossing light: %1").arg(pedestrian_text));
+
+  for (int row = 0; row < light_table_->rowCount(); ++row) {
+    const auto id = light_table_->item(row, kColId)->text().toLongLong();
+    const auto it = live_signals.find(id);
+    light_table_->item(row, kColNow)
+      ->setText(it != live_signals.end() ? QString::fromStdString(it->second) : "-");
+  }
 }
 
 }  // namespace rviz_plugins
