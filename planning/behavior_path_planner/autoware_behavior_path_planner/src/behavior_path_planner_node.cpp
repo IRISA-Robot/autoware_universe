@@ -353,6 +353,7 @@ void BehaviorPathPlannerNode::run()
       get_logger(), "Scenario returned to LANEDRIVING from elsewhere. Resetting modules.");
     planner_manager_->reset();
     planner_manager_->resetCurrentRouteLanelet(planner_data_);
+    planner_data_->prev_output_path = std::make_shared<PathWithLaneId>();
   }
   was_lane_driving_ = true;
 
@@ -400,6 +401,7 @@ void BehaviorPathPlannerNode::run()
       planner_manager_->reset();
       planner_manager_->resetCurrentRouteLanelet(planner_data_);
       planner_data_->prev_modified_goal.reset();
+      planner_data_->prev_output_path = std::make_shared<PathWithLaneId>();
     }
   }
   const auto controlled_by_autoware_autonomously =
@@ -782,8 +784,19 @@ PathWithLaneId::SharedPtr BehaviorPathPlannerNode::getPath(
 {
   // TODO(Horibe) do some error handling when path is not available.
 
-  auto path = !output.path.points.empty() ? std::make_shared<PathWithLaneId>(output.path)
-                                          : planner_data->prev_output_path;
+  // An empty output falls back to the last published path only while ego is still on it;
+  // otherwise publish nothing rather than a path from somewhere the robot no longer is.
+  auto path = [&]() -> PathWithLaneId::SharedPtr {
+    if (!output.path.points.empty()) {
+      return std::make_shared<PathWithLaneId>(output.path);
+    }
+    if (
+      calcEgoDistanceToPath(*planner_data->prev_output_path, *planner_data) <=
+      max_ego_distance_to_cached_path) {
+      return planner_data->prev_output_path;
+    }
+    return std::make_shared<PathWithLaneId>();
+  }();
   path->header = planner_data->route_handler->getRouteHeader();
   return path;
 }

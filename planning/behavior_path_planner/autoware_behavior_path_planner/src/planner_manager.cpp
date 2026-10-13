@@ -33,6 +33,7 @@
 #include <cmath>
 #include <cstdio>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -330,7 +331,9 @@ BehaviorModuleOutput PlannerManager::run(const std::shared_ptr<PlannerData> & da
   if (!fold_after_resample) {
     last_unfolded_path_ = result_output.valid_output.path;
     fold_substitution_count_ = 0;
-  } else if (last_unfolded_path_ && fold_substitution_count_ < max_fold_substitutions) {
+  } else if (
+    last_unfolded_path_ && fold_substitution_count_ < max_fold_substitutions &&
+    calcEgoDistanceToPath(*last_unfolded_path_, *data) <= max_ego_distance_to_cached_path) {
     ++fold_substitution_count_;
     RCLCPP_ERROR_THROTTLE(
       logger_, clock_, 1000,
@@ -344,7 +347,9 @@ BehaviorModuleOutput PlannerManager::run(const std::shared_ptr<PlannerData> & da
       logger_, clock_, 1000,
       "[PATH-FOLD] published path folds back on itself and there is no usable path to fall back "
       "on (%s). Publishing it: the controller may steer sharply.",
-      last_unfolded_path_ ? "substitution budget spent" : "no unfolded path seen yet");
+      !last_unfolded_path_                                   ? "no unfolded path seen yet"
+      : fold_substitution_count_ >= max_fold_substitutions ? "substitution budget spent"
+                                                             : "last unfolded path is away from ego");
   }
 
   if (fold_before_resample || fold_after_resample) {
@@ -463,6 +468,34 @@ lanelet::ConstLanelet selectCurrentRouteLanelet(const std::shared_ptr<PlannerDat
   return closest;
 }
 
+double calcEgoDistanceToPath(const PathWithLaneId & path, const PlannerData & data)
+{
+  const auto & points = path.points;
+  if (points.empty()) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const auto & ego = data.self_odometry->pose.pose.position;
+  const auto to_point = [&](const size_t i) {
+    const auto & p = points.at(i).point.pose.position;
+    return std::hypot(ego.x - p.x, ego.y - p.y);
+  };
+  double min_dist = to_point(0);
+  for (size_t i = 1; i < points.size(); ++i) {
+    const auto & a = points.at(i - 1).point.pose.position;
+    const auto & b = points.at(i).point.pose.position;
+    const double dx = b.x - a.x;
+    const double dy = b.y - a.y;
+    const double len2 = dx * dx + dy * dy;
+    if (len2 < 1e-12) {
+      min_dist = std::min(min_dist, to_point(i));
+      continue;
+    }
+    const double t = std::clamp(((ego.x - a.x) * dx + (ego.y - a.y) * dy) / len2, 0.0, 1.0);
+    min_dist = std::min(min_dist, std::hypot(ego.x - (a.x + t * dx), ego.y - (a.y + t * dy)));
+  }
+  return min_dist;
+}
+
 void PlannerManager::updateCurrentRouteLanelet(
   const std::shared_ptr<PlannerData> & data, const bool is_any_approved_module_running)
 {
@@ -520,7 +553,10 @@ BehaviorModuleOutput PlannerManager::getReferencePath(
       logger_, clock_, 5000,
       "Empty reference path detected. Using last valid reference path if available.");
 
-    if (last_valid_reference_path_.has_value()) {
+    if (
+      last_valid_reference_path_.has_value() &&
+      calcEgoDistanceToPath(last_valid_reference_path_->path, *data) <=
+        max_ego_distance_to_cached_path) {
       return last_valid_reference_path_.value();
     }
 
