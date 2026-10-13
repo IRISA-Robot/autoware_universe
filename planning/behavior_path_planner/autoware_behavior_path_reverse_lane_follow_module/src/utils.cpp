@@ -18,7 +18,11 @@
 #include <autoware_utils/geometry/geometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include <autoware/behavior_path_planner_common/utils/utils.hpp>
+
+#include <boost/geometry/algorithms/area.hpp>
 #include <boost/geometry/algorithms/distance.hpp>
+#include <boost/geometry/algorithms/intersection.hpp>
 
 #include <lanelet2_core/geometry/Polygon.h>
 
@@ -437,6 +441,66 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
         "not the segment's preferred primitive. Building the reverse path from chosen lanelets only.",
         lanelet_sequence_raw[end_idx].id(), lanelet_sequence_raw[end_idx + 1].id());
     }
+
+    // [OVERLAP-TRIM] A route can go out and back over the same ground on overlapping lanelets
+    // (hibikino_kanan: 382 up, 195/188 back down over it).  A window spanning both passes gives a
+    // path that lies under ego twice: every yaw-matched nearest search downstream then picks the
+    // pass whose heading happens to fit -- the other leg when reversing -- and the overlap cut in
+    // the planner manager, which assumes the lanes start at ego, fell behind ego on the return
+    // leg.  Keep the window to ego's own pass, using current_idx (route order), not geometry:
+    //  - behind ego, drop every lanelet up to the last one that overlaps any later lanelet in the
+    //    window (the passes behind ego must not lie over each other either);
+    //  - ahead, stop before the first lanelet that overlaps an earlier one in the window
+    //    (the same rule as utils::cutOverlappedLanes(), applied here where ego is known).
+    {
+      const auto overlaps = [](const lanelet::ConstLanelet & a, const lanelet::ConstLanelet & b) {
+        std::vector<autoware_utils::Polygon2d> intersections;
+        try {
+          boost::geometry::intersection(
+            ::autoware::behavior_path_planner::utils::toPolygon2d(a),
+            ::autoware::behavior_path_planner::utils::toPolygon2d(b), intersections);
+        } catch (const std::exception &) {
+          return false;  // e.g. a self-intersecting U-turn lanelet polygon
+        }
+        return std::any_of(intersections.begin(), intersections.end(), [](const auto & polygon) {
+          return boost::geometry::area(polygon) > 1e-3;
+        });
+      };
+      const size_t original_begin = begin_idx;
+      const size_t original_end = end_idx;
+      for (size_t i = begin_idx; i < current_idx; ++i) {
+        for (size_t j = i + 2; j <= end_idx; ++j) {
+          if (overlaps(lanelet_sequence_raw[i], lanelet_sequence_raw[j])) {
+            begin_idx = i + 1;
+            break;
+          }
+        }
+      }
+      for (size_t j = std::max(current_idx + 1, begin_idx + 2); j <= end_idx; ++j) {
+        bool overlaps_earlier = false;
+        for (size_t i = begin_idx; i + 2 <= j; ++i) {
+          if (overlaps(lanelet_sequence_raw[i], lanelet_sequence_raw[j])) {
+            overlaps_earlier = true;
+            break;
+          }
+        }
+        if (overlaps_earlier) {
+          end_idx = j - 1;
+          forward_end_is_genuine_discontinuity = false;
+          break;
+        }
+      }
+      if (begin_idx != original_begin || end_idx != original_end) {
+        RCLCPP_WARN_THROTTLE(
+          logger, steady_clock, 3000,
+          "[OVERLAP-TRIM] window around ego's lanelet %ld cut to its own pass: %ld..%ld "
+          "(was %ld..%ld)",
+          current_lanelet.id(), lanelet_sequence_raw[begin_idx].id(),
+          lanelet_sequence_raw[end_idx].id(), lanelet_sequence_raw[original_begin].id(),
+          lanelet_sequence_raw[original_end].id());
+      }
+    }
+
     lanelet_sequence = lanelet::ConstLanelets(
       lanelet_sequence_raw.begin() + static_cast<std::ptrdiff_t>(begin_idx),
       lanelet_sequence_raw.begin() + static_cast<std::ptrdiff_t>(end_idx) + 1);
