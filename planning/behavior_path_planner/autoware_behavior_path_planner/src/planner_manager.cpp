@@ -22,12 +22,7 @@
 #include <autoware_lanelet2_extension/utility/query.hpp>
 #include <magic_enum.hpp>
 
-#include <autoware_utils/geometry/geometry.hpp>
-
-#include <boost/geometry/algorithms/distance.hpp>
 #include <boost/scope_exit.hpp>
-
-#include <lanelet2_core/geometry/Polygon.h>
 
 #include <algorithm>
 #include <cmath>
@@ -419,73 +414,6 @@ void PlannerManager::generateCombinedDrivableArea(
   utils::extractObstaclesFromDrivableArea(output.path, di.obstacles);
 }
 
-namespace
-{
-double distanceToLanelet(const lanelet::ConstLanelet & lanelet, const geometry_msgs::msg::Pose & pose)
-{
-  return boost::geometry::distance(
-    lanelet::BasicPoint2d(pose.position.x, pose.position.y), lanelet.polygon2d().basicPolygon());
-}
-
-geometry_msgs::msg::Pose withFlippedYaw(const geometry_msgs::msg::Pose & pose)
-{
-  auto flipped = pose;
-  flipped.orientation =
-    autoware_utils::create_quaternion_from_yaw(autoware_utils::get_rpy(pose).z + M_PI);
-  return flipped;
-}
-}  // namespace
-
-lanelet::ConstLanelet selectCurrentRouteLanelet(
-  const std::shared_ptr<PlannerData> & data, const std::optional<lanelet::ConstLanelet> & previous)
-{
-  const auto & route_handler = data->route_handler;
-  const auto & pose = data->self_odometry->pose.pose;
-  const double max_dist = data->parameters.ego_nearest_dist_threshold;
-
-  // Still on the lanelet picked before (e.g. on return from the recovery scenario, or every cycle
-  // while not in autonomous mode): keep it.  Choosing afresh breaks a tie between overlapping
-  // route lanelets by heading, which picks the other leg of an out-and-back route when reversing.
-  if (previous) {
-    const auto preferred = route_handler->getPreferredLanelets();
-    const bool still_preferred =
-      std::any_of(preferred.begin(), preferred.end(), [&previous](const auto & llt) {
-        return llt.id() == previous->id() && llt.inverted() == previous->inverted();
-      });
-    constexpr double still_on_it_m = 0.5;
-    if (still_preferred && distanceToLanelet(*previous, pose) <= still_on_it_m) {
-      return *previous;
-    }
-  }
-
-  // getClosestLaneletWithinRoute picks among ALL primitives of every route segment (unchosen
-  // alternatives included) with no distance limit.  Where a chosen lanelet is just as near (ego
-  // on overlapping alternatives) take the chosen one -- but only then: before a lane change ego
-  // sits on an unchosen lane with the chosen one beside it, and picking that put ego "out of
-  // route", so the lane change module never ran.
-  lanelet::ConstLanelet closest{};
-  if (!route_handler->getClosestLaneletWithinRoute(pose, &closest)) {
-    return closest;  // no route lanelets (same as before)
-  }
-  const double dist = distanceToLanelet(closest, pose);
-  constexpr double same_distance_m = 0.1;
-  lanelet::ConstLanelet preferred{};
-  if (
-    route_handler->getClosestPreferredLaneletWithinRoute(pose, &preferred) &&
-    distanceToLanelet(preferred, pose) <= std::min(dist + same_distance_m, max_dist)) {
-    return preferred;
-  }
-  if (dist > max_dist) {
-    static rclcpp::Clock steady_clock{RCL_STEADY_TIME};
-    RCLCPP_WARN_THROTTLE(
-      rclcpp::get_logger("behavior_path_planner").get_child("planner_manager"), steady_clock, 2000,
-      "[EGO-FAR-FROM-ROUTE] ego (%.2f, %.2f) is %.2f m from the closest route lanelet %ld "
-      "(> ego_nearest_dist_threshold %.1f m): the path will start there, away from the robot.",
-      pose.position.x, pose.position.y, dist, closest.id(), max_dist);
-  }
-  return closest;
-}
-
 double calcEgoDistanceToPath(const PathWithLaneId & path, const PlannerData & data)
 {
   const auto & points = path.points;
@@ -533,35 +461,12 @@ void PlannerManager::updateCurrentRouteLanelet(
     *current_route_lanelet_ = closest_lane;
     return;
   }
-  // Reversing: the nose points against the (inverted) lanelet direction, so the check above
-  // never passes.  Try the same neighbourhood (this lanelet and its route neighbours) with the
-  // heading the robot is actually travelling, before widening the search: the wider sequence can
-  // hold a later leg of the route lying beside or under ego (out and back over the same ground,
-  // hibikino_kanan 347 vs 195) whose lanelet matches the nose and would win.
-  if (route_handler->getClosestRouteLaneletFromLanelet(
-        withFlippedYaw(pose), current_route_lanelet_->value(), &closest_lane,
-        p.ego_nearest_dist_threshold, p.ego_nearest_yaw_threshold)) {
-    *current_route_lanelet_ = closest_lane;
-    return;
-  }
 
   const auto lanelet_sequence = route_handler->getLaneletSequence(
     current_route_lanelet_->value(), pose, backward_length, p.forward_path_length);
 
-  // Either heading may fit a lanelet within the distance threshold; take the lanelet ego is
-  // actually nearer to (inside), not whichever heading was tried first.
-  const auto opt_nose = autoware::experimental::lanelet2_utils::get_closest_lanelet_within_constraint(
+  auto opt = autoware::experimental::lanelet2_utils::get_closest_lanelet_within_constraint(
     lanelet_sequence, pose, p.ego_nearest_dist_threshold, p.ego_nearest_yaw_threshold);
-  const auto opt_travel =
-    autoware::experimental::lanelet2_utils::get_closest_lanelet_within_constraint(
-      lanelet_sequence, withFlippedYaw(pose), p.ego_nearest_dist_threshold,
-      p.ego_nearest_yaw_threshold);
-  auto opt = opt_nose;
-  if (
-    opt_travel.has_value() &&
-    (!opt.has_value() || distanceToLanelet(*opt_travel, pose) < distanceToLanelet(*opt, pose))) {
-    opt = opt_travel;
-  }
   if (opt.has_value()) {
     closest_lane = *opt;
   }

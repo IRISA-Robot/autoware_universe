@@ -1183,33 +1183,16 @@ PathWithLaneId StaticObstacleAvoidanceModule::extendBackwardLength(
   const size_t orig_ego_seg_idx = planner_data_->findEgoSegmentIndex(original_path.points);
   const size_t orig_ego_idx = std::min(orig_ego_seg_idx + 1, original_path.points.size() - 1);
   const auto & anchor_pose = autoware_utils::get_pose(original_path.points.at(orig_ego_idx));
-
-  // Never splice around an anchor that is not at the robot.  On a 1 m path the point after ego's
-  // segment is ~1 m away; if it is further than this, the ego index landed on the wrong part of
-  // the path (or the path does not pass the robot at all), and splicing would carry that offset
-  // into the output -- return the original path untouched instead.  Same limit for where the
-  // anchor lands on the previous path: an unbounded search there could match a far section.
-  constexpr double max_splice_anchor_distance = 5.0;  // [m]
-  const double anchor_dist_from_ego =
-    autoware_utils::calc_distance2d(getEgoPosition(), anchor_pose.position);
-  if (anchor_dist_from_ego > max_splice_anchor_distance) {
-    RCLCPP_WARN_THROTTLE(
-      getLogger(), *clock_, 1000,
-      "[SPLICE-ANCHOR-FAR] extendBackwardLength: anchor %.2f m from ego (> %.1f m, seg_idx=%zu of "
-      "%zu points) -- not splicing the previous path.",
-      anchor_dist_from_ego, max_splice_anchor_distance, orig_ego_seg_idx,
-      original_path.points.size());
-    return original_path;
-  }
   const auto prev_ego_idx = autoware::motion_utils::findNearestSegmentIndex(
-    previous_path.points, anchor_pose, max_splice_anchor_distance,
+    previous_path.points, anchor_pose, std::numeric_limits<double>::max(),
     planner_data_->parameters.ego_nearest_yaw_threshold);
   if (!prev_ego_idx) {
     return original_path;
   }
 
-  // the anchor sits ahead of ego: the extension must reach back past ego.
-  const double required_backward_length = backward_length + anchor_dist_from_ego;
+  // the anchor may sit well ahead of ego on a sparse path: the extension must reach back past ego.
+  const double required_backward_length =
+    backward_length + autoware_utils::calc_distance2d(getEgoPosition(), anchor_pose.position);
 
   size_t clip_idx = 0;
   double accumulated_length = 0.0;

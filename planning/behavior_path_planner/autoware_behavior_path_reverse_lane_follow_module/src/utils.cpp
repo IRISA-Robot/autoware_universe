@@ -18,14 +18,6 @@
 #include <autoware_utils/geometry/geometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 
-#include <autoware/behavior_path_planner_common/utils/utils.hpp>
-
-#include <boost/geometry/algorithms/area.hpp>
-#include <boost/geometry/algorithms/distance.hpp>
-#include <boost/geometry/algorithms/intersection.hpp>
-
-#include <lanelet2_core/geometry/Polygon.h>
-
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -146,88 +138,6 @@ void dropNonAdvancingPoints(PathWithLaneId & path, const double max_reversal_rad
   }
 }
 
-// The route lanelet ego is on, for anchoring this module's paths.  getClosestLaneletWithinRoute
-// alone picks among every primitive of every route segment (unchosen alternatives included, which
-// is what re-opens the [SEAM-FOLD]-prone unfiltered window) and has no distance limit, so a robot
-// displaced off its lane got a path built around a lanelet it is not on -- metres away.  Prefer
-// the chosen lanelets, and refuse anything farther than this from ego: no path is better than one
-// that starts somewhere else.
-constexpr double kMaxEgoDistanceToRouteLaneletM = 3.0;
-
-// Chosen lanelets this much farther from ego than the nearest one still count as "ego is on it":
-// where a route runs out and back over the same ground, both legs' lanelets contain ego.
-constexpr double kEgoLaneletTieToleranceM = 0.5;
-// Ego still counts as on last cycle's lanelet (or a route neighbour of it) up to this far outside
-// it; beyond, it has been relocalised and the whole route is searched.
-constexpr double kEgoLaneletMaxDriftM = 1.0;
-
-// The chosen-lanelet index picked last cycle, per route.  Shared by both callers below (they look
-// up the same ego), reset whenever the route changes.
-struct EgoRouteLaneletMemory
-{
-  std::optional<unique_identifier_msgs::msg::UUID> route_uuid;
-  std::optional<size_t> index;
-};
-EgoRouteLaneletMemory & egoRouteLaneletMemory()
-{
-  static EgoRouteLaneletMemory memory;
-  return memory;
-}
-
-std::optional<lanelet::ConstLanelet> findEgoRouteLanelet(
-  const RouteHandler & route_handler, const Pose & ego_pose)
-{
-  const lanelet::BasicPoint2d ego_point(ego_pose.position.x, ego_pose.position.y);
-  const auto distance_to = [&](const lanelet::ConstLanelet & llt) {
-    return boost::geometry::distance(ego_point, llt.polygon2d().basicPolygon());
-  };
-
-  // Not getClosestPreferredLaneletWithinRoute: on overlapping out-and-back lanelets its heading
-  // tie-break picks the other leg whenever the robot is reversing (see selectEgoRouteLaneletIndex).
-  const auto preferred = route_handler.getPreferredLanelets();
-  if (!preferred.empty()) {
-    auto & memory = egoRouteLaneletMemory();
-    const auto route_uuid = route_handler.getRouteUuid();
-    if (!memory.route_uuid || *memory.route_uuid != route_uuid) {
-      memory.route_uuid = route_uuid;
-      memory.index.reset();
-    }
-    if (memory.index && *memory.index >= preferred.size()) {
-      memory.index.reset();
-    }
-
-    std::vector<double> distances;
-    distances.reserve(preferred.size());
-    for (const auto & llt : preferred) {
-      distances.push_back(distance_to(llt));
-    }
-    const auto index = selectEgoRouteLaneletIndex(
-      distances, memory.index, kEgoLaneletTieToleranceM, kEgoLaneletMaxDriftM,
-      kMaxEgoDistanceToRouteLaneletM);
-    if (index) {
-      memory.index = index;
-      return preferred.at(*index);
-    }
-  }
-
-  lanelet::ConstLanelet lanelet;
-  if (!route_handler.getClosestLaneletWithinRoute(ego_pose, &lanelet)) {
-    return std::nullopt;
-  }
-  const double dist = distance_to(lanelet);
-  if (dist > kMaxEgoDistanceToRouteLaneletM) {
-    static rclcpp::Clock steady_clock{RCL_STEADY_TIME};
-    RCLCPP_WARN_THROTTLE(
-      rclcpp::get_logger("reverse_lane_follow_utils"), steady_clock, 2000,
-      "[EGO-FAR-FROM-ROUTE] ego (%.2f, %.2f) is %.2f m from the closest route lanelet %ld "
-      "(> %.1f m): not building a reverse path around it.",
-      ego_pose.position.x, ego_pose.position.y, dist, lanelet.id(),
-      kMaxEgoDistanceToRouteLaneletM);
-    return std::nullopt;
-  }
-  return lanelet;
-}
-
 }  // namespace
 
 std::optional<TraveledTail> extractTraveledTailPath(
@@ -238,11 +148,10 @@ std::optional<TraveledTail> extractTraveledTailPath(
     return std::nullopt;
   }
 
-  const auto ego_lanelet = findEgoRouteLanelet(*route_handler, ego_pose);
-  if (!ego_lanelet) {
+  lanelet::ConstLanelet current_lanelet;
+  if (!route_handler->getClosestLaneletWithinRoute(ego_pose, &current_lanelet)) {
     return std::nullopt;
   }
-  const lanelet::ConstLanelet current_lanelet = *ego_lanelet;
 
   // Lanelet sequence covering (at least) retrace_distance_m behind ego and nothing ahead of ego.
   // This is purely a lookup into the already-computed, already-legal route -- no routing-graph
@@ -313,16 +222,15 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
     return std::nullopt;
   }
 
-  const auto ego_lanelet = findEgoRouteLanelet(*route_handler, ego_pose);
-  if (!ego_lanelet) {
+  lanelet::ConstLanelet current_lanelet;
+  if (!route_handler->getClosestLaneletWithinRoute(ego_pose, &current_lanelet)) {
     RCLCPP_WARN_THROTTLE(
       logger, steady_clock, 2000,
-      "[BIDIR-DEBUG] buildRouteReversedFollowPath: no route lanelet within %.1f m of ego pose "
-      "(%.2f, %.2f)",
-      kMaxEgoDistanceToRouteLaneletM, ego_pose.position.x, ego_pose.position.y);
+      "[BIDIR-DEBUG] buildRouteReversedFollowPath: getClosestLaneletWithinRoute failed for ego "
+      "pose (%.2f, %.2f)",
+      ego_pose.position.x, ego_pose.position.y);
     return std::nullopt;
   }
-  const lanelet::ConstLanelet current_lanelet = *ego_lanelet;
 
   // [BIDIR-BUG-FIX #2] No longer gate on current_lanelet's own isLaneletInvertedInRoute() here --
   // see buildRouteReversedFollowPath()'s doc comment in utils.hpp. Logged for visibility only;
@@ -441,100 +349,6 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
         "not the segment's preferred primitive. Building the reverse path from chosen lanelets only.",
         lanelet_sequence_raw[end_idx].id(), lanelet_sequence_raw[end_idx + 1].id());
     }
-
-    // [OVERLAP-TRIM] A route can go out and back over the same ground on overlapping lanelets
-    // (hibikino_kanan: 382 up, 195/188 back down over it), or right beside it (347 / 195).  A window spanning both passes gives a
-    // path that lies under ego twice: every yaw-matched nearest search downstream then picks the
-    // pass whose heading happens to fit -- the other leg when reversing -- and the overlap cut in
-    // the planner manager, which assumes the lanes start at ego, fell behind ego on the return
-    // leg.  Keep the window to ego's own pass, using current_idx (route order), not geometry:
-    //  - behind ego, drop every lanelet up to the last one that overlaps any later lanelet in the
-    //    window (the passes behind ego must not lie over each other either);
-    //  - ahead, stop before the first lanelet that overlaps an earlier one in the window
-    //    (the same rule as utils::cutOverlappedLanes(), applied here where ego is known).
-    {
-      // Two lanelets of the window conflict when they overlap, or when they run the opposite way
-      // within the nearest-search distance of each other (347 up beside 195 down, 2.5 m apart):
-      // every yaw-matched nearest search -- planner, optimizer, controller, validator -- takes
-      // the leg whose heading fits ego's nose, which is the other leg when reversing.
-      constexpr double kOppositeLegNearM = 3.0;
-      constexpr double kOppositeCos = -0.7;  // more than ~135 deg apart
-      const auto overlaps = [](const lanelet::ConstLanelet & a, const lanelet::ConstLanelet & b) {
-        const auto poly_a = ::autoware::behavior_path_planner::utils::toPolygon2d(a);
-        const auto poly_b = ::autoware::behavior_path_planner::utils::toPolygon2d(b);
-        try {
-          std::vector<autoware_utils::Polygon2d> intersections;
-          boost::geometry::intersection(poly_a, poly_b, intersections);
-          if (std::any_of(intersections.begin(), intersections.end(), [](const auto & polygon) {
-                return boost::geometry::area(polygon) > 1e-3;
-              })) {
-            return true;
-          }
-          if (boost::geometry::distance(poly_a, poly_b) > kOppositeLegNearM) {
-            return false;
-          }
-        } catch (const std::exception &) {
-          return false;  // e.g. a self-intersecting U-turn lanelet polygon
-        }
-        // Direction of travel (centerline of the route-oriented lanelet) where they come closest.
-        const auto ca = a.centerline2d();
-        const auto cb = b.centerline2d();
-        if (ca.size() < 2 || cb.size() < 2) {
-          return false;
-        }
-        double best = std::numeric_limits<double>::max();
-        size_t ia = 0;
-        size_t ib = 0;
-        for (size_t i = 0; i + 1 < ca.size(); ++i) {
-          for (size_t j = 0; j + 1 < cb.size(); ++j) {
-            const double d = (ca[i].basicPoint() - cb[j].basicPoint()).squaredNorm();
-            if (d < best) {
-              best = d;
-              ia = i;
-              ib = j;
-            }
-          }
-        }
-        const lanelet::BasicPoint2d da = ca[ia + 1].basicPoint() - ca[ia].basicPoint();
-        const lanelet::BasicPoint2d db = cb[ib + 1].basicPoint() - cb[ib].basicPoint();
-        const double norm = da.norm() * db.norm();
-        return norm > 1e-9 && da.dot(db) / norm < kOppositeCos;
-      };
-      const size_t original_begin = begin_idx;
-      const size_t original_end = end_idx;
-      for (size_t i = begin_idx; i < current_idx; ++i) {
-        for (size_t j = i + 2; j <= end_idx; ++j) {
-          if (overlaps(lanelet_sequence_raw[i], lanelet_sequence_raw[j])) {
-            begin_idx = i + 1;
-            break;
-          }
-        }
-      }
-      for (size_t j = std::max(current_idx + 1, begin_idx + 2); j <= end_idx; ++j) {
-        bool overlaps_earlier = false;
-        for (size_t i = begin_idx; i + 2 <= j; ++i) {
-          if (overlaps(lanelet_sequence_raw[i], lanelet_sequence_raw[j])) {
-            overlaps_earlier = true;
-            break;
-          }
-        }
-        if (overlaps_earlier) {
-          end_idx = j - 1;
-          forward_end_is_genuine_discontinuity = false;
-          break;
-        }
-      }
-      if (begin_idx != original_begin || end_idx != original_end) {
-        RCLCPP_WARN_THROTTLE(
-          logger, steady_clock, 3000,
-          "[OVERLAP-TRIM] window around ego's lanelet %ld cut to its own pass: %ld..%ld "
-          "(was %ld..%ld)",
-          current_lanelet.id(), lanelet_sequence_raw[begin_idx].id(),
-          lanelet_sequence_raw[end_idx].id(), lanelet_sequence_raw[original_begin].id(),
-          lanelet_sequence_raw[original_end].id());
-      }
-    }
-
     lanelet_sequence = lanelet::ConstLanelets(
       lanelet_sequence_raw.begin() + static_cast<std::ptrdiff_t>(begin_idx),
       lanelet_sequence_raw.begin() + static_cast<std::ptrdiff_t>(end_idx) + 1);
@@ -972,66 +786,6 @@ bool isEgoArrivedAndStoppedAtGoal(
   const bool ego_within_goal_tolerance = distance_to_goal_m < goal_reach_tolerance_m;
   const bool ego_genuinely_stopped = std::abs(ego_speed_mps) < arrived_stop_velocity_mps;
   return ego_within_goal_tolerance && ego_genuinely_stopped;
-}
-
-std::optional<size_t> selectEgoRouteLaneletIndex(
-  const std::vector<double> & distances_m, const std::optional<size_t> & previous_index,
-  const double tie_tolerance_m, const double max_drift_m, const double max_distance_m)
-{
-  if (distances_m.empty()) {
-    return std::nullopt;
-  }
-  const size_t n = distances_m.size();
-
-  // Follow the route from last cycle's pick: look only at it and its route neighbours (one back,
-  // two ahead).  Ego drifting off its lanelet must never let a later leg that happens to lie
-  // under it win -- only a neighbour along the route can take over.
-  if (previous_index && *previous_index < n) {
-    const size_t p = *previous_index;
-    const size_t begin = p > 0 ? p - 1 : 0;
-    const size_t end = std::min(n, p + 3);
-    double local_min = std::numeric_limits<double>::max();
-    for (size_t i = begin; i < end; ++i) {
-      local_min = std::min(local_min, distances_m.at(i));
-    }
-    if (local_min <= max_drift_m) {
-      const auto is_local_candidate = [&](const size_t i) {
-        return distances_m.at(i) <= local_min + tie_tolerance_m;
-      };
-      // The furthest one along the route that ego is on.  Holding on to the previous one until
-      // ego had left it deadlocked at a tight U-turn: the window ahead of 347 ends after the
-      // short U-turn lanelet 458, the robot stopped for that path end right at the 347/458 seam,
-      // still "on" 347, so the window -- and the path end -- never moved on.
-      for (size_t i = end; i-- > p;) {
-        if (is_local_candidate(i)) {
-          return i;
-        }
-      }
-      return begin;  // only the one behind is near: ego went backwards along the route
-    }
-    // Ego is off all of them (relocalised / pose-estimated): search the whole route.
-  }
-
-  const double min_distance = *std::min_element(distances_m.begin(), distances_m.end());
-  if (min_distance > max_distance_m) {
-    return std::nullopt;
-  }
-  const auto is_candidate = [&](const size_t i) {
-    return distances_m.at(i) <= min_distance + tie_tolerance_m;
-  };
-  if (previous_index) {
-    for (size_t i = std::min(*previous_index, n); i < n; ++i) {
-      if (is_candidate(i)) {
-        return i;
-      }
-    }
-  }
-  for (size_t i = 0; i < n; ++i) {
-    if (is_candidate(i)) {
-      return i;
-    }
-  }
-  return std::nullopt;
 }
 
 }  // namespace autoware::behavior_path_planner::reverse_lane_follow_utils

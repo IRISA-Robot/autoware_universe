@@ -39,7 +39,6 @@ using autoware::behavior_path_planner::reverse_lane_follow_utils::clampVelocityN
 using autoware::behavior_path_planner::reverse_lane_follow_utils::densifyPathNearGoal;
 using autoware::behavior_path_planner::reverse_lane_follow_utils::isEgoArrivedAndStoppedAtGoal;
 using autoware::behavior_path_planner::reverse_lane_follow_utils::reversePathForRetrace;
-using autoware::behavior_path_planner::reverse_lane_follow_utils::selectEgoRouteLaneletIndex;
 using autoware::behavior_path_planner::reverse_lane_follow_utils::
   shouldSuppressReversedFollowReactivation;
 using autoware::behavior_path_planner::reverse_lane_follow_utils::truncatePathAtGoal;
@@ -736,75 +735,6 @@ TEST(IsEgoArrivedAndStoppedAtGoal, LiveConfirmedResidualCreepDoesNotBlockArrival
   EXPECT_TRUE(isEgoArrivedAndStoppedAtGoal(
     /*distance_to_goal_m=*/0.6, /*ego_speed_mps=*/0.00105, /*goal_reach_tolerance_m=*/1.0,
     /*arrived_stop_velocity_mps=*/0.05));
-}
-
-// Out-and-back route over overlapping lanelets (live: hibikino_kanan 382 up, ..., 188 back down
-// over the same ground).  Route order: 0=382, 1=373, 2=347, 3=458, 4=195, 5=188.  On the way
-// out ego lies inside both 382 (index 0) and 188 (index 5).
-TEST(SelectEgoRouteLaneletIndex, OutboundLegKeptWhileInsideTheReturnLegToo)
-{
-  const std::vector<double> d{0.0, 30.0, 50.0, 60.0, 8.0, 0.0};
-  // no history yet: the earliest leg
-  EXPECT_EQ(selectEgoRouteLaneletIndex(d, std::nullopt, 0.5, 1.0, 3.0), std::optional<size_t>(0));
-  // already on 382: stay on it, never jump to the return leg
-  EXPECT_EQ(selectEgoRouteLaneletIndex(d, 0, 0.5, 1.0, 3.0), std::optional<size_t>(0));
-}
-
-TEST(SelectEgoRouteLaneletIndex, ReturnLegKeptWhileInsideTheOutboundLegToo)
-{
-  const std::vector<double> d{0.0, 30.0, 50.0, 60.0, 0.3, 0.0};
-  // coming down from 195 (index 4) into the overlap: next along the route is 188, not 382
-  EXPECT_EQ(selectEgoRouteLaneletIndex(d, 4, 0.5, 1.0, 3.0), std::optional<size_t>(5));
-  const std::vector<double> past_195{0.0, 30.0, 50.0, 60.0, 0.9, 0.0};
-  EXPECT_EQ(selectEgoRouteLaneletIndex(past_195, 4, 0.5, 1.0, 3.0), std::optional<size_t>(5));
-  EXPECT_EQ(selectEgoRouteLaneletIndex(past_195, 5, 0.5, 1.0, 3.0), std::optional<size_t>(5));
-}
-
-TEST(SelectEgoRouteLaneletIndex, DriftingOffTheOutboundLaneletDoesNotJumpToTheReturnLeg)
-{
-  // live: ego 0.6 m outside 382 on a curve, fully inside 188 (index 5)
-  const std::vector<double> d{0.6, 40.0, 70.0, 90.0, 5.0, 0.0};
-  EXPECT_EQ(selectEgoRouteLaneletIndex(d, 0, 0.5, 1.0, 3.0), std::optional<size_t>(0));
-}
-
-TEST(SelectEgoRouteLaneletIndex, RelocalisedFarAwaySearchesTheWholeRoute)
-{
-  // pose-estimated from 382 to the top of 195
-  const std::vector<double> d{50.0, 20.0, 1.6, 1.8, 0.0, 88.0};
-  EXPECT_EQ(selectEgoRouteLaneletIndex(d, 0, 0.5, 1.0, 3.0), std::optional<size_t>(4));
-}
-
-TEST(SelectEgoRouteLaneletIndex, AdvancesToTheNextLaneletAtASeam)
-{
-  // reaching 373 from 382: hand over as soon as ego is at the seam
-  EXPECT_EQ(
-    selectEgoRouteLaneletIndex({0.0, 0.4, 20.0}, 0, 0.5, 1.0, 3.0), std::optional<size_t>(1));
-  EXPECT_EQ(
-    selectEgoRouteLaneletIndex({0.4, 0.0, 20.0}, 0, 0.5, 1.0, 3.0), std::optional<size_t>(1));
-  // still well inside 382
-  EXPECT_EQ(
-    selectEgoRouteLaneletIndex({0.0, 0.8, 20.0}, 0, 0.5, 1.0, 3.0), std::optional<size_t>(0));
-  EXPECT_EQ(
-    selectEgoRouteLaneletIndex({0.7, 0.0, 20.0}, 0, 0.5, 1.0, 3.0), std::optional<size_t>(1));
-}
-
-TEST(SelectEgoRouteLaneletIndex, StoppedAtTheUTurnSeamMovesOnToTheUTurnLanelet)
-{
-  // live: ego stopped 0.02 m from 347 (index 2), inside 458 (index 3); 195 (index 4) 1.38 m away
-  const std::vector<double> d{50.0, 20.0, 0.02, 0.0, 1.38, 88.0};
-  EXPECT_EQ(selectEgoRouteLaneletIndex(d, 2, 0.5, 1.0, 3.0), std::optional<size_t>(3));
-}
-
-TEST(SelectEgoRouteLaneletIndex, FallsBackBehindWhenNothingIsAhead)
-{
-  EXPECT_EQ(
-    selectEgoRouteLaneletIndex({0.0, 5.0, 9.0}, 2, 0.5, 1.0, 3.0), std::optional<size_t>(0));
-}
-
-TEST(SelectEgoRouteLaneletIndex, RefusesWhenEgoIsFarFromEveryLanelet)
-{
-  EXPECT_EQ(selectEgoRouteLaneletIndex({3.5, 4.0}, 0, 0.5, 1.0, 3.0), std::nullopt);
-  EXPECT_EQ(selectEgoRouteLaneletIndex({}, std::nullopt, 0.5, 1.0, 3.0), std::nullopt);
 }
 
 int main(int argc, char ** argv)
