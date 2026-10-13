@@ -41,9 +41,11 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <tier4_planning_msgs/msg/lateral_offset.hpp>
 
+#include <cmath>
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -351,20 +353,85 @@ struct PlannerData
     return traffic_light_id_map.at(id);
   }
 
+  // Ego's nearest point, for a path driven in either direction.
+  //
+  // motion_utils::findFirstNearestIndexWithSoftConstraints compares ego's nose with the path yaw.
+  // A route-reversed path carries yaw = direction of travel while the nose points the other way,
+  // so the distance+yaw stage never matched in reverse, and when no point was within the distance
+  // threshold its next stage matched on yaw alone with NO distance limit -- any part of the path
+  // that had turned > 120 deg (a U-turn, a loop), tens of metres away.  Everything anchored on
+  // that index (avoidance's extendBackwardLength, the output crop, drivable bounds) then started
+  // the path there.  Here: the same first stage, then the same with the nose flipped, then
+  // distance only, then the plain nearest point -- never yaw alone.  Forward driving resolves in
+  // the first stage, exactly as before.
   template <class T>
   size_t findEgoIndex(const std::vector<T> & points) const
   {
-    return autoware::motion_utils::findFirstNearestIndexWithSoftConstraints(
-      points, self_odometry->pose.pose, parameters.ego_nearest_dist_threshold,
-      parameters.ego_nearest_yaw_threshold);
+    autoware::motion_utils::validateNonEmpty(points);
+    const auto & ego_pose = self_odometry->pose.pose;
+    const double dist_th = parameters.ego_nearest_dist_threshold;
+    const double yaw_th = parameters.ego_nearest_yaw_threshold;
+
+    if (const auto idx = findFirstNearestIndexWithin(points, ego_pose, dist_th, yaw_th)) {
+      return *idx;
+    }
+    auto flipped_pose = ego_pose;
+    flipped_pose.orientation = autoware_utils_geometry::create_quaternion_from_yaw(
+      autoware_utils_geometry::get_rpy(ego_pose).z + M_PI);
+    if (const auto idx = findFirstNearestIndexWithin(points, flipped_pose, dist_th, yaw_th)) {
+      return *idx;
+    }
+    if (const auto idx = findFirstNearestIndexWithin(
+          points, ego_pose, dist_th, std::numeric_limits<double>::max())) {
+      return *idx;
+    }
+    return autoware::motion_utils::findNearestIndex(points, ego_pose.position);
   }
 
   template <class T>
   size_t findEgoSegmentIndex(const std::vector<T> & points) const
   {
-    return autoware::motion_utils::findFirstNearestSegmentIndexWithSoftConstraints(
-      points, self_odometry->pose.pose, parameters.ego_nearest_dist_threshold,
-      parameters.ego_nearest_yaw_threshold);
+    // same index -> segment rule as motion_utils::findFirstNearestSegmentIndexWithSoftConstraints
+    const size_t nearest_idx = findEgoIndex(points);
+    if (nearest_idx == 0) {
+      return 0;
+    }
+    if (nearest_idx == points.size() - 1) {
+      return points.size() - 2;
+    }
+    const double signed_length = autoware::motion_utils::calcLongitudinalOffsetToSegment(
+      points, nearest_idx, self_odometry->pose.pose.position);
+    return signed_length <= 0 ? nearest_idx - 1 : nearest_idx;
+  }
+
+private:
+  // The first run of consecutive points within both thresholds, and the nearest point in it
+  // (motion_utils' first stage), or nullopt if no point qualifies.
+  template <class T>
+  static std::optional<size_t> findFirstNearestIndexWithin(
+    const std::vector<T> & points, const geometry_msgs::msg::Pose & pose,
+    const double dist_threshold, const double yaw_threshold)
+  {
+    const double squared_dist_threshold = dist_threshold * dist_threshold;
+    double min_squared_dist = std::numeric_limits<double>::max();
+    std::optional<size_t> min_idx;
+    for (size_t i = 0; i < points.size(); ++i) {
+      const auto squared_dist =
+        autoware_utils_geometry::calc_squared_distance2d(points.at(i), pose.position);
+      const auto yaw = autoware_utils_geometry::calc_yaw_deviation(
+        autoware_utils_geometry::get_pose(points.at(i)), pose);
+      if (squared_dist_threshold < squared_dist || yaw_threshold < std::abs(yaw)) {
+        if (min_idx) {
+          break;
+        }
+        continue;
+      }
+      if (squared_dist < min_squared_dist) {
+        min_squared_dist = squared_dist;
+        min_idx = i;
+      }
+    }
+    return min_idx;
   }
 };
 
