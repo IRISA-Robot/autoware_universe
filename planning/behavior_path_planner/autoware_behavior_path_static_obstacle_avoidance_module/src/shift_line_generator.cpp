@@ -307,9 +307,13 @@ std::optional<std::pair<double, double>> ShiftLineGenerator::computeFeasibleShif
   // lateral_hard_margin; half the vehicle width is kept in full since it is the ego's actual
   // physical footprint, not a tunable buffer.
   constexpr double kRelaxedHardMarginFloor = 0.03;  // [m], ~3cm, intentionally non-zero.
-  const auto infeasible =
-    std::abs(feasible_shift_length - object.overhang_points.front().first) - LAT_DIST_BUFFER <
-    0.5 * data_->parameters.vehicle_width + kRelaxedHardMarginFloor;
+  // Clearance is measured to the edge the shifted path actually passes: the object's left-most
+  // edge when shifting left, its right-most edge when shifting right (front() is sorted by the
+  // path side and is the far edge whenever the shift side differs from it).
+  const auto passed_edge = utils::static_obstacle_avoidance::getOverhangDistance(
+    object, /*is_object_on_right=*/desire_shift_length > 0.0);
+  const auto infeasible = std::abs(feasible_shift_length - passed_edge) - LAT_DIST_BUFFER <
+                          0.5 * data_->parameters.vehicle_width + kRelaxedHardMarginFloor;
   if (infeasible) {
     // [REV-F2 fix 2026-09-03] This hard lateral-margin check is the one feasibility gate that
     // is_avoidance_committed deliberately never bypasses (see the comment above

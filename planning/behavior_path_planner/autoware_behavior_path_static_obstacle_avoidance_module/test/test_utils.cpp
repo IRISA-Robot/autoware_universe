@@ -3767,4 +3767,60 @@ TEST(TestUtils, ClusterNearbyObjectsMembershipHysteresisPreventsFlicker)
       << "cycle 7: 3 consecutive out-of-range cycles -- must actually split now";
   }
 }
+
+namespace
+{
+ObjectData objectWithOverhangs(const std::vector<double> & laterals, const Direction direction)
+{
+  ObjectData o;
+  o.direction = direction;
+  for (const auto l : laterals) {
+    o.overhang_points.emplace_back(l, create_point(0.0, l, 0.0));
+  }
+  // same order calcEnvelopeOverhangDistance() produces: front() is the path-side ego-facing edge
+  std::sort(o.overhang_points.begin(), o.overhang_points.end(), [&](const auto & a, const auto & b) {
+    return direction == Direction::RIGHT ? b.first < a.first : a.first < b.first;
+  });
+  return o;
+}
+}  // namespace
+
+TEST(TestUtils, getOverhangDistance)
+{
+  // object straddling the path, listed as RIGHT by the path side: edges at -1.2 and +0.4
+  const auto o = objectWithOverhangs({-1.2, -0.5, 0.4}, Direction::RIGHT);
+  EXPECT_DOUBLE_EQ(getOverhangDistance(o, true), 0.4);    // treated right -> its left-most edge
+  EXPECT_DOUBLE_EQ(getOverhangDistance(o, false), -1.2);  // treated left -> its right-most edge
+  // matches front() when the side agrees with the path side (unchanged behavior)
+  EXPECT_DOUBLE_EQ(getOverhangDistance(o, true), o.overhang_points.front().first);
+
+  // treated-left object passed on its right: shift must clear its RIGHT edge, never its left edge
+  EXPECT_DOUBLE_EQ(calcShiftLength(false, getOverhangDistance(o, false), 0.8), -2.0);
+
+  EXPECT_DOUBLE_EQ(getOverhangDistance(ObjectData{}, true), 0.0);
+}
+
+TEST(TestUtils, isObjectOnRightForAvoidance)
+{
+  using filtering_utils::isObjectOnRightForAvoidance;
+  const AvoidancePlanningData data{};  // centerline tie-break is not reached in these cases
+
+  // log_belok.log 883.9 s: envelope entirely 0.29 m+ right of the path -> must stay RIGHT
+  EXPECT_TRUE(isObjectOnRightForAvoidance(
+    objectWithOverhangs({-0.29, -0.6, -0.9}, Direction::RIGHT), data));
+  // belog_lagi.log 492.3 s: envelope entirely 0.077 m+ right of the path -> RIGHT
+  EXPECT_TRUE(isObjectOnRightForAvoidance(
+    objectWithOverhangs({-0.077, -0.4, -0.7}, Direction::RIGHT), data));
+  // log_belok.log 887.7 s: 2.55 m right of the path -> RIGHT
+  EXPECT_TRUE(isObjectOnRightForAvoidance(
+    objectWithOverhangs({-2.553, -3.0, -3.4}, Direction::RIGHT), data));
+  // entirely left of the path -> LEFT
+  EXPECT_FALSE(isObjectOnRightForAvoidance(
+    objectWithOverhangs({0.3, 0.7, 1.1}, Direction::LEFT), data));
+
+  // shift for the 883.9 s object now points away from it (left, positive)
+  const auto o = objectWithOverhangs({-0.29, -0.6, -0.9}, Direction::RIGHT);
+  const bool right = isObjectOnRightForAvoidance(o, data);
+  EXPECT_GT(calcShiftLength(right, getOverhangDistance(o, right), 0.828), 0.0);
+}
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
