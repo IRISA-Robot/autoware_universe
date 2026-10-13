@@ -362,8 +362,8 @@ struct PlannerData
   // that had turned > 120 deg (a U-turn, a loop), tens of metres away.  Everything anchored on
   // that index (avoidance's extendBackwardLength, the output crop, drivable bounds) then started
   // the path there.  Here: the same first stage, then the same with the nose flipped, then
-  // distance only, then the plain nearest point -- never yaw alone.  Forward driving resolves in
-  // the first stage, exactly as before.
+  // distance only, then the plain nearest point -- never yaw alone.  Forward driving resolves on
+  // the nose match, exactly as before, unless a reversed stretch lies nearer to ego.
   template <class T>
   size_t findEgoIndex(const std::vector<T> & points) const
   {
@@ -372,14 +372,26 @@ struct PlannerData
     const double dist_th = parameters.ego_nearest_dist_threshold;
     const double yaw_th = parameters.ego_nearest_yaw_threshold;
 
-    if (const auto idx = findFirstNearestIndexWithin(points, ego_pose, dist_th, yaw_th)) {
-      return *idx;
-    }
+    // Both headings, and the nearer match wins: where the route comes back the other way beside
+    // or over ego (out and back, hibikino_kanan 347 vs 195 2.5 m apart), the leg ego is reversing
+    // along matches only the flipped nose while the other leg matches the nose -- taking the nose
+    // stage first put ego on the other leg.
     auto flipped_pose = ego_pose;
     flipped_pose.orientation = autoware_utils_geometry::create_quaternion_from_yaw(
       autoware_utils_geometry::get_rpy(ego_pose).z + M_PI);
-    if (const auto idx = findFirstNearestIndexWithin(points, flipped_pose, dist_th, yaw_th)) {
-      return *idx;
+    const auto nose_idx = findFirstNearestIndexWithin(points, ego_pose, dist_th, yaw_th);
+    const auto travel_idx = findFirstNearestIndexWithin(points, flipped_pose, dist_th, yaw_th);
+    if (nose_idx && travel_idx) {
+      const auto squared_dist = [&](const size_t i) {
+        return autoware_utils_geometry::calc_squared_distance2d(points.at(i), ego_pose.position);
+      };
+      return squared_dist(*travel_idx) < squared_dist(*nose_idx) ? *travel_idx : *nose_idx;
+    }
+    if (nose_idx) {
+      return *nose_idx;
+    }
+    if (travel_idx) {
+      return *travel_idx;
     }
     if (const auto idx = findFirstNearestIndexWithin(
           points, ego_pose, dist_th, std::numeric_limits<double>::max())) {

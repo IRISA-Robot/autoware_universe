@@ -612,6 +612,18 @@ TEST(PlannerDataEgoIndex, ReversingEgoFarFromEveryVertexNeverJumpsToTheOtherLeg)
   EXPECT_LE(data->findEgoSegmentIndex(uTurnPath()), 1u);
 }
 
+TEST(PlannerDataEgoIndex, ReversingBesideTheReturnLegStaysOnItsOwnLeg)
+{
+  // Out and back on parallel legs 2.5 m apart (hibikino_kanan 347 / 195): ego reverses along the
+  // first leg (+x, nose -x); the return leg's yaw (-x) matches the nose and is within 3 m.
+  const std::vector<PathPointWithLaneId> path{
+    pathPoint(0.0, 0.0, 0.0),   pathPoint(1.0, 0.0, 0.0),   pathPoint(2.0, 0.0, 0.0),
+    pathPoint(3.0, 0.0, 0.0),   pathPoint(3.0, 2.5, M_PI),  pathPoint(2.0, 2.5, M_PI),
+    pathPoint(1.0, 2.5, M_PI),  pathPoint(0.0, 2.5, M_PI)};
+  const auto data = plannerDataAt(1.0, 0.0, M_PI);
+  EXPECT_EQ(data->findEgoIndex(path), 1u);
+}
+
 TEST(PlannerDataEgoIndex, ForwardDrivingIsUnchanged)
 {
   const auto data = plannerDataAt(10.5, 0.2, 0.0);
