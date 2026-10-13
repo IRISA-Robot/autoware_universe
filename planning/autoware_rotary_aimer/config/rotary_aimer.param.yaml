@@ -61,3 +61,7 @@
     # Kalau FSM berhenti publish (misal sudah lewat fase approach), target expired
     # dan node otomatis fallback ke mode lampu tf_pedestrian.
     target_fresh_sec: 0.5
+
+    # Lampu yang dipasangkan dengan crossing aktif (PedestrianLightTarget dari FSM).
+    # Mode lampu hanya mengarah ke lampu ini; sebelum FSM publish, ke lampu terdekat.
+    target_light_topic: "/planning/road_crossing/target_light"

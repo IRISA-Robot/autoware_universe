@@ -88,6 +88,8 @@ from geometry_msgs.msg import PointStamped
 from std_msgs.msg import Float32
 from std_srvs.srv import SetBool
 
+from autoware_road_crossing_msgs.msg import PedestrianLightTarget
+
 try:
     import tf2_ros
     _TF2_AVAILABLE = True
@@ -133,6 +135,7 @@ class RotaryAimerNode(Node):
         self.declare_parameter('zero_rate_rad_s', 0.04)
         self.declare_parameter('target_topic', '~/aim_target')
         self.declare_parameter('target_fresh_sec', 0.5)
+        self.declare_parameter('target_light_topic', '/planning/road_crossing/target_light')
 
         self._map_path = str(self.get_parameter('map_path').value)
         self._base_frame = str(self.get_parameter('base_frame').value)
@@ -168,6 +171,10 @@ class RotaryAimerNode(Node):
         # External aim target from FSM (road_crossing approach phase)
         self._ext_target_point = None   # (x, y, z) in map frame, or None
         self._ext_target_time = None    # rclpy.time.Time when the msg was received
+
+        # Light(s) paired with the FSM's active crossing; None until the FSM publishes,
+        # in which case every tf_pedestrian light is a candidate (original behavior).
+        self._target_light_ids = None
 
         # ------------------------------------------------------------------ tf2
         if _TF2_AVAILABLE:
@@ -208,6 +215,15 @@ class RotaryAimerNode(Node):
         )
         self.get_logger().info(
             f'Subscribed to rotary feedback: {self._feedback_topic}')
+
+        # ------------------------------------------------------------------ sub (paired light)
+        target_light_topic = str(self.get_parameter('target_light_topic').value)
+        self._target_light_sub = self.create_subscription(
+            PedestrianLightTarget,
+            target_light_topic,
+            self._target_light_cb,
+            10,
+        )
 
         # ------------------------------------------------------------------ sub (external target)
         self._ext_target_sub = self.create_subscription(
@@ -484,8 +500,13 @@ class RotaryAimerNode(Node):
                 )
 
             else:
-                # --- INTERNAL target: nearest tf_pedestrian light (original behavior) ---
-                if not self._lights:
+                # --- INTERNAL target: nearest of the crossing's paired light(s), or of
+                # every tf_pedestrian light before the FSM has published a target ---
+                lights = self._lights
+                if self._target_light_ids is not None:
+                    lights = [lt for lt in self._lights
+                              if int(lt.way_id) in self._target_light_ids]
+                if not lights:
                     return
 
                 # Find nearest light by distance from robot origin to light midpoint
@@ -493,7 +514,7 @@ class RotaryAimerNode(Node):
                 best_light = None
                 best_dist_sq = float('inf')
 
-                for light in self._lights:
+                for light in lights:
                     mx, my, mz = light.midpoint
                     # Transform midpoint from map to base_frame: p_base = R @ p_map + t
                     p_map = np.array([mx, my, mz], dtype=float)
@@ -576,6 +597,13 @@ class RotaryAimerNode(Node):
         """Store latest rotary position feedback (rad, same convention as cmd)."""
         self._latest_feedback_angle = float(msg.data)
         self._feedback_received = True
+
+    def _target_light_cb(self, msg: PedestrianLightTarget):
+        ids = [int(i) for i in msg.light_ids]
+        if ids != self._target_light_ids:
+            self.get_logger().info(
+                f'Target light: crossing={msg.crossing_id} lights={ids or "none"}')
+        self._target_light_ids = ids
 
     def _ext_target_cb(self, msg: PointStamped):
         """Store the latest external aim target published by the FSM.
