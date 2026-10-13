@@ -66,40 +66,36 @@ std::map<lanelet::Id, lanelet::ConstLanelet> getRouteLanelets(
     return route_lanelets;
   }
 
-  // Add preceding lanes of front route_section to prevent detection errors
-  {
-    const auto extension_length = 2 * vehicle_length;
-
-    for (const auto & primitive : route_ptr->segments.front().primitives) {
-      const auto lane_id = primitive.id;
+  // Add the lanes around both ends of the route to prevent detection errors. Both directions
+  // are added at each end because a route may run against the lanelet direction (reverse
+  // driving / bidirectional lanes): there, the lane physically behind the ego at the route
+  // start is the map *successor* of the first lanelet, not its predecessor, and the ego's
+  // overhang into it was reported as out of lane.
+  const auto extension_length = 2 * vehicle_length;
+  const auto add_neighbor_lanes = [&](const auto & route_section) {
+    for (const auto & primitive : route_section.primitives) {
+      const auto & lanelet = lanelet_map->laneletLayer.get(primitive.id);
       for (const auto & lanelet_sequence : lanelet::utils::query::getPrecedingLaneletSequences(
-             routing_graph, lanelet_map->laneletLayer.get(lane_id), extension_length)) {
+             routing_graph, lanelet, extension_length)) {
         for (const auto & preceding_lanelet : lanelet_sequence) {
           route_lanelets[preceding_lanelet.id()] = preceding_lanelet;
         }
       }
+      for (const auto & lanelet_sequence : lanelet::utils::query::getSucceedingLaneletSequences(
+             routing_graph, lanelet, extension_length)) {
+        for (const auto & succeeding_lanelet : lanelet_sequence) {
+          route_lanelets[succeeding_lanelet.id()] = succeeding_lanelet;
+        }
+      }
     }
-  }
+  };
+  add_neighbor_lanes(route_ptr->segments.front());
+  add_neighbor_lanes(route_ptr->segments.back());
 
   for (const auto & route_section : route_ptr->segments) {
     for (const auto & primitive : route_section.primitives) {
       const auto lane_id = primitive.id;
       route_lanelets[lane_id] = lanelet_map->laneletLayer.get(lane_id);
-    }
-  }
-
-  // Add succeeding lanes of last route_section to prevent detection errors
-  {
-    const auto extension_length = 2 * vehicle_length;
-
-    for (const auto & primitive : route_ptr->segments.back().primitives) {
-      const auto lane_id = primitive.id;
-      for (const auto & lanelet_sequence : lanelet::utils::query::getSucceedingLaneletSequences(
-             routing_graph, lanelet_map->laneletLayer.get(lane_id), extension_length)) {
-        for (const auto & succeeding_lanelet : lanelet_sequence) {
-          route_lanelets[succeeding_lanelet.id()] = succeeding_lanelet;
-        }
-      }
     }
   }
 
