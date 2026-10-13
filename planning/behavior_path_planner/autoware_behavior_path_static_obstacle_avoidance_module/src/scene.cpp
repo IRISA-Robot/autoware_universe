@@ -1693,7 +1693,18 @@ bool StaticObstacleAvoidanceModule::isValidShiftLine(
   addNewShiftLines(shifter_for_validate, shift_lines);
 
   ShiftedPath proposed_shift_path;
-  shifter_for_validate.generate(&proposed_shift_path);
+  if (!shifter_for_validate.generate(&proposed_shift_path)) {
+    // The return value used to be ignored: a failed generate() leaves the shift all zeros, which
+    // passes both the ego-offset and the drivable-bound checks below, so the line was committed.
+    // Every later cycle then failed to generate, the module kept publishing its last good path
+    // (scene.cpp [FALLBACK-VISIBILITY]), and when the line passed behind ego the base offset was
+    // applied in one cycle -- the path stepped sideways by the whole shift.
+    RCLCPP_WARN_THROTTLE(
+      getLogger(), *clock_, 1000,
+      "[SHIFT-LINE-UNGENERATABLE] PathShifter::generate() failed for the proposed shift line(s) "
+      "-- not registering them.");
+    return false;
+  }
 
   debug_data_.proposed_spline_shift = proposed_shift_path.shift_length;
 

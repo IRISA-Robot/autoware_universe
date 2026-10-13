@@ -215,18 +215,28 @@ public:
     return std::max(from_jerk, getSteerableShiftDistance(shift_length));
   }
 
+  // The "max" (= nominal, most comfortable) distances must never be shorter than the steerable
+  // one.  52774baaa put the curvature floor into getMinAvoidanceDistance only, but the shift line
+  // generator sizes avoid lines from getMaxAvoidanceDistance and return lines from
+  // getMaxReturnDistance -- both jerk-based, and jerk scales with speed: below ~0.45 m/s a 1 m
+  // shift came out ~1.1 m long against a steerable ~2.4 m.  That is the 0.3-1.5 m sideways S the
+  // floor was written to prevent, and when start and end land on adjacent indices it is a step.
   double getMaxAvoidanceDistance(const double shift_length) const
   {
     const auto distance_from_jerk = autoware::motion_utils::calc_longitudinal_dist_from_jerk(
       shift_length, getAvoidanceLateralMinJerkLimit(), getAvoidanceEgoSpeed());
-    return std::max(getNominalAvoidanceDistance(shift_length), distance_from_jerk);
+    return std::max(
+      {getNominalAvoidanceDistance(shift_length), distance_from_jerk,
+       getSteerableShiftDistance(shift_length)});
   }
 
   double getMaxReturnDistance(const double shift_length) const
   {
     const auto distance_from_jerk = autoware::motion_utils::calc_longitudinal_dist_from_jerk(
       shift_length, getReturnLateralMinJerkLimit(), getAvoidanceEgoSpeed());
-    return std::max(getNominalReturnDistance(shift_length), distance_from_jerk);
+    return std::max(
+      {getNominalReturnDistance(shift_length), distance_from_jerk,
+       getSteerableShiftDistance(shift_length)});
   }
 
   double getSharpAvoidanceDistance(const double shift_length) const
