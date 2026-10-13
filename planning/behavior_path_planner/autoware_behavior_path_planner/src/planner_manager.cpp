@@ -181,6 +181,80 @@ std::string running_module_names(
   }
   return names.empty() ? std::string{"<none>"} : names;
 }
+
+// cutOverlappedLanes() cuts the path at the first drivable lane that overlaps an earlier one, so
+// that a route looping back over itself does not get one drivable area spanning both passes.  It
+// assumes the lanes start at ego.  A module that hands over a long window behind ego breaks that:
+// on a route that goes out and back over the same ground (hibikino_kanan 382 up, 195/188 back
+// down over it), the window still starts on the outbound leg while ego is on the return leg, so
+// the cut fell *behind* ego -- the path ended 2 m behind the robot, longitudinal_distance_deviation
+// went ERROR and autonomous mode stayed unavailable until the route was reset.
+//
+// Drop the lanes ego has already left (keeping the one just behind it unless that one is what
+// overlaps the lanes ahead), and the path points on them, before the overlap cut runs.
+std::vector<DrivableLanes> dropDrivableLanesBehindEgo(
+  PathWithLaneId & path, const std::vector<DrivableLanes> & lanes, const PlannerData & data)
+{
+  if (path.points.empty() || !utils::getOverlappedLaneletId(lanes)) {
+    return lanes;
+  }
+
+  const size_t ego_idx = data.findEgoIndex(path.points);
+  const auto & ego_lane_ids = path.points.at(ego_idx).lane_ids;
+  const auto contains_any = [](const DrivableLanes & dl, const std::vector<int64_t> & ids) {
+    const auto lanelets = utils::transformToLanelets(dl);
+    return std::any_of(lanelets.begin(), lanelets.end(), [&ids](const auto & llt) {
+      return std::find(ids.begin(), ids.end(), llt.id()) != ids.end();
+    });
+  };
+
+  // The ego lane on ego's own pass: the last match, since the outbound pass comes first.
+  std::optional<size_t> ego_lane_idx;
+  for (size_t i = lanes.size(); i-- > 0;) {
+    if (contains_any(lanes.at(i), ego_lane_ids)) {
+      ego_lane_idx = i;
+      break;
+    }
+  }
+  if (!ego_lane_idx || *ego_lane_idx == 0) {
+    return lanes;
+  }
+
+  const std::vector<DrivableLanes> from_ego{lanes.begin() + *ego_lane_idx, lanes.end()};
+  const std::vector<DrivableLanes> from_prev{lanes.begin() + *ego_lane_idx - 1, lanes.end()};
+  const auto cut_from_ego = utils::getOverlappedLaneletId(from_ego);
+  const auto cut_from_prev = utils::getOverlappedLaneletId(from_prev);
+  const bool keep_prev =
+    !cut_from_prev || (cut_from_ego && *cut_from_prev == *cut_from_ego + 1);
+  const auto trimmed = keep_prev ? from_prev : from_ego;
+
+  // Path points before ego's pass through the kept lanes go too (walk back from ego only, so the
+  // outbound pass through the same lanelet ids is not mistaken for this one).
+  std::vector<int64_t> kept_ids;
+  for (const auto & llt : utils::transformToLanelets(trimmed)) {
+    kept_ids.push_back(llt.id());
+  }
+  size_t start_idx = ego_idx;
+  while (start_idx > 0) {
+    const auto & ids = path.points.at(start_idx - 1).lane_ids;
+    const bool kept = std::any_of(ids.begin(), ids.end(), [&kept_ids](const auto id) {
+      return std::find(kept_ids.begin(), kept_ids.end(), id) != kept_ids.end();
+    });
+    if (!kept) {
+      break;
+    }
+    --start_idx;
+  }
+  path.points.erase(path.points.begin(), path.points.begin() + static_cast<std::ptrdiff_t>(start_idx));
+
+  static rclcpp::Clock steady_clock{RCL_STEADY_TIME};
+  RCLCPP_WARN_THROTTLE(
+    rclcpp::get_logger("behavior_path_planner").get_child("planner_manager"), steady_clock, 2000,
+    "[OVERLAP-BEHIND-EGO] dropped %zu drivable lane(s) and %zu path point(s) behind ego so the "
+    "overlap cut does not fall behind it",
+    lanes.size() - trimmed.size(), start_idx);
+  return trimmed;
+}
 }  // namespace
 
 // This is a temporary process until motion planning can take the terminal pose into account
@@ -401,7 +475,8 @@ void PlannerManager::generateCombinedDrivableArea(
     utils::generateDrivableArea(
       output.path, di.drivable_lanes, false, false, false, data, is_driving_forward);
   } else {
-    const auto shorten_lanes = utils::cutOverlappedLanes(output.path, di.drivable_lanes);
+    const auto lanes_from_ego = dropDrivableLanesBehindEgo(output.path, di.drivable_lanes, *data);
+    const auto shorten_lanes = utils::cutOverlappedLanes(output.path, lanes_from_ego);
 
     const auto & dp = data->drivable_area_expansion_parameters;
     const auto expanded_lanes = utils::expandLanelets(
