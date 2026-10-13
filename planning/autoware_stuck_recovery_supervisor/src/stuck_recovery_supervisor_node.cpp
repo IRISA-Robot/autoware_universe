@@ -1748,7 +1748,25 @@ std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_
   double search_limit =
     top_large_fit ? std::numeric_limits<double>::max() : param_.max_goal_search_distance_m;
   if (route_) {
-    if (const auto goal_idx = find_nearest_index(reference_path_, route_->goal_pose)) {
+    // The clamp only applies when the mission goal actually lies in this window.
+    // find_nearest_index() snaps by straight-line distance alone, so on a route that
+    // loops back -- the goal a few tens of metres away in space but two kilometres away
+    // along the road -- the goal snapped onto the local 30 m path, landed at or behind
+    // the robot, and clamped the search to nothing.
+    //
+    // [2026-10-13] that is what produced "0 escape-goal candidates from 4.0 m ...
+    // searched out to 0.0 m" on an open road: the route ran 66 lanelets around the map
+    // and ended back where the robot had started, so the escape goal search never ran a
+    // single iteration and the episode held still until the operator took over.
+    //
+    // The window is made of lane centerlines, so a mission goal that really sits in it
+    // is within a lane half-width of one of its points; anything farther is elsewhere
+    // on the map and says nothing about how far ahead the robot may look.
+    constexpr double goal_in_window_tolerance_m = 2.0;
+    const auto goal_idx = find_nearest_index(reference_path_, route_->goal_pose);
+    if (
+      goal_idx &&
+      distance2d(reference_path_[*goal_idx], route_->goal_pose) <= goal_in_window_tolerance_m) {
       if (*goal_idx > ego_index) {
         double to_goal = 0.0;
         for (size_t k = ego_index + 1; k <= *goal_idx; ++k) {
