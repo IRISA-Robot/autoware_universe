@@ -1422,11 +1422,18 @@ MPTOptimizer::ConstraintMatrix MPTOptimizer::calcConstraintMatrix(
     // lb.segment(A_rows_end, N_u) = Eigen::MatrixXd::Constant(N_u, 1, -mpt_param_.max_steer_rad);
     // ub.segment(A_rows_end, N_u) = Eigen::MatrixXd::Constant(N_u, 1, mpt_param_.max_steer_rad);
 
+    // The state equation is built with curvature 0 (state_equation_generator.cpp), so u is the
+    // steering DEVIATION from the reference: actual steer ~= ref_steer + u.  |actual| <= max
+    // therefore means u in [-max - ref, max - ref].  This used to be [ref - max, ref + max] --
+    // the mirror image -- which at a tight reference curve forbade opening the curve and, past
+    // ref > max / 2, forced the path tighter than its reference (measured: elastic band
+    // R 1.06 m -> MPT R 0.59 m on a robot whose minimum radius is 0.60 m), cutting the inside
+    // of the corner off the lane.
     for (size_t i = 0; i < N_u; ++i) {
       const double ref_steer_angle =
         std::atan2(vehicle_info_.wheel_base_m * ref_points.at(i).curvature, 1.0);
-      lb(A_rows_end + i) = ref_steer_angle - mpt_param_.max_steer_rad;
-      ub(A_rows_end + i) = ref_steer_angle + mpt_param_.max_steer_rad;
+      lb(A_rows_end + i) = -ref_steer_angle - mpt_param_.max_steer_rad;
+      ub(A_rows_end + i) = -ref_steer_angle + mpt_param_.max_steer_rad;
     }
 
     // cppcheck-suppress unreadVariable
