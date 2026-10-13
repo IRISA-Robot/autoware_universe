@@ -26,8 +26,8 @@
 #include <autoware_internal_debug_msgs/msg/int32_stamped.hpp>
 #include <autoware_map_msgs/msg/lanelet_map_bin.hpp>
 #include <autoware_planning_msgs/msg/lanelet_route.hpp>
-#include <autoware_road_crossing_msgs/msg/crosswalk_detection.hpp>
 #include <autoware_road_crossing_msgs/msg/pedestrian_light_state.hpp>
+#include <autoware_road_crossing_msgs/msg/pedestrian_light_target.hpp>
 #include <autoware_road_crossing_msgs/msg/road_crossing_gate.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/pose.hpp>
@@ -57,8 +57,8 @@ namespace autoware::road_crossing_fsm
 // Values are stable — do NOT renumber existing states.
 //
 //   IDLE             = 0
-//   ARMED_CROSSWALK  = 1   robot approaching crossing; waiting for crosswalk detection
-//   CROSSWALK_OK     = 2   crosswalk detected; one-tick intermediate
+//   ARMED_CROSSWALK  = 1   robot approaching crossing; holding until ego is at the pre
+//   CROSSWALK_OK     = 2   ego at the pre; one-tick intermediate
 //   REROUTING_TO_ALT = 3   Phase A: send robot to alternate crossing
 //   ARMED_LIGHT      = 4   at road_crossing; waiting for pedestrian light
 //   WAIT_GREEN       = 5   pedestrian light seen; waiting for GREEN
@@ -94,15 +94,13 @@ private:
   struct Param
   {
     double update_rate_hz{10.0};
-    int arm_hops_max{3};
-    double crosswalk_min_confidence{0.5};
-    double fail_distance_m{2.0};
-    // reroute_after_sec: how long (s) ego must be stopped at the pre lanelet without
-    // a crosswalk detection before initiating reroute.  Replaces the old
-    // fail_consecutive_sec which was only a 2-second hold; the new default is 15 s
-    // to give the crosswalk detector a fair chance before committing to reroute.
-    double reroute_after_sec{15.0};
-    std::vector<int64_t> green_states{2, 3};
+    // Interlock lampu hijau di WAIT_GREEN (interlock.plan.md).  Satuan: tick FSM
+    // (1 / update_rate_hz).  Lihat road_crossing_fsm.param.yaml untuk aturan tuning.
+    int threshold_merah_valid{3};
+    int threshold_hijau_valid{3};
+    int threshold_merah_off{10};
+    int threshold_hijau_off{3};
+    int threshold_interlock_hijau_solid{20};
     bool reroute_enabled{true};
     double reroute_cooldown_sec{60.0};
     // Interlock params for REROUTING_TO_ALT step3 → REROUTING_TO_GOAL transition.
@@ -114,14 +112,14 @@ private:
     double engage_retry_sec{2.0};      // [s] minimum interval between retry engage calls
 
     // topic / service names
-    std::string topic_crosswalk_detection;
     std::string topic_pedestrian_light;
     std::string topic_gate;
     std::string topic_fsm_state;
+    // Interlock status_now (Int32Stamped: 0 NONE, 1 MERAH, 2 HIJAU), for rviz / PlotJuggler.
+    std::string topic_light_status;
     std::string topic_route;
     std::string topic_map;
     std::string topic_ego_pose;
-    std::string srv_crosswalk_detector;
     std::string srv_ped_light_detector;
     std::string srv_rotary_aimer;
 
@@ -141,11 +139,8 @@ private:
     double aim_approach_dist_m{10.0};
     // Topik PointStamped (map frame) untuk mengirim target eksternal ke rotary_aimer.
     std::string topic_aim_target{"/rotary_aimer/aim_target"};
-
-    // --- Crosswalk detector lazy-enable by distance ---
-    // Jarak (m) ke pre entry untuk mulai enable crosswalk_detector — ~2× aim_approach_dist_m,
-    // biar detektor sudah jalan sebelum kamera aim ke crosswalk.
-    double crosswalk_enable_dist_m{20.0};
+    // PedestrianLightTarget: the light(s) paired with the active crossing.
+    std::string topic_target_light{"/planning/road_crossing/target_light"};
 
     // --- Position gates (mencegah FSM maju sebelum robot sampai di lokasi) ---
     // Jarak (m) dari pre entry di bawahnya ego dianggap "sudah di pre".
@@ -153,11 +148,8 @@ private:
     double pre_arrive_dist_m{3.0};
     // Jarak (m) dari crossing entry di bawahnya ego dianggap "sudah di crossing".
     double crossing_arrive_dist_m{1.5};
-    // Durasi terus-menerus TIDAK mendeteksi lampu (NONE atau detektor diam) sebelum
-    // FSM menyerah dan GO (fallback).  Deteksi RED/GREEN/BLANK mereset counter ini
-    // sehingga selama lampu merah robot menunggu GREEN selamanya (benar).
-    double light_detect_timeout_sec{10.0};
-
+    // [m] ego moving more than this in one FSM tick = relocalized → reset the episode.
+    double relocalize_jump_m{2.0};
     // --- Safety-timeout watchdogs (defensive, additive — do not gate normal-path exits) ---
     // CROSSING (state 6) safety timeout: its only normal exit is egoPastCrossingExit()
     // (a centerline-projection check), which can permanently fail to register "past exit"
@@ -171,17 +163,11 @@ private:
     // engage_retry_sec cadence. If exceeded without ever becoming autonomous, abandon the
     // reroute attempt (resetEpisode + IDLE) instead of retrying forever.
     double engage_timeout_sec{30.0};
-    // Blanket episode-duration watchdog (catch-all): if the FSM is not IDLE for longer
-    // than this, force resetEpisode()+IDLE regardless of which state it is stuck in.
-    // Defense-in-depth for any stuck-state bug not covered by the two timeouts above.
-    double max_episode_duration_sec{120.0};
   } param_;
 
   // ------------------------------------------------------------------
   // Subscribers
   // ------------------------------------------------------------------
-  rclcpp::Subscription<autoware_road_crossing_msgs::msg::CrosswalkDetection>::SharedPtr
-    sub_crosswalk_;
   rclcpp::Subscription<autoware_road_crossing_msgs::msg::PedestrianLightState>::SharedPtr
     sub_ped_light_;
   rclcpp::Subscription<autoware_planning_msgs::msg::LaneletRoute>::SharedPtr sub_route_;
@@ -199,16 +185,19 @@ private:
   // ------------------------------------------------------------------
   rclcpp::Publisher<autoware_road_crossing_msgs::msg::RoadCrossingGate>::SharedPtr pub_gate_;
   rclcpp::Publisher<autoware_internal_debug_msgs::msg::Int32Stamped>::SharedPtr pub_fsm_state_;
+  rclcpp::Publisher<autoware_internal_debug_msgs::msg::Int32Stamped>::SharedPtr pub_light_status_;
   // AdAPI goal publisher (transient_local, reliable, depth 1 — matching auto_cycle_goals.py)
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_goal_;
   // APPROACH phase: publish road_crossing centroid (map PointStamped) ke rotary_aimer
   // sebagai target eksternal agar kamera menghadap crosswalk sebelum robot tiba di pre.
   rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr pub_aim_target_;
+  // The light(s) paired with the active crossing — detector, aimer and simulator follow it.
+  rclcpp::Publisher<autoware_road_crossing_msgs::msg::PedestrianLightTarget>::SharedPtr
+    pub_target_light_;
 
   // ------------------------------------------------------------------
   // Service clients
   // ------------------------------------------------------------------
-  rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr cli_crosswalk_detector_;
   rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr cli_ped_light_detector_;
   rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr cli_rotary_aimer_;
   // AdAPI reroute clients
@@ -226,9 +215,9 @@ private:
   FsmState state_{FsmState::IDLE};
 
   // Latest sensor / map messages (guarded against nullptr)
-  autoware_road_crossing_msgs::msg::CrosswalkDetection::SharedPtr last_crosswalk_det_;
-  autoware_road_crossing_msgs::msg::PedestrianLightState::SharedPtr last_ped_light_;
   nav_msgs::msg::Odometry::SharedPtr last_odom_;
+  // Ego position at the previous tick, to detect relocalization jumps.
+  std::optional<geometry_msgs::msg::Point> prev_tick_position_;
   autoware_map_msgs::msg::LaneletMapBin::SharedPtr last_map_msg_;
 
   // Route handler wrapping map + route
@@ -317,30 +306,11 @@ private:
   std::optional<lanelet::Id> active_pre_id_;
   std::optional<lanelet::Id> active_crossing_id_;
 
-  // Blanket episode-duration watchdog (defensive watchdog #3, catch-all).
-  // Set once at the IDLE -> ARMED_CROSSWALK transition (i.e. right when
-  // checkArmCondition() first succeeds and active_pre_id_/active_crossing_id_ get
-  // assigned). Checked at the very top of onTimer(), before the state switch: if
-  // state_ != IDLE and the elapsed time exceeds max_episode_duration_sec, force
-  // resetEpisode()+IDLE regardless of which state the FSM is stuck in. Defense-in-depth
-  // for any stuck-state bug the two more targeted timeouts above don't cover.
-  // Reset in resetEpisode().
-  std::optional<rclcpp::Time> episode_start_time_;
-
-  // Suppression: the road_crossing lanelet ID of the episode that just completed (DONE).
-  // checkArmCondition() will not re-arm for this ID until ego leaves the vicinity
-  // (i.e. no crossing at all is found within arm_hops_max, or a DIFFERENT crossing
-  // is found — meaning ego has moved past this one).
-  // resetEpisode() intentionally does NOT clear this field.
+  // Only written by the (unreachable) reroute path.  Arming no longer needs suppression:
+  // it only happens on the pre of a crossing, and a finished crossing leaves ego past it.
   std::optional<lanelet::Id> suppressed_crossing_id_;
 
-  // ARMED_CROSSWALK pre-stop reroute timer.
-  // Starts once ego is close enough to the crossing entry (within fail_distance_m)
-  // but crosswalk is still NOT detected.  If crosswalk is detected before the timer
-  // expires the timer is cancelled.  If it expires → REROUTING_TO_ALT.
-  std::optional<rclcpp::Time> pre_wait_timer_start_;
-
-  // WAIT_GREEN timeout timer
+  // Set on the first ARMED_LIGHT tick (entry-action guard); cleared when the episode crosses.
   std::optional<rclcpp::Time> light_timeout_start_;
 
   // CROSSING safety-timeout timer (defensive watchdog #1).
@@ -358,12 +328,37 @@ private:
   // traverses the crossing (so the behavior module sees GO_GREEN reliably).
   bool road_cross_is_green_{false};
 
-  // Counter waktu "tidak mendeteksi lampu" di WAIT_GREEN (skema baru).
-  // Di-set saat pertama kali masuk kondisi tidak-deteksi (NONE atau pesan null).
-  // Di-reset ke nullopt saat ada deteksi VALID (GREEN/RED/BLANK) — bukan NONE.
-  // Jika (now - *no_detect_since_) > light_detect_timeout_sec → fallback GO.
-  // Di-reset di resetEpisode() dan saat masuk/keluar WAIT_GREEN.
-  std::optional<rclcpp::Time> no_detect_since_;
+  // Pedestrian light(s) paired with active_crossing_id_, resolved once at arming from the
+  // crossing's direction tag (forward_pedestrian_tf / reverse_pedestrian_tf) so the target
+  // cannot flip mid-episode.  Empty = the crossing has no light: WAIT_GREEN goes straight
+  // to GO.  Cleared in resetEpisode().
+  std::vector<int64_t> active_light_ids_;
+  uint8_t active_light_direction_{
+    autoware_road_crossing_msgs::msg::PedestrianLightTarget::FORWARD};
+
+  // Interlock lampu hijau (interlock.plan.md): state yang di-reset tiap penyeberangan
+  // (masuk ARMED_LIGHT dan resetEpisode()).
+  // Values are published on topic_light_status — keep them stable.
+  enum class LightStatus : uint8_t { NONE = 0, MERAH = 1, HIJAU = 2 };
+  struct LightInterlock
+  {
+    // Diset onPedLight() dari lampu pasangan sejak tick terakhir; dibaca & dikosongkan
+    // tiap tick.  Pesan NONE/BLANK (atau dari lampu lain) tidak menghapus deteksi.
+    bool merah_seen{false};
+    bool hijau_seen{false};
+    uint16_t prev_counter_merah_detected{0};
+    uint16_t prev_counter_hijau_detected{0};
+    uint16_t counter_merah_detected{0};
+    uint16_t counter_hijau_detected{0};
+    uint16_t counter_merah_not_detected{0};
+    uint16_t counter_hijau_not_detected{0};
+    bool status_merah_valid{false};
+    bool status_hijau_valid{false};
+    LightStatus status_now{LightStatus::NONE};
+    LightStatus prev_status{LightStatus::NONE};
+    bool red_to_green{false};     // Rule 1, latched while green stays continuous
+    bool allows_crossing{false};  // Rule 1 || Rule 2
+  } interlock_;
 
   // Re-route state
   std::optional<rclcpp::Time> last_reroute_time_;
@@ -378,11 +373,7 @@ private:
   std::optional<lanelet::Id> active_alt_id_;
 
   // Detectors enabled state (track to avoid redundant service calls)
-  bool crosswalk_detector_enabled_{false};
   bool ped_light_detector_enabled_{false};
-  // Flag: crosswalk_detector sudah di-enable via distance-gate di episode ini.
-  // Di-reset di resetEpisode() agar setiap episode baru memanggil enable sekali.
-  bool crosswalk_detector_lazy_enabled_{false};
 
   // --- Rotary aimer spam-enable state ---
   // Waktu terakhir menerima pesan /control/rotary_angle_cmd (inisialisasi 0/lama).
@@ -445,8 +436,6 @@ private:
   void onTimer();
 
   // Callbacks
-  void onCrosswalkDetection(
-    const autoware_road_crossing_msgs::msg::CrosswalkDetection::SharedPtr msg);
   void onPedLight(
     const autoware_road_crossing_msgs::msg::PedestrianLightState::SharedPtr msg);
   void onRoute(const autoware_planning_msgs::msg::LaneletRoute::SharedPtr msg);
@@ -548,11 +537,28 @@ private:
   // Publish FSM state debug.
   void publishFsmState();
 
+  // Publish active_light_ids_ for the active crossing (empty when idle).
+  void publishTargetLight();
+  // active_light_ids_ as "1471,1490" for logs.
+  std::string lightIdsText() const;
+
+  // The tf_pedestrian way ids paired with `crossing_id` for the given direction of travel,
+  // read from the crossing's forward_pedestrian_tf / reverse_pedestrian_tf tag.
+  std::vector<int64_t> pairedLights(lanelet::Id crossing_id, bool forward) const;
+
   // Transition helper: change state and log.
   void transitionTo(FsmState new_state);
 
-  // Check if PedestrianLightState.state is in green_states param.
-  bool isGreenState(uint8_t state) const;
+  // One FSM tick of the green-light interlock (interlock.plan.md); updates interlock_.
+  // `where` (state name) only prefixes the log.
+  void updateLightInterlock(const char * where);
+  // True when ego's base_link is inside lanelet `id`.
+  bool egoOnLanelet(lanelet::Id id) const;
+  // True when ego is before lanelet `id` (on the travel-direction side) by more than margin.
+  bool egoUpstreamOf(lanelet::Id id, double margin) const;
+  // The route lanelet right after the active crossing, if it is a pre_road_crossing.
+  std::optional<lanelet::Id> nextPreAfterCrossing() const;
+  static const char * lightStatusName(LightStatus status);
 
   // Walk N hops from cur_lanelet via getNextLanelets, check attribute.
   bool hasTaggedLaneletWithinHops(

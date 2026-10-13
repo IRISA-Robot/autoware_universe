@@ -8,33 +8,35 @@
     # -------------------------------------------------------------------
     # IDLE → ARMED_CROSSWALK trigger
     # -------------------------------------------------------------------
-    arm_hops_max: 3                     # look-ahead hops via getNextLanelets() to find tagged lanelets
+    # Episode mulai hanya saat base_link di lanelet tepat sebelum road_crossing (pre) dan berakhir/reset
+    # begitu robot tidak di pre/crossing aktif (arm_hops_max dihapus).
 
     # -------------------------------------------------------------------
-    # ARMED_CROSSWALK → CROSSWALK_OK / REROUTING_TO_ALT
+    # Interlock lampu hijau di WAIT_GREEN (interlock.plan.md). Satuan: TICK FSM
+    # (1 tick = 1/update_rate_hz = 0.1 s). Dihitung dari pesan lampu PASANGAN crossing:
+    # RED = merah terdeteksi; GREEN / COUNTDOWN_GREEN = hijau terdeteksi; NONE/BLANK = tidak.
+    #   Rule 1: status MERAH lalu HIJAU            → GO (awal fase hijau, pasti solid)
+    #   Rule 2: HIJAU terus >= hijau_solid tick    → GO (tanpa merah sebelumnya)
+    # GO boleh di mana saja di pre (tidak menunggu dekat garis); robot lalu menyeberang tanpa
+    # berhenti di garis stop.
+    # Tidak ada timeout: tanpa izin interlock robot HOLD selamanya.
+    #
+    # Lampu standar di sini: hijau 15 s, hijau kedip 10 s (~0.5 s nyala / 0.5 s padam),
+    # merah ~60 s, merah kedip jarang. Aturan tuning:
+    #   hijau_off   < fase padam kedip (5 tick)  — supaya kedip memutus counter hijau,
+    #               > putus deteksi sesaat di hijau solid.
+    #   hijau_solid > fase nyala kedip (5 tick)  — satu nyala kedip tidak cukup untuk GO,
+    #               (20 tick = 2 s: margin 4x; pre terpendek 3.4 m jadi tidak perlu menunggu)
+    #               < hijau solid (150 tick)     — kalau datang telat > hijau_solid sebelum
+    #                 kedip, tunggu siklus berikutnya.
+    #   merah_off   > celah deteksi saat merah → hijau + hijau_valid — supaya status
+    #                 langsung MERAH → HIJAU (Rule 1), tidak lewat NONE.
     # -------------------------------------------------------------------
-    crosswalk_min_confidence: 0.5       # [-] CrosswalkDetection.confidence threshold
-    fail_distance_m: 2.0                # [m] ego-to-crossing-entry distance below which the
-                                        #     reroute_after_sec timer starts (robot near/stopped at pre)
-    reroute_after_sec: 15.0             # [s] how long to wait at the pre stop without crosswalk
-                                        #     detection before initiating reroute.
-                                        #     (Replaces old fail_consecutive_sec: 2.0 s which was
-                                        #      too aggressive; 15 s gives the detector a fair window.)
-
-    # -------------------------------------------------------------------
-    # WAIT_GREEN: counter berbasis waktu untuk kondisi "tidak mendeteksi lampu"
-    # -------------------------------------------------------------------
-    light_detect_timeout_sec: 10.0      # [s] durasi terus-menerus TIDAK mendeteksi lampu (NONE atau
-                                        #     detektor diam) sebelum nyerah & lanjut/GO.
-                                        #     Deteksi RED/GREEN/BLANK mereset counter ini sehingga
-                                        #     selama lampu merah robot menunggu GREEN selamanya (benar).
-                                        #     Hanya persistent tidak-deteksi yang memicu fallback GO.
-
-    # -------------------------------------------------------------------
-    # GREEN states (PedestrianLightState.state values treated as go)
-    # 2=GREEN, 3=COUNTDOWN_GREEN
-    # -------------------------------------------------------------------
-    green_states: [2, 3]
+    threshold_merah_valid: 3            # [tick] merah terdeteksi >= ini → status_merah_valid
+    threshold_hijau_valid: 3            # [tick] hijau terdeteksi >= ini → status_hijau_valid
+    threshold_merah_off: 10             # [tick] merah hilang >= ini → counter merah = 0
+    threshold_hijau_off: 3              # [tick] hijau hilang >= ini → counter hijau = 0
+    threshold_interlock_hijau_solid: 20 # [tick] hijau terus >= ini → hijau solid (Rule 2)
 
     # -------------------------------------------------------------------
     # Re-route to alternate crossing (two-phase reroute)
@@ -60,14 +62,13 @@
     # -------------------------------------------------------------------
     # Topic / service names (defaults match the interface contract)
     # -------------------------------------------------------------------
-    topic_crosswalk_detection:   "/perception/road_crossing/crosswalk_detection"
     topic_pedestrian_light:      "/perception/road_crossing/pedestrian_light"
     topic_gate:                  "/planning/road_crossing/gate"
     topic_fsm_state:             "/planning/road_crossing/fsm_state"
+    topic_light_status:          "/planning/road_crossing/light_status"   # interlock status_now: 0 NONE, 1 MERAH, 2 HIJAU
     topic_route:                 "/planning/mission_planning/route"
     topic_map:                   "/map/vector_map"
     topic_ego_pose:              "/localization/kinematic_state"
-    srv_crosswalk_detector:      "/perception/road_crossing/crosswalk_detector/enable"
     srv_ped_light_detector:      "/perception/road_crossing/pedestrian_light_detector/enable"
     srv_rotary_aimer:            "/rotary_aimer/enable"
 
@@ -101,18 +102,11 @@
                                         # Di pre: kirim target berhenti → aimer aim lampu.
     topic_aim_target:  "/rotary_aimer/aim_target"
                                         # Topik PointStamped (map frame) target eksternal aimer.
-
-    # -------------------------------------------------------------------
-    # Crosswalk detector lazy-enable by distance
-    # Enable crosswalk_detector saat robot dalam jarak crosswalk_enable_dist_m dari pre
-    # entry — LEBIH AWAL dari aimer (aim_approach_dist_m=10 m) sehingga detektor sudah
-    # running dan warm sebelum kamera aim ke crosswalk.
-    # ~2× aim_approach_dist_m adalah nilai yang reasonable untuk head-start detection.
-    # Jika crossing tagged disable_crosswalk_check, enable TIDAK dikirim (sama seperti dulu).
-    # -------------------------------------------------------------------
-    crosswalk_enable_dist_m:  20.0      # [m] jarak ke pre entry untuk mulai enable crosswalk_detector
-                                        # — ~2× aim_approach_dist_m, biar detektor sudah jalan
-                                        # sebelum kamera aim ke crosswalk.
+    topic_target_light:  "/planning/road_crossing/target_light"
+                                        # PedestrianLightTarget: lampu pasangan crossing aktif,
+                                        # dari tag forward_pedestrian_tf (reverse_pedestrian_tf
+                                        # nanti). Detector, aimer dan simulator mengikuti ini.
+                                        # Crossing tanpa tag = tanpa lampu → langsung GO.
 
     # -------------------------------------------------------------------
     # Position gates (mencegah FSM maju sebelum robot tiba di lokasi)
@@ -126,6 +120,9 @@
     crossing_arrive_dist_m:  3.0        # [m] ego dianggap "sudah di crossing" jika
                                         #     distanceToCrossingEntry() berada di [0, crossing_arrive_dist_m].
                                         #     Gate WAIT_GREEN: tahan sampai at_crossing = true.
+    relocalize_jump_m:       2.0        # [m] ego berpindah > ini dalam 1 tick FSM (0.1 s) = relokalisasi
+                                        #     (2D Pose Estimate / lompatan lokalisasi) → reset episode
+                                        #     & suppression, pilih ulang crossing dari posisi baru.
 
     # -------------------------------------------------------------------
     # Safety-timeout watchdogs (defensive, additive — do not gate normal-path exits)
@@ -143,8 +140,3 @@
                                         #     retrying change_to_autonomous at engage_retry_sec
                                         #     cadence. If exceeded, abandons the reroute attempt
                                         #     (resetEpisode + IDLE) instead of retrying forever.
-    max_episode_duration_sec:   120.0   # [s] Blanket episode-duration watchdog (catch-all). If
-                                        #     the FSM is not IDLE for longer than this, forces
-                                        #     resetEpisode()+IDLE regardless of which state it is
-                                        #     stuck in. Defense-in-depth for any stuck-state bug
-                                        #     not covered by the two more targeted timeouts above.
