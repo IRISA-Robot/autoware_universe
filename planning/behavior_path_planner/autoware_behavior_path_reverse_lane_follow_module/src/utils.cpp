@@ -18,6 +18,10 @@
 #include <autoware_utils/geometry/geometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include <boost/geometry/algorithms/distance.hpp>
+
+#include <lanelet2_core/geometry/Polygon.h>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -138,6 +142,45 @@ void dropNonAdvancingPoints(PathWithLaneId & path, const double max_reversal_rad
   }
 }
 
+// The route lanelet ego is on, for anchoring this module's paths.  getClosestLaneletWithinRoute
+// alone picks among every primitive of every route segment (unchosen alternatives included, which
+// is what re-opens the [SEAM-FOLD]-prone unfiltered window) and has no distance limit, so a robot
+// displaced off its lane got a path built around a lanelet it is not on -- metres away.  Prefer
+// the chosen lanelets, and refuse anything farther than this from ego: no path is better than one
+// that starts somewhere else.
+constexpr double kMaxEgoDistanceToRouteLaneletM = 3.0;
+
+std::optional<lanelet::ConstLanelet> findEgoRouteLanelet(
+  const RouteHandler & route_handler, const Pose & ego_pose)
+{
+  const lanelet::BasicPoint2d ego_point(ego_pose.position.x, ego_pose.position.y);
+  const auto distance_to = [&](const lanelet::ConstLanelet & llt) {
+    return boost::geometry::distance(ego_point, llt.polygon2d().basicPolygon());
+  };
+
+  lanelet::ConstLanelet lanelet;
+  if (
+    route_handler.getClosestPreferredLaneletWithinRoute(ego_pose, &lanelet) &&
+    distance_to(lanelet) <= kMaxEgoDistanceToRouteLaneletM) {
+    return lanelet;
+  }
+  if (!route_handler.getClosestLaneletWithinRoute(ego_pose, &lanelet)) {
+    return std::nullopt;
+  }
+  const double dist = distance_to(lanelet);
+  if (dist > kMaxEgoDistanceToRouteLaneletM) {
+    static rclcpp::Clock steady_clock{RCL_STEADY_TIME};
+    RCLCPP_WARN_THROTTLE(
+      rclcpp::get_logger("reverse_lane_follow_utils"), steady_clock, 2000,
+      "[EGO-FAR-FROM-ROUTE] ego (%.2f, %.2f) is %.2f m from the closest route lanelet %ld "
+      "(> %.1f m): not building a reverse path around it.",
+      ego_pose.position.x, ego_pose.position.y, dist, lanelet.id(),
+      kMaxEgoDistanceToRouteLaneletM);
+    return std::nullopt;
+  }
+  return lanelet;
+}
+
 }  // namespace
 
 std::optional<TraveledTail> extractTraveledTailPath(
@@ -148,10 +191,11 @@ std::optional<TraveledTail> extractTraveledTailPath(
     return std::nullopt;
   }
 
-  lanelet::ConstLanelet current_lanelet;
-  if (!route_handler->getClosestLaneletWithinRoute(ego_pose, &current_lanelet)) {
+  const auto ego_lanelet = findEgoRouteLanelet(*route_handler, ego_pose);
+  if (!ego_lanelet) {
     return std::nullopt;
   }
+  const lanelet::ConstLanelet current_lanelet = *ego_lanelet;
 
   // Lanelet sequence covering (at least) retrace_distance_m behind ego and nothing ahead of ego.
   // This is purely a lookup into the already-computed, already-legal route -- no routing-graph
@@ -222,15 +266,16 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
     return std::nullopt;
   }
 
-  lanelet::ConstLanelet current_lanelet;
-  if (!route_handler->getClosestLaneletWithinRoute(ego_pose, &current_lanelet)) {
+  const auto ego_lanelet = findEgoRouteLanelet(*route_handler, ego_pose);
+  if (!ego_lanelet) {
     RCLCPP_WARN_THROTTLE(
       logger, steady_clock, 2000,
-      "[BIDIR-DEBUG] buildRouteReversedFollowPath: getClosestLaneletWithinRoute failed for ego "
-      "pose (%.2f, %.2f)",
-      ego_pose.position.x, ego_pose.position.y);
+      "[BIDIR-DEBUG] buildRouteReversedFollowPath: no route lanelet within %.1f m of ego pose "
+      "(%.2f, %.2f)",
+      kMaxEgoDistanceToRouteLaneletM, ego_pose.position.x, ego_pose.position.y);
     return std::nullopt;
   }
+  const lanelet::ConstLanelet current_lanelet = *ego_lanelet;
 
   // [BIDIR-BUG-FIX #2] No longer gate on current_lanelet's own isLaneletInvertedInRoute() here --
   // see buildRouteReversedFollowPath()'s doc comment in utils.hpp. Logged for visibility only;

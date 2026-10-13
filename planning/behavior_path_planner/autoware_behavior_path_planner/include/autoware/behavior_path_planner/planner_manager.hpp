@@ -124,6 +124,16 @@ struct SlotOutput
   bool is_upstream_waiting_approved{false};
 };
 
+/**
+ * @brief the route lanelet to (re)initialise the current route lanelet with.
+ * @details Prefers the lanelets the route actually chose, if one is within
+ * ego_nearest_dist_threshold of ego; otherwise the closest route lanelet, as before.  Warns
+ * ([EGO-FAR-FROM-ROUTE]) when even that is farther than the threshold: the path will be built
+ * around a lanelet the robot is not on, and only planning_validator / lane_departure_checker
+ * stand between that and the robot steering toward it.
+ */
+lanelet::ConstLanelet selectCurrentRouteLanelet(const std::shared_ptr<PlannerData> & data);
+
 class SubPlannerManager
 {
 public:
@@ -200,9 +210,7 @@ public:
    */
   void resetCurrentRouteLanelet(const std::shared_ptr<PlannerData> & data)
   {
-    lanelet::ConstLanelet ret{};
-    data->route_handler->getClosestLaneletWithinRoute(data->self_odometry->pose.pose, &ret);
-    *current_route_lanelet_ = ret;
+    *current_route_lanelet_ = selectCurrentRouteLanelet(data);
   }
 
   void reset()
@@ -538,8 +546,7 @@ public:
    */
   void resetCurrentRouteLanelet(const std::shared_ptr<PlannerData> & data)
   {
-    lanelet::ConstLanelet ret{};
-    data->route_handler->getClosestLaneletWithinRoute(data->self_odometry->pose.pose, &ret);
+    const auto ret = selectCurrentRouteLanelet(data);
     RCLCPP_DEBUG(logger_, "update current route lanelet. id:%ld", ret.id());
     *current_route_lanelet_ = ret;
   }
