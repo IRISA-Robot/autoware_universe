@@ -459,20 +459,22 @@ lanelet::ConstLanelet selectCurrentRouteLanelet(
   }
 
   // getClosestLaneletWithinRoute picks among ALL primitives of every route segment (unchosen
-  // alternatives included) with no distance limit; the chosen lanelets come first when ego is
-  // actually on one of them.
-  lanelet::ConstLanelet preferred{};
-  if (
-    route_handler->getClosestPreferredLaneletWithinRoute(pose, &preferred) &&
-    distanceToLanelet(preferred, pose) <= max_dist) {
-    return preferred;
-  }
-
+  // alternatives included) with no distance limit.  Where a chosen lanelet is just as near (ego
+  // on overlapping alternatives) take the chosen one -- but only then: before a lane change ego
+  // sits on an unchosen lane with the chosen one beside it, and picking that put ego "out of
+  // route", so the lane change module never ran.
   lanelet::ConstLanelet closest{};
   if (!route_handler->getClosestLaneletWithinRoute(pose, &closest)) {
     return closest;  // no route lanelets (same as before)
   }
   const double dist = distanceToLanelet(closest, pose);
+  constexpr double same_distance_m = 0.1;
+  lanelet::ConstLanelet preferred{};
+  if (
+    route_handler->getClosestPreferredLaneletWithinRoute(pose, &preferred) &&
+    distanceToLanelet(preferred, pose) <= std::min(dist + same_distance_m, max_dist)) {
+    return preferred;
+  }
   if (dist > max_dist) {
     static rclcpp::Clock steady_clock{RCL_STEADY_TIME};
     RCLCPP_WARN_THROTTLE(
