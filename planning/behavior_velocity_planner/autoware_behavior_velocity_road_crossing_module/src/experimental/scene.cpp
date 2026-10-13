@@ -25,9 +25,11 @@
 
 #include <lanelet2_core/geometry/Lanelet.h>
 #include <lanelet2_core/geometry/Polygon.h>
+#include <lanelet2_core/primitives/BoundingBox.h>
 
 #include <algorithm>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -191,16 +193,31 @@ std::pair<double, std::optional<double>> RoadCrossingModule::findEgoAndStopPoint
   const auto path_pts = path.restore();
 
   std::optional<double> raw_entry_s;
+  double prev_knot_s = ego_s;
   for (const auto & pt : path_pts) {
     const lanelet::BasicPoint2d p{pt.point.pose.position.x, pt.point.pose.position.y};
+    // s of this knot on the trajectory.
+    const double s = autoware::experimental::trajectory::closest(path, pt.point.pose);
     if (boost::geometry::covered_by(p, polygon)) {
-      // Found a point inside the polygon. Get its s on the trajectory.
-      const double s = autoware::experimental::trajectory::closest(path, pt.point.pose);
       if (s > ego_s) {  // must be ahead of ego
-        raw_entry_s = s;
+        // Knots can be meters apart, so the first knot inside the polygon may lie well
+        // past the actual boundary — and the stop line with it (the robot then stopped
+        // inside the crossing).  Walk the continuous path from the previous knot to find
+        // where it really enters.
+        constexpr double kStep = 0.05;  // [m]
+        double entry_s = s;
+        for (double q = std::max(prev_knot_s, ego_s); q < s; q += kStep) {
+          const auto & qp = path.compute(q).point.pose.position;
+          if (boost::geometry::covered_by(lanelet::BasicPoint2d{qp.x, qp.y}, polygon)) {
+            entry_s = q;
+            break;
+          }
+        }
+        raw_entry_s = entry_s;
         break;
       }
     }
+    prev_knot_s = s;
   }
 
   if (!raw_entry_s) {
@@ -295,7 +312,6 @@ void RoadCrossingModule::updateState(
         state_ = State::STOPPING;
         green_blocked_since_.reset();
         go_blocked_since_.reset();
-        gate_wait_since_.reset();
         RCLCPP_INFO(
           logger_, "RoadCrossing %ld: APPROACHING → STOPPING (dist %.2f m)",
           getModuleId(), distance_to_stop_point);
@@ -311,7 +327,6 @@ void RoadCrossingModule::updateState(
         clear_since_.reset();
         green_blocked_since_.reset();
         go_blocked_since_.reset();
-        gate_wait_since_.reset();
         RCLCPP_INFO(
           logger_, "RoadCrossing %ld: STOPPING → CHECKING (arrived, ego stopped)",
           getModuleId());
@@ -333,7 +348,6 @@ void RoadCrossingModule::updateState(
         clear_since_.reset();
         go_blocked_since_.reset();
         green_blocked_since_.reset();
-        gate_wait_since_.reset();
         RCLCPP_WARN_THROTTLE(
           logger_, *clock_, 5000,
           "RoadCrossing %ld: FSM gate=ABORT — holding at crossing", getModuleId());
@@ -350,7 +364,6 @@ void RoadCrossingModule::updateState(
             getModuleId());
         } else {
           // Gate is GO or GO_GREEN (or require_fsm_gate is somehow false — shouldn't happen for PRE).
-          gate_wait_since_.reset();
           state_ = State::CROSSING;
           RCLCPP_INFO(
             logger_, "RoadCrossing %ld [PRE]: CHECKING → CROSSING (crosswalk gate=GO/GO_GREEN)",
@@ -372,7 +385,6 @@ void RoadCrossingModule::updateState(
         if (!blocked) {
           // Path is clear — cross immediately. Reset stale timer.
           green_blocked_since_.reset();
-          gate_wait_since_.reset();
           state_ = State::CROSSING;
           RCLCPP_INFO(
             logger_,
@@ -386,7 +398,6 @@ void RoadCrossingModule::updateState(
             // Timeout expired — cross anyway. Lampu HIJAU = hak jalan; jangan deadlock selamanya.
             // Collision safety for actually-present obstacles still handled by obstacle_stop /
             // dynamic_obstacle_stop (same as normal driving).
-            gate_wait_since_.reset();
             state_ = State::CROSSING;
             RCLCPP_WARN(
               logger_,
@@ -407,7 +418,6 @@ void RoadCrossingModule::updateState(
 
       if (blocked) {
         clear_since_.reset();
-        gate_wait_since_.reset();
         // Bounded-timeout override (mirrors the GO_GREEN branch above): start (or continue)
         // the clock the moment `blocked` first becomes true on this path. If it never clears
         // for timeout_sec, force CHECKING → CROSSING anyway rather than deadlocking forever —
@@ -421,7 +431,6 @@ void RoadCrossingModule::updateState(
           const bool gate_permits_go =
             !planner_param_.require_fsm_gate || isGoCommand(current_gate);
           if (gate_permits_go) {
-            gate_wait_since_.reset();
             state_ = State::CROSSING;
             RCLCPP_WARN(
               logger_,
@@ -449,29 +458,14 @@ void RoadCrossingModule::updateState(
           // When require_fsm_gate=true, additionally require gate GO or GO_GREEN.
           if (planner_param_.require_fsm_gate && !isGoCommand(current_gate))
           {
-            // Gate-wait watchdog: path is clear but FSM is still HOLD. Give it up to
-            // gate_wait_timeout_sec before concluding the FSM itself is stuck — without
-            // this, a wedged FSM would deadlock the robot here forever.
-            if (!gate_wait_since_) gate_wait_since_ = now;
-            const double gate_wait_elapsed = (now - *gate_wait_since_).seconds();
-            if (gate_wait_elapsed >= planner_param_.gate_wait_timeout_sec) {
-              state_ = State::CROSSING;
-              RCLCPP_ERROR(
-                logger_,
-                "RoadCrossing %ld: vehicle clear (%.2f s) but FSM gate=HOLD for %.1f/%.1fs — "
-                "FSM appears stuck, forcing CHECKING → CROSSING anyway",
-                getModuleId(), clear_elapsed, gate_wait_elapsed,
-                planner_param_.gate_wait_timeout_sec);
-            } else {
-              RCLCPP_INFO_THROTTLE(
-                logger_, *clock_, 2000,
-                "RoadCrossing %ld: vehicle clear (%.2f s) but FSM gate=HOLD — waiting for GO "
-                "(%.1f/%.1fs before gate-wait watchdog forces CROSSING)",
-                getModuleId(), clear_elapsed, gate_wait_elapsed,
-                planner_param_.gate_wait_timeout_sec);
-            }
+            // No timeout here: the FSM holds the gate until the pedestrian light allows
+            // crossing (a red can last a minute or more), and a FSM that is gone leaves a
+            // stale gate, which counts as HOLD.  Forcing CROSSING would cross on red.
+            RCLCPP_INFO_THROTTLE(
+              logger_, *clock_, 2000,
+              "RoadCrossing %ld: vehicle clear (%.2f s) but FSM gate=HOLD — waiting for GO",
+              getModuleId(), clear_elapsed);
           } else {
-            gate_wait_since_.reset();
             state_ = State::CROSSING;
             RCLCPP_INFO(
               logger_, "RoadCrossing %ld: CHECKING → CROSSING (clear %.2f s%s)",
@@ -524,8 +518,25 @@ void RoadCrossingModule::updateState(
       break;
     }
 
-    case State::DONE:
+    case State::DONE: {
+      // The crossing is ahead of ego again (initial pose reset, or the next lap of a looped
+      // route): start over, otherwise this module would never stop the robot again.
+      const auto & ego_pos = planner_data.current_odometry->pose.position;
+      const bool ego_inside = boost::geometry::covered_by(
+        lanelet::BasicPoint2d{ego_pos.x, ego_pos.y}, crossing.polygon2d().basicPolygon());
+      if (distance_to_stop_point > planner_param_.stop_arrival_threshold && !ego_inside) {
+        state_ = State::APPROACHING;
+        stopped_at_.reset();
+        clear_since_.reset();
+        green_blocked_since_.reset();
+        go_blocked_since_.reset();
+        was_inside_polygon_ = false;
+        RCLCPP_INFO(
+          logger_, "RoadCrossing %ld: DONE → APPROACHING (crossing ahead again, dist %.2f m)",
+          getModuleId(), distance_to_stop_point);
+      }
       break;
+    }
   }
 }
 
@@ -563,6 +574,48 @@ bool RoadCrossingModule::modifyPathVelocity(
     debug_data_.last_check_blocked = false;
   }
 
+  if (kind_ == CrossingKind::ROAD && planner_param_.require_fsm_gate) {
+    uint8_t gate = autoware_road_crossing_msgs::msg::RoadCrossingGate::HOLD;
+    {
+      std::lock_guard<std::mutex> lk(gate_mutex_);
+      gate = gate_command_;
+    }
+    const auto & ego_pos = planner_data.current_odometry->pose.position;
+    const bool ego_inside = boost::geometry::covered_by(
+      lanelet::BasicPoint2d{ego_pos.x, ego_pos.y}, crossing.polygon2d().basicPolygon());
+
+    if (
+      (state_ == State::APPROACHING || state_ == State::STOPPING) && stop_s &&
+      gate == autoware_road_crossing_msgs::msg::RoadCrossingGate::GO_GREEN) {
+      // The FSM already confirmed a solid green before ego reached the stop line: no point
+      // braking to a halt there just to read that gate.  Same vehicle check as CHECKING's
+      // green path; if it is blocked, keep approaching and stop at the line as usual.
+      const bool green_blocked = isPredictedBlocked(crossing, planner_data);
+      debug_data_.last_check_blocked = green_blocked;
+      if (!green_blocked) {
+        state_ = State::CROSSING;
+        green_blocked_since_.reset();
+        go_blocked_since_.reset();
+        RCLCPP_INFO(
+          logger_,
+          "RoadCrossing %ld [ROAD]: GREEN + clear before the stop line → CROSSING without "
+          "stopping",
+          getModuleId());
+      }
+    } else if (
+      state_ == State::CROSSING && !was_inside_polygon_ && !ego_inside &&
+      gate == autoware_road_crossing_msgs::msg::RoadCrossingGate::HOLD) {
+      // Released but not on the crossing yet, and the release is gone (the FSM dropped the
+      // episode, e.g. relocalized): stop at the line again instead of crossing on a stale GO.
+      state_ = State::APPROACHING;
+      RCLCPP_WARN(
+        logger_,
+        "RoadCrossing %ld [ROAD]: gate back to HOLD before ego entered the crossing → "
+        "APPROACHING (will stop at the line)",
+        getModuleId());
+    }
+  }
+
   // Update state machine
   const double dist_to_stop = stop_s ? (*stop_s - ego_s) : -1.0;
   updateState(
@@ -584,6 +637,50 @@ bool RoadCrossingModule::modifyPathVelocity(
       "remaining_ahead=%.3f stop_s=%s",
       getModuleId(), ego_s, path.length(), remaining_path_len,
       stop_s ? std::to_string(*stop_s).c_str() : "none");
+  }
+
+  // Gate HOLD while ego's front is already over the stop line but base_link is not on the
+  // crossing yet (the FSM fell back to WAIT_GREEN after ego stopped there): there is no line
+  // ahead left to stop at, so hold where ego stands rather than creep onto the road.  Only when
+  // standing still — a moving ego past the line cannot stop before it anyway and goes on.
+  bool hold_in_place = false;
+  if (
+    kind_ == CrossingKind::ROAD && planner_param_.require_fsm_gate &&
+    state_ == State::APPROACHING && (!stop_s || dist_to_stop < 0.0) &&
+    planner_data.isVehicleStopped()) {
+    uint8_t gate = autoware_road_crossing_msgs::msg::RoadCrossingGate::HOLD;
+    {
+      std::lock_guard<std::mutex> lk(gate_mutex_);
+      gate = gate_command_;
+    }
+    const auto & ego_pos = planner_data.current_odometry->pose.position;
+    const lanelet::BasicPoint2d ego2d{ego_pos.x, ego_pos.y};
+    const auto polygon = crossing.polygon2d().basicPolygon();
+    const double leading_edge_offset = planner_data.is_driving_forward
+      ? planner_data.vehicle_info_.max_longitudinal_offset_m
+      : -planner_data.vehicle_info_.min_longitudinal_offset_m;
+    // Within one stop distance of the crossing: the stop line is behind ego's front.
+    const bool past_line = !boost::geometry::covered_by(ego2d, polygon) &&
+      boost::geometry::distance(ego2d, polygon) <=
+        leading_edge_offset + planner_param_.stop_margin + 0.1;
+    hold_in_place =
+      past_line && gate == autoware_road_crossing_msgs::msg::RoadCrossingGate::HOLD;
+    if (hold_in_place) {
+      RCLCPP_WARN_THROTTLE(
+        logger_, *clock_, 2000,
+        "RoadCrossing %ld [ROAD]: gate HOLD, ego stopped past the stop line before the crossing "
+        "→ holding in place",
+        getModuleId());
+    }
+  }
+  if (hold_in_place && ego_s < path.length()) {
+    path.longitudinal_velocity_mps().range(ego_s, path.length()).set(0.0);
+    planning_factor_interface_->add(
+      path.restore(), planner_data.current_odometry->pose, path.compute(ego_s).point.pose,
+      autoware_internal_planning_msgs::msg::PlanningFactor::STOP,
+      autoware_internal_planning_msgs::msg::SafetyFactorArray{}, planner_data.is_driving_forward,
+      0.0, 0.0 /*shift distance*/, "road_crossing");
+    debug_data_.stop_pose = path.compute(ego_s).point.pose;
   }
 
   // Insert stop velocity if in STOPPING or CHECKING state.

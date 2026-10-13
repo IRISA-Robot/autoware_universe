@@ -65,10 +65,7 @@ RoadCrossingModuleManager::RoadCrossingModuleManager(rclcpp::Node & node)
   p.green_block_timeout_sec =
     get_or_declare_parameter<double>(node, ns + ".green_block_timeout_sec");
 
-  // Gate-wait watchdog: max seconds to wait in "vehicle clear but FSM gate=HOLD" before
-  // concluding the FSM itself is stuck and forcing CROSSING anyway.
-  p.gate_wait_timeout_sec =
-    get_or_declare_parameter<double>(node, ns + ".gate_wait_timeout_sec");
+  p.gate_stale_sec = get_or_declare_parameter<double>(node, ns + ".gate_stale_sec");
 
   // Create ONE persistent gate subscription in the manager (not per-module).
   // Scene modules are created/destroyed dynamically; creating subscriptions inside
@@ -76,10 +73,12 @@ RoadCrossingModuleManager::RoadCrossingModuleManager(rclcpp::Node & node)
   // node lifetime so its subscription is safe.
   if (p.require_fsm_gate) {
     sub_gate_ = node.create_subscription<autoware_road_crossing_msgs::msg::RoadCrossingGate>(
-      p.gate_topic, rclcpp::QoS(1),
+      // Depth 10: the FSM publishes the PRE and the ROAD gate back to back every tick;
+      // depth 1 lets the second overwrite the first before it is taken.
+      p.gate_topic, rclcpp::QoS(10),
       [this](const autoware_road_crossing_msgs::msg::RoadCrossingGate::SharedPtr msg) {
         std::lock_guard<std::mutex> lk(gate_mutex_);
-        gate_commands_[static_cast<lanelet::Id>(msg->lanelet_id)] = msg->command;
+        gate_commands_[static_cast<lanelet::Id>(msg->lanelet_id)] = {msg->command, clock_->now()};
       });
     RCLCPP_INFO(
       logger_,
@@ -100,7 +99,7 @@ void RoadCrossingModuleManager::modifyPathVelocity(
   if (planner_param_.require_fsm_gate) {
     // Snapshot the gate map under lock, then push without holding the lock
     // (avoids holding gate_mutex_ while module logic runs).
-    std::map<lanelet::Id, uint8_t> snapshot;
+    std::map<lanelet::Id, GateCommand> snapshot;
     {
       std::lock_guard<std::mutex> lk(gate_mutex_);
       snapshot = gate_commands_;
@@ -110,12 +109,15 @@ void RoadCrossingModuleManager::modifyPathVelocity(
       auto * rc_module = dynamic_cast<RoadCrossingModule *>(scene_module.get());
       if (!rc_module) continue;
       const lanelet::Id id = static_cast<lanelet::Id>(rc_module->getModuleId());
+      // No gate for this lanelet, or none recently: HOLD.  The FSM republishes the gate of
+      // the crossing it is handling every tick; anything older is left over from an earlier
+      // episode and must not release the robot.
       const auto it = snapshot.find(id);
-      if (it != snapshot.end()) {
-        rc_module->setGateCommand(it->second);
-      }
-      // If no gate message yet for this lanelet, leave gate_command_ at its
-      // default (HOLD) — the module will wait until a GO arrives.
+      const bool fresh =
+        it != snapshot.end() &&
+        (clock_->now() - it->second.received).seconds() <= planner_param_.gate_stale_sec;
+      rc_module->setGateCommand(
+        fresh ? it->second.command : autoware_road_crossing_msgs::msg::RoadCrossingGate::HOLD);
     }
   }
 
@@ -128,10 +130,11 @@ void RoadCrossingModuleManager::modifyPathVelocity(
 namespace
 {
 // Walk the lane_ids on the trajectory; return IDs of lanelets carrying road_crossing:true tag.
-// When require_pre is true, also collect pre_road_crossing:true lanelets (for dual-stop mode).
+// pre_road_crossing lanelets get no instance: their stop existed for crosswalk detection,
+// which is gone, so the robot drives straight on to the ROAD stop line (the pre/road border).
 // Returns a map from lanelet ID → CrossingKind.
 std::map<lanelet::Id, RoadCrossingModule::CrossingKind> collectCrossingLaneletIdsOnPath(
-  const Trajectory & path, const PlannerData & planner_data, bool require_pre)
+  const Trajectory & path, const PlannerData & planner_data)
 {
   std::map<lanelet::Id, RoadCrossingModule::CrossingKind> result;
   if (!planner_data.route_handler_) return result;
@@ -148,13 +151,6 @@ std::map<lanelet::Id, RoadCrossingModule::CrossingKind> collectCrossingLaneletId
         const std::string road_attr(llt.attributeOr("road_crossing", "false"));
         if (road_attr == "true") {
           result[id] = RoadCrossingModule::CrossingKind::ROAD;
-          continue;
-        }
-        if (require_pre) {
-          const std::string pre_attr(llt.attributeOr("pre_road_crossing", "false"));
-          if (pre_attr == "true") {
-            result[id] = RoadCrossingModule::CrossingKind::PRE;
-          }
         }
       } catch (const lanelet::NoSuchPrimitiveError &) {
         // skip
@@ -169,8 +165,7 @@ void RoadCrossingModuleManager::launchNewModules(
   const Trajectory & path, [[maybe_unused]] const rclcpp::Time & stamp,
   const PlannerData & planner_data)
 {
-  const bool require_pre = planner_param_.require_fsm_gate;
-  for (const auto & [lane_id, kind] : collectCrossingLaneletIdsOnPath(path, planner_data, require_pre)) {
+  for (const auto & [lane_id, kind] : collectCrossingLaneletIdsOnPath(path, planner_data)) {
     if (isModuleRegistered(lane_id)) continue;
     registerModule(
       std::make_shared<RoadCrossingModule>(
@@ -184,8 +179,7 @@ std::function<bool(const std::shared_ptr<SceneModuleInterface> &)>
 RoadCrossingModuleManager::getModuleExpiredFunction(
   const Trajectory & path, const PlannerData & planner_data)
 {
-  const bool require_pre = planner_param_.require_fsm_gate;
-  const auto crossing_map = collectCrossingLaneletIdsOnPath(path, planner_data, require_pre);
+  const auto crossing_map = collectCrossingLaneletIdsOnPath(path, planner_data);
   return [crossing_map](const std::shared_ptr<SceneModuleInterface> & scene_module) {
     return crossing_map.count(scene_module->getModuleId()) == 0;
   };

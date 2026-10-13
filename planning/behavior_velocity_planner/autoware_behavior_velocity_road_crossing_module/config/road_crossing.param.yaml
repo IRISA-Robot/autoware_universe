@@ -26,6 +26,7 @@
       block_on_pedestrian: false
       block_on_unknown: true  # true: perception platform ini output UNKNOWN untuk semua object, jadi harus block UNKNOWN supaya stop berfungsi
       stop_margin: 0.5        # [m] jarak stop sebelum stop_line untuk instance ROAD — wiring field PlannerParam::stop_margin
+      # TIDAK DIPAKAI LAGI: stop sebelum pre_road_crossing dihapus (dulu untuk deteksi crosswalk).
       pre_stop_dist_m: 2.0    # [tuned] 1.0→2.0: robot stop 2m sebelum pre (buffer lebih besar dari residual gerak/localization jitter; tetap di parent/fork buat reroute alternate). [m] jarak fisik bagian depan robot ke entry polygon pre_road_crossing. Robot berhenti di parent lanelet (titik fork) supaya reroute ke alternate masih bisa dilakukan. (Hanya berlaku untuk instance PRE; instance ROAD tetap pakai stop_margin.)
 
       # FSM gate integration
@@ -36,9 +37,7 @@
       # [ROAD, hijau] tunggu maksimal N detik kalau predicted-path kendaraan nge-block sebelum nyebrang anyway;
       # 0.0 = langsung nyebrang pas hijau; besar = nunggu kendaraan clear lebih lama.
       green_block_timeout_sec: 2.0
-      # [safety watchdog] kalau vehicle-path sudah clear (sustained_clear_sec terpenuhi) tapi FSM
-      # gate masih HOLD, tunggu maksimal gate_wait_timeout_sec sebelum menyimpulkan FSM-nya sendiri
-      # yang macet lalu paksa CROSSING anyway (ERROR log). Tanpa ini robot bisa nyangkut selamanya
-      # kalau FSM node wedged. Tidak berlaku untuk gate=ABORT (tetap indefinite hold) atau GO_GREEN
-      # (punya timeout sendiri: green_block_timeout_sec).
-      gate_wait_timeout_sec: 45.0
+      # Tidak ada watchdog yang memaksa CROSSING selama gate HOLD: lampu merah bisa ~60 s.
+      # Gate lebih tua dari ini = HOLD. FSM publish gate crossing aktif tiap tick (10 Hz);
+      # gate lama dari episode sebelumnya (atau FSM mati) tidak boleh melepas robot.
+      gate_stale_sec: 0.5

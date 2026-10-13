@@ -46,9 +46,15 @@ private:
   // This avoids the wait_set SIGABRT triggered by per-module subscriptions.
   rclcpp::Subscription<autoware_road_crossing_msgs::msg::RoadCrossingGate>::SharedPtr sub_gate_;
 
-  // Map: lanelet_id → latest gate command.  Written by sub_gate_ callback;
-  // read in modifyPathVelocity() before iterating modules.
-  std::map<lanelet::Id, uint8_t> gate_commands_;
+  // Map: lanelet_id → latest gate command and when it arrived.  Written by sub_gate_
+  // callback; read in modifyPathVelocity() before iterating modules, where a command older
+  // than gate_stale_sec is replaced by HOLD.
+  struct GateCommand
+  {
+    uint8_t command;
+    rclcpp::Time received;
+  };
+  std::map<lanelet::Id, GateCommand> gate_commands_;
   mutable std::mutex gate_mutex_;
 
   void launchNewModules(
