@@ -105,42 +105,71 @@ void TrajectoryChecker::setup_diag()
   const auto & status = context_->validation_status;
 
   std::string ns = "trajectory_validation_";
+  // override_error_diag downgrades ERROR to WARN for the check that asks for it, and for that
+  // check only. It used to be one flag shared by every check in the cycle: a curvature failure
+  // (override on, and the stack does exceed it) silently turned a trajectory that starts metres
+  // away from ego into a WARN as well, so no geometric check could ever reach MRM.
   const auto add_diag = [&](
-                          const std::string & name, const bool & status, const std::string & msg) {
+                          const std::string & name, const bool & status, const std::string & msg,
+                          const bool override_error_diag = false) {
     context_->diag_updater->add(
-      ns + name, [&, msg = msg](auto & stat) { set_diag_status(stat, status, msg); });
+      ns + name, [&, msg = msg, override_error_diag](auto & stat) {
+        set_diag_status(stat, status, msg, override_error_diag);
+      });
   };
 
   add_diag("size", status->is_valid_size, "invalid trajectory size is found");
   add_diag("finite", status->is_valid_finite_value, "infinite value is found");
-  add_diag("interval", status->is_valid_interval, "points interval is too large");
-  add_diag("relative_angle", status->is_valid_relative_angle, "relative angle is too large");
-  add_diag("curvature", status->is_valid_curvature, "curvature is too large");
   add_diag(
-    "lateral_acceleration", status->is_valid_lateral_acc, "lateral acceleration is too large");
-  add_diag("acceleration", status->is_valid_longitudinal_max_acc, "acceleration is too large");
-  add_diag("deceleration", status->is_valid_longitudinal_min_acc, "deceleration is too large");
-  add_diag("steering", status->is_valid_steering, "steering angle is too large");
-  add_diag("steering_rate", status->is_valid_steering_rate, "steering rate is too large");
+    "interval", status->is_valid_interval, "points interval is too large",
+    params_.interval.override_error_diag);
   add_diag(
-    "velocity_deviation", status->is_valid_velocity_deviation, "velocity deviation is too large");
+    "relative_angle", status->is_valid_relative_angle, "relative angle is too large",
+    params_.relative_angle.override_error_diag);
   add_diag(
-    "distance_deviation", status->is_valid_distance_deviation, "distance deviation is too large");
+    "curvature", status->is_valid_curvature, "curvature is too large",
+    params_.curvature.override_error_diag);
+  add_diag(
+    "lateral_acceleration", status->is_valid_lateral_acc, "lateral acceleration is too large",
+    params_.lateral_accel.override_error_diag);
+  add_diag(
+    "acceleration", status->is_valid_longitudinal_max_acc, "acceleration is too large",
+    params_.max_lon_accel.override_error_diag);
+  add_diag(
+    "deceleration", status->is_valid_longitudinal_min_acc, "deceleration is too large",
+    params_.min_lon_accel.override_error_diag);
+  add_diag(
+    "steering", status->is_valid_steering, "steering angle is too large",
+    params_.steering.override_error_diag);
+  add_diag(
+    "steering_rate", status->is_valid_steering_rate, "steering rate is too large",
+    params_.steering_rate.override_error_diag);
+  add_diag(
+    "velocity_deviation", status->is_valid_velocity_deviation, "velocity deviation is too large",
+    params_.velocity_deviation.override_error_diag);
+  add_diag(
+    "distance_deviation", status->is_valid_distance_deviation, "distance deviation is too large",
+    params_.distance_deviation.override_error_diag);
   add_diag(
     "longitudinal_distance_deviation", status->is_valid_longitudinal_distance_deviation,
-    "longitudinal distance deviation is too large");
+    "longitudinal distance deviation is too large",
+    params_.lon_distance_deviation.override_error_diag);
   add_diag(
     "yaw_deviation", status->is_valid_yaw_deviation,
-    "difference between vehicle yaw and closest trajectory yaw is too large");
+    "difference between vehicle yaw and closest trajectory yaw is too large",
+    params_.yaw_deviation.override_error_diag);
   add_diag(
     "forward_trajectory_length", status->is_valid_forward_trajectory_length,
-    "trajectory length is too short");
+    "trajectory length is too short",
+    params_.forward_trajectory_length.override_error_diag);
   add_diag(
-    "trajectory_shift", status->is_valid_trajectory_shift, "detected sudden shift in trajectory");
+    "trajectory_shift", status->is_valid_trajectory_shift, "detected sudden shift in trajectory",
+    params_.trajectory_shift.override_error_diag);
 }
 
 void TrajectoryChecker::set_diag_status(
-  DiagnosticStatusWrapper & stat, const bool & is_ok, const std::string & msg) const
+  DiagnosticStatusWrapper & stat, const bool & is_ok, const std::string & msg,
+  const bool override_error_diag) const
 {
   if (is_ok) {
     stat.summary(DiagnosticStatus::OK, "validated.");
@@ -157,7 +186,7 @@ void TrajectoryChecker::set_diag_status(
     return;
   }
 
-  if (override_all_error_diag_) {
+  if (override_error_diag) {
     const auto warn_msg = msg + " (error diag was overriden internally)";
     stat.summary(DiagnosticStatus::WARN, warn_msg);
     return;
