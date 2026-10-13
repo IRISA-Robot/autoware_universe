@@ -436,11 +436,27 @@ geometry_msgs::msg::Pose withFlippedYaw(const geometry_msgs::msg::Pose & pose)
 }
 }  // namespace
 
-lanelet::ConstLanelet selectCurrentRouteLanelet(const std::shared_ptr<PlannerData> & data)
+lanelet::ConstLanelet selectCurrentRouteLanelet(
+  const std::shared_ptr<PlannerData> & data, const std::optional<lanelet::ConstLanelet> & previous)
 {
   const auto & route_handler = data->route_handler;
   const auto & pose = data->self_odometry->pose.pose;
   const double max_dist = data->parameters.ego_nearest_dist_threshold;
+
+  // Still on the lanelet picked before (e.g. on return from the recovery scenario, or every cycle
+  // while not in autonomous mode): keep it.  Choosing afresh breaks a tie between overlapping
+  // route lanelets by heading, which picks the other leg of an out-and-back route when reversing.
+  if (previous) {
+    const auto preferred = route_handler->getPreferredLanelets();
+    const bool still_preferred =
+      std::any_of(preferred.begin(), preferred.end(), [&previous](const auto & llt) {
+        return llt.id() == previous->id() && llt.inverted() == previous->inverted();
+      });
+    constexpr double still_on_it_m = 0.5;
+    if (still_preferred && distanceToLanelet(*previous, pose) <= still_on_it_m) {
+      return *previous;
+    }
+  }
 
   // getClosestLaneletWithinRoute picks among ALL primitives of every route segment (unchosen
   // alternatives included) with no distance limit; the chosen lanelets come first when ego is
@@ -515,19 +531,34 @@ void PlannerManager::updateCurrentRouteLanelet(
     *current_route_lanelet_ = closest_lane;
     return;
   }
+  // Reversing: the nose points against the (inverted) lanelet direction, so the check above
+  // never passes.  Try the same neighbourhood (this lanelet and its route neighbours) with the
+  // heading the robot is actually travelling, before widening the search: the wider sequence can
+  // hold a later leg of the route lying beside or under ego (out and back over the same ground,
+  // hibikino_kanan 347 vs 195) whose lanelet matches the nose and would win.
+  if (route_handler->getClosestRouteLaneletFromLanelet(
+        withFlippedYaw(pose), current_route_lanelet_->value(), &closest_lane,
+        p.ego_nearest_dist_threshold, p.ego_nearest_yaw_threshold)) {
+    *current_route_lanelet_ = closest_lane;
+    return;
+  }
 
   const auto lanelet_sequence = route_handler->getLaneletSequence(
     current_route_lanelet_->value(), pose, backward_length, p.forward_path_length);
 
-  auto opt = autoware::experimental::lanelet2_utils::get_closest_lanelet_within_constraint(
+  // Either heading may fit a lanelet within the distance threshold; take the lanelet ego is
+  // actually nearer to (inside), not whichever heading was tried first.
+  const auto opt_nose = autoware::experimental::lanelet2_utils::get_closest_lanelet_within_constraint(
     lanelet_sequence, pose, p.ego_nearest_dist_threshold, p.ego_nearest_yaw_threshold);
-  if (!opt.has_value()) {
-    // Reversing: the nose points against the (inverted) lanelet direction, so the yaw check above
-    // never passes and the choice fell to distance alone -- at a seam or between overlapping
-    // lanelets that can be the wrong one.  Try the heading the robot is actually travelling.
-    opt = autoware::experimental::lanelet2_utils::get_closest_lanelet_within_constraint(
+  const auto opt_travel =
+    autoware::experimental::lanelet2_utils::get_closest_lanelet_within_constraint(
       lanelet_sequence, withFlippedYaw(pose), p.ego_nearest_dist_threshold,
       p.ego_nearest_yaw_threshold);
+  auto opt = opt_nose;
+  if (
+    opt_travel.has_value() &&
+    (!opt.has_value() || distanceToLanelet(*opt_travel, pose) < distanceToLanelet(*opt, pose))) {
+    opt = opt_travel;
   }
   if (opt.has_value()) {
     closest_lane = *opt;
