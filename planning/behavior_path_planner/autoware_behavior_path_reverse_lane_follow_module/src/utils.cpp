@@ -153,6 +153,9 @@ constexpr double kMaxEgoDistanceToRouteLaneletM = 3.0;
 // Chosen lanelets this much farther from ego than the nearest one still count as "ego is on it":
 // where a route runs out and back over the same ground, both legs' lanelets contain ego.
 constexpr double kEgoLaneletTieToleranceM = 0.5;
+// Ego still counts as on last cycle's lanelet (or a route neighbour of it) up to this far outside
+// it; beyond, it has been relocalised and the whole route is searched.
+constexpr double kEgoLaneletMaxDriftM = 1.0;
 
 // The chosen-lanelet index picked last cycle, per route.  Shared by both callers below (they look
 // up the same ego), reset whenever the route changes.
@@ -195,7 +198,8 @@ std::optional<lanelet::ConstLanelet> findEgoRouteLanelet(
       distances.push_back(distance_to(llt));
     }
     const auto index = selectEgoRouteLaneletIndex(
-      distances, memory.index, kEgoLaneletTieToleranceM, kMaxEgoDistanceToRouteLaneletM);
+      distances, memory.index, kEgoLaneletTieToleranceM, kEgoLaneletMaxDriftM,
+      kMaxEgoDistanceToRouteLaneletM);
     if (index) {
       memory.index = index;
       return preferred.at(*index);
@@ -874,11 +878,41 @@ bool isEgoArrivedAndStoppedAtGoal(
 
 std::optional<size_t> selectEgoRouteLaneletIndex(
   const std::vector<double> & distances_m, const std::optional<size_t> & previous_index,
-  const double tie_tolerance_m, const double max_distance_m)
+  const double tie_tolerance_m, const double max_drift_m, const double max_distance_m)
 {
   if (distances_m.empty()) {
     return std::nullopt;
   }
+  const size_t n = distances_m.size();
+
+  // Follow the route from last cycle's pick: look only at it and its route neighbours (one back,
+  // two ahead).  Ego drifting off its lanelet must never let a later leg that happens to lie
+  // under it win -- only a neighbour along the route can take over.
+  if (previous_index && *previous_index < n) {
+    const size_t p = *previous_index;
+    const size_t begin = p > 0 ? p - 1 : 0;
+    const size_t end = std::min(n, p + 3);
+    double local_min = std::numeric_limits<double>::max();
+    for (size_t i = begin; i < end; ++i) {
+      local_min = std::min(local_min, distances_m.at(i));
+    }
+    if (local_min <= max_drift_m) {
+      const auto is_local_candidate = [&](const size_t i) {
+        return distances_m.at(i) <= local_min + tie_tolerance_m;
+      };
+      if (is_local_candidate(p)) {
+        return p;
+      }
+      for (size_t i = p + 1; i < end; ++i) {
+        if (is_local_candidate(i)) {
+          return i;
+        }
+      }
+      return begin;  // only the one behind is near: ego went backwards along the route
+    }
+    // Ego is off all of them (relocalised / pose-estimated): search the whole route.
+  }
+
   const double min_distance = *std::min_element(distances_m.begin(), distances_m.end());
   if (min_distance > max_distance_m) {
     return std::nullopt;
@@ -886,27 +920,14 @@ std::optional<size_t> selectEgoRouteLaneletIndex(
   const auto is_candidate = [&](const size_t i) {
     return distances_m.at(i) <= min_distance + tie_tolerance_m;
   };
-
-  if (previous_index && *previous_index < distances_m.size()) {
-    // Still on it: keep it (no flip-flop at seams or between overlapping lanelets).
-    if (is_candidate(*previous_index)) {
-      return previous_index;
-    }
-    // Moved on: the next candidate along the route.
-    for (size_t i = *previous_index + 1; i < distances_m.size(); ++i) {
-      if (is_candidate(i)) {
-        return i;
-      }
-    }
-    // None ahead (ego went backwards along the route): the nearest candidate behind.
-    for (size_t i = *previous_index; i-- > 0;) {
+  if (previous_index) {
+    for (size_t i = std::min(*previous_index, n); i < n; ++i) {
       if (is_candidate(i)) {
         return i;
       }
     }
   }
-
-  for (size_t i = 0; i < distances_m.size(); ++i) {
+  for (size_t i = 0; i < n; ++i) {
     if (is_candidate(i)) {
       return i;
     }

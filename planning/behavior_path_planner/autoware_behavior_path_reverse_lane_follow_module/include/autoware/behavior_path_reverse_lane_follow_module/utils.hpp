@@ -437,10 +437,12 @@ bool isEgoArrivedAndStoppedAtGoal(
  * reversing the nose points against the direction of travel, so that tie-break picks the lanelet
  * of the *other* leg, and the path is built along it: the robot turns round to follow it.
  *
- * Instead: every lanelet within @p tie_tolerance_m of the nearest one is a candidate; keep the
- * previously picked one while it is still a candidate; otherwise take the first candidate at or
- * after it in route order (the next lanelet along the route, never a later leg ahead of an earlier
- * one); with no previous pick, take the earliest candidate in route order.
+ * Instead, with a previous pick: look only at it and its route neighbours (one back, two ahead);
+ * keep it while it is within @p tie_tolerance_m of the nearest of those, otherwise hand over to
+ * the next neighbour along the route that is.  A later leg lying under ego never wins, even when
+ * ego has drifted off its own lanelet.  Only when ego is farther than @p max_drift_m from all of
+ * them (relocalised) is the whole route searched: the first candidate at or after the previous
+ * pick, else the earliest.  With no previous pick, the earliest candidate in route order.
  *
  * @param distances_m distance from ego to each chosen lanelet, in route order
  * @param previous_index index picked last cycle on this route, if any
@@ -448,7 +450,7 @@ bool isEgoArrivedAndStoppedAtGoal(
  */
 std::optional<size_t> selectEgoRouteLaneletIndex(
   const std::vector<double> & distances_m, const std::optional<size_t> & previous_index,
-  const double tie_tolerance_m, const double max_distance_m);
+  const double tie_tolerance_m, const double max_drift_m, const double max_distance_m);
 
 }  // namespace autoware::behavior_path_planner::reverse_lane_follow_utils
 
