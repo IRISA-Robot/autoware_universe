@@ -570,6 +570,36 @@ double getDistanceToCenterline(const ObjectData & object, const AvoidancePlannin
   return to_centerline;
 }
 
+/**
+ * @brief side of the object used for every avoid_margin / shift_length decision
+ * (ObjectData::is_on_right_of_true_lane).
+ * @details If the whole envelope lies on one side of data.reference_path, that side is
+ * geometrically unambiguous and is returned as-is: ego can only pass such an object on the other
+ * side. The lane-centerline test (getDistanceToCenterline) is only a tie-breaker for an object that
+ * straddles the path. Field evidence (route-reversed driving, lanelet 322): objects lying entirely
+ * right of the path were classified LEFT of the centerline (log_belok.log 883.9 s overhang -0.29 ->
+ * shift -1.118; belog_lagi.log 492.3 s overhang -0.077 -> shift -0.905), i.e. a shift toward the
+ * object. Forward driving showed no such contradiction for objects fully on one side.
+ * @param object data (overhang_points must already be filled for the geometric test).
+ * @param data planning data.
+ * @return true if the object is to be treated as lying on the right.
+ */
+bool isObjectOnRightForAvoidance(const ObjectData & object, const AvoidancePlanningData & data)
+{
+  if (!object.overhang_points.empty()) {
+    const auto [min_it, max_it] = std::minmax_element(
+      object.overhang_points.begin(), object.overhang_points.end(),
+      [](const auto & a, const auto & b) { return a.first < b.first; });
+    if (max_it->first < 0.0) {
+      return true;  // entire envelope right of the path
+    }
+    if (min_it->first > 0.0) {
+      return false;  // entire envelope left of the path
+    }
+  }
+  return getDistanceToCenterline(object, data) <= 0.0;
+}
+
 std::optional<lanelet::ConstLineString3d> getNearestIntersectionRoadBorder(
   const ObjectData & object, const std::shared_ptr<RouteHandler> & route_handler)
 {
@@ -1263,9 +1293,11 @@ bool isNoNeedAvoidanceBehavior(
   // margin), since that decision has to agree with the true-lane side getAvoidMargin() assumed
   // when it picked the "far" road bound. So use object.is_on_right_of_true_lane here instead of
   // isOnRight(object) to keep both terms of the shift_length formula in the same frame.
-  const auto shift_length = calcShiftLength(
-    object.is_on_right_of_true_lane, object.overhang_points.front().first,
-    object.avoid_margin.value());
+  // The edge must match the side used for the add-vs-subtract decision; front() is sorted by the
+  // path side and is the wrong edge whenever is_on_right_of_true_lane != isOnRight(object).
+  const auto overhang_dist = getOverhangDistance(object, object.is_on_right_of_true_lane);
+  const auto shift_length =
+    calcShiftLength(object.is_on_right_of_true_lane, overhang_dist, object.avoid_margin.value());
 
   const auto enough_lateral_distance = !isShiftNecessary(object.is_on_right_of_true_lane, shift_length);
   const auto below_execution_threshold =
@@ -1281,7 +1313,7 @@ bool isNoNeedAvoidanceBehavior(
     "avoid_margin=%.3f shift_length=%.3f lateral_execution_threshold=%.3f "
     "to_road_shoulder_distance=%.3f result=%s",
     autoware_utils::to_hex_string(object.object.object_id).c_str(),
-    object.is_on_right_of_true_lane ? "true" : "false", object.overhang_points.front().first,
+    object.is_on_right_of_true_lane ? "true" : "false", overhang_dist,
     object.avoid_margin.value(), shift_length, parameters->lateral_execution_threshold,
     object.to_road_shoulder_distance,
     enough_lateral_distance
@@ -1441,7 +1473,9 @@ double getRoadShoulderDistance(
   // prefer_lateral_ratio lanelet tag) the object actually sits on, reusing the same bias-independent
   // arc-coordinate computation already used elsewhere for centerline-distance checks, so the correct
   // real boundary is treated as the "far" side regardless of how far off-center the current path is.
-  const bool is_object_on_right_of_true_lane = getDistanceToCenterline(object, data) <= 0.0;
+  // Same side as ObjectData::is_on_right_of_true_lane (see isObjectOnRightForAvoidance()), so the
+  // shoulder distance is always measured toward the bound ego will actually pass on.
+  const bool is_object_on_right_of_true_lane = isObjectOnRightForAvoidance(object, data);
   const auto bound = is_object_on_right_of_true_lane ? data.left_bound : data.right_bound;
   const auto envelope_polygon_width = boost::geometry::area(object.envelope_poly) /
                                       std::max(object.length, 1e-3);  // prevent division by zero
@@ -1577,6 +1611,17 @@ double calcShiftLength(
   const auto shift_length =
     is_object_on_right ? (overhang_dist + avoid_margin) : (overhang_dist - avoid_margin);
   return std::fabs(shift_length) > 1e-3 ? shift_length : 0.0;
+}
+
+double getOverhangDistance(const ObjectData & object, const bool is_object_on_right)
+{
+  if (object.overhang_points.empty()) {
+    return 0.0;
+  }
+  const auto [min_it, max_it] = std::minmax_element(
+    object.overhang_points.begin(), object.overhang_points.end(),
+    [](const auto & a, const auto & b) { return a.first < b.first; });
+  return is_object_on_right ? max_it->first : min_it->first;
 }
 
 bool isWithinLanes(
@@ -2518,7 +2563,7 @@ void updateRoadShoulderDistance(
 
   for (auto & o : data.target_objects) {
     o.to_road_shoulder_distance = filtering_utils::getRoadShoulderDistance(o, data, planner_data);
-    o.is_on_right_of_true_lane = filtering_utils::getDistanceToCenterline(o, data) <= 0.0;
+    o.is_on_right_of_true_lane = filtering_utils::isObjectOnRightForAvoidance(o, data);
   }
 
   filtering_utils::applyJointLateralFeasibility(data.target_objects, planner_data, parameters);
@@ -2636,7 +2681,7 @@ void filterTargetObjects(
     // data_structs.hpp. Must be computed here (rather than reusing isOnRight(o)) so that every
     // downstream consumer that combines this side with avoid_margin (itself true-lane-relative)
     // stays in the same reference frame, even when data.reference_path is laterally biased.
-    o.is_on_right_of_true_lane = filtering_utils::getDistanceToCenterline(o, data) <= 0.0;
+    o.is_on_right_of_true_lane = filtering_utils::isObjectOnRightForAvoidance(o, data);
 
     if (filtering_utils::isUnknownTypeObject(o)) {
       const auto avoid_margin = filtering_utils::getAvoidMargin(o, planner_data, parameters);

@@ -265,7 +265,7 @@
     # robot has reached this episode, so driving on pays it back.  It is what bounds "the
     # obstacle closes in and the robot keeps giving ground", which is possible again now.
     # false = the strict rule: every freespace segment must travel with the mission.
-    allow_counter_mission_legs: true
+    allow_counter_mission_legs: false
     max_direction_changes: 2               # forward-back-forward
     # pid_longitudinal_controller leaves STOPPED on stop_dist > drive_state_stop_dist
     # (0.5 m); the 1.5 m sum is only its STOPPING-state test.  At a cusp the robot is

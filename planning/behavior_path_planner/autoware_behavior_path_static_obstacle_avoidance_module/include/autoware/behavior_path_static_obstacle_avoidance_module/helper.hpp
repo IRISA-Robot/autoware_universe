@@ -296,9 +296,12 @@ public:
     const ObjectData & object, const bool & is_on_right, const double & margin) const
   {
     using utils::static_obstacle_avoidance::calcShiftLength;
+    using utils::static_obstacle_avoidance::getOverhangDistance;
 
+    // Take the ego-facing edge for the side the shift is planned for, not front() (sorted by the
+    // path side) -- the two sides may legitimately differ for an object straddling the path.
     const auto shift_length =
-      calcShiftLength(is_on_right, object.overhang_points.front().first, margin);
+      calcShiftLength(is_on_right, getOverhangDistance(object, is_on_right), margin);
     return is_on_right ? std::min(shift_length, getLeftShiftBound())
                        : std::max(shift_length, getRightShiftBound());
   }

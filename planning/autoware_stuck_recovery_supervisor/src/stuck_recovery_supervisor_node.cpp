@@ -2500,11 +2500,47 @@ bool StuckRecoverySupervisorNode::capture_reference_path_from_centerline()
   for (const auto & point : path.points) {
     reference_path_.push_back(point.point.pose);
   }
+  // MEASURE the path, do not restate the request. "over %.1f m" used to print
+  // param_.max_goal_search_distance_m -- the distance ASKED FOR -- so a map that
+  // could only supply a fraction of it logged the full number anyway, and the
+  // one quantity that matters when recovery retreats was never visible at all:
+  // how much reference path exists BEHIND the robot. Giving ground is bounded
+  // by max_ground_given_m and measured along this path, so wherever the lanelet
+  // ends sooner than that, the retreat is being measured against a path that
+  // does not reach where the robot is being sent.
+  double behind_m = 0.0;
+  double ahead_m = 0.0;
+  {
+    size_t near = 0;
+    double best = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < reference_path_.size(); ++i) {
+      const double d = std::hypot(
+        reference_path_[i].position.x - odom_->pose.pose.position.x,
+        reference_path_[i].position.y - odom_->pose.pose.position.y);
+      if (d < best) {
+        best = d;
+        near = i;
+      }
+    }
+    for (size_t i = 1; i < reference_path_.size(); ++i) {
+      const double seg = std::hypot(
+        reference_path_[i].position.x - reference_path_[i - 1].position.x,
+        reference_path_[i].position.y - reference_path_[i - 1].position.y);
+      (i <= near ? behind_m : ahead_m) += seg;
+    }
+  }
   RCLCPP_INFO_THROTTLE(
     get_logger(), *get_clock(), 5000,
-    "[episode %u] reference path rebuilt from the lanelet centerline: %zu points over %.1f m "
-    "(resampled from %zu)",
-    episode_id_, reference_path_.size(), param_.max_goal_search_distance_m, raw.points.size());
+    "[episode %u] reference path rebuilt from the lanelet centerline: %zu points, "
+    "%.1f m behind the robot and %.1f m ahead (asked %.1f m behind, %.1f m ahead; "
+    "max_ground_given_m=%.1f)%s (resampled from %zu)",
+    episode_id_, reference_path_.size(), behind_m, ahead_m,
+    std::min(5.0, param_.max_ground_given_m + 1.0), param_.max_goal_search_distance_m,
+    param_.max_ground_given_m,
+    behind_m + 0.05 < param_.max_ground_given_m
+      ? " -- LESS PATH BEHIND THAN RECOVERY MAY GIVE: a retreat can run off the end of it"
+      : "",
+    raw.points.size());
   return reference_path_.size() >= 2;
 }
 
@@ -2817,6 +2853,24 @@ bool StuckRecoverySupervisorNode::full_plan_is_acceptable(
   if (static_cast<double>(legs.back().sign) * want < 0.0) {
     return refuse(std::string("plan ends travelling against the mission, which is in ") +
                   mission + " motion");
+  }
+  // The strict rule, which allow_counter_mission_legs has promised since it was
+  // introduced and never actually applied: the parameter was declared, written
+  // about in two comments, and read by nothing. Setting it false changed no
+  // behaviour at all, so the only thing bounding counter-mission travel was the
+  // budget further down -- which permits it, just not much of it.
+  //
+  // It matters most exactly where it was missing. On a REVERSE mission a leg
+  // "against the mission" drives the robot physically forward, and the escape
+  // goals can sit where the lanelet has already ended; the robot then gives
+  // ground into unmapped space a metre at a time and never escapes. With this
+  // false such a plan is refused outright, the candidates run out, and recovery
+  // stops and waits for an operator -- which is what this module says should
+  // happen when there is no usable plan.
+  if (!param_.allow_counter_mission_legs && against_m > 0.0) {
+    why << against_m << " m against the mission, and allow_counter_mission_legs is false "
+        << "(every segment must travel with the " << mission << " mission)";
+    return refuse(why.str());
   }
   if (changes > param_.max_direction_changes) {
     why << "plan changes direction " << changes << " times (limit "

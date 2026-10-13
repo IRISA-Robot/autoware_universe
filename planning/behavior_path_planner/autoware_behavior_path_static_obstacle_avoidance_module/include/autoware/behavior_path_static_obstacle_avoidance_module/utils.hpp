@@ -60,6 +60,20 @@ bool isOnRight(const ObjectData & obj);
 double calcShiftLength(
   const bool & is_object_on_right, const double & overhang_dist, const double & avoid_margin);
 
+/**
+ * @brief path-relative lateral distance of the object's envelope edge that faces the ego when the
+ * object is treated as lying on the given side: the left-most edge (max lateral) for an object on
+ * the right, the right-most edge (min lateral) for an object on the left.
+ * @details object.overhang_points.front() is sorted by isOnRight(object) (path side). Whenever the
+ * side used for the shift (is_on_right_of_true_lane) can differ from the path side, the edge MUST be
+ * taken from this function instead of front(), or calcShiftLength() pairs the "pass this object on
+ * its right" formula with the object's LEFT edge and plans a shift straight through the object.
+ * @param object data (overhang_points must be filled).
+ * @param is_object_on_right side the shift is planned for.
+ * @return signed lateral distance [m] of the ego-facing edge (0.0 if overhang_points is empty).
+ */
+double getOverhangDistance(const ObjectData & object, const bool is_object_on_right);
+
 bool isWithinLanes(
   const std::optional<lanelet::ConstLanelet> & closest_lanelet,
   const std::shared_ptr<const PlannerData> & planner_data);
