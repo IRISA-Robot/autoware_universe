@@ -998,10 +998,11 @@ std::optional<size_t> selectEgoRouteLaneletIndex(
       const auto is_local_candidate = [&](const size_t i) {
         return distances_m.at(i) <= local_min + tie_tolerance_m;
       };
-      if (is_local_candidate(p)) {
-        return p;
-      }
-      for (size_t i = p + 1; i < end; ++i) {
+      // The furthest one along the route that ego is on.  Holding on to the previous one until
+      // ego had left it deadlocked at a tight U-turn: the window ahead of 347 ends after the
+      // short U-turn lanelet 458, the robot stopped for that path end right at the 347/458 seam,
+      // still "on" 347, so the window -- and the path end -- never moved on.
+      for (size_t i = end; i-- > p;) {
         if (is_local_candidate(i)) {
           return i;
         }

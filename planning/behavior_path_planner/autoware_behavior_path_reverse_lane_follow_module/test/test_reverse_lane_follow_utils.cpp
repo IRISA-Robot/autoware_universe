@@ -754,7 +754,7 @@ TEST(SelectEgoRouteLaneletIndex, ReturnLegKeptWhileInsideTheOutboundLegToo)
 {
   const std::vector<double> d{0.0, 30.0, 50.0, 60.0, 0.3, 0.0};
   // coming down from 195 (index 4) into the overlap: next along the route is 188, not 382
-  EXPECT_EQ(selectEgoRouteLaneletIndex(d, 4, 0.5, 1.0, 3.0), std::optional<size_t>(4));
+  EXPECT_EQ(selectEgoRouteLaneletIndex(d, 4, 0.5, 1.0, 3.0), std::optional<size_t>(5));
   const std::vector<double> past_195{0.0, 30.0, 50.0, 60.0, 0.9, 0.0};
   EXPECT_EQ(selectEgoRouteLaneletIndex(past_195, 4, 0.5, 1.0, 3.0), std::optional<size_t>(5));
   EXPECT_EQ(selectEgoRouteLaneletIndex(past_195, 5, 0.5, 1.0, 3.0), std::optional<size_t>(5));
@@ -776,11 +776,23 @@ TEST(SelectEgoRouteLaneletIndex, RelocalisedFarAwaySearchesTheWholeRoute)
 
 TEST(SelectEgoRouteLaneletIndex, AdvancesToTheNextLaneletAtASeam)
 {
-  // leaving 382 into 373
+  // reaching 373 from 382: hand over as soon as ego is at the seam
   EXPECT_EQ(
-    selectEgoRouteLaneletIndex({0.4, 0.0, 20.0}, 0, 0.5, 1.0, 3.0), std::optional<size_t>(0));
+    selectEgoRouteLaneletIndex({0.0, 0.4, 20.0}, 0, 0.5, 1.0, 3.0), std::optional<size_t>(1));
+  EXPECT_EQ(
+    selectEgoRouteLaneletIndex({0.4, 0.0, 20.0}, 0, 0.5, 1.0, 3.0), std::optional<size_t>(1));
+  // still well inside 382
+  EXPECT_EQ(
+    selectEgoRouteLaneletIndex({0.0, 0.8, 20.0}, 0, 0.5, 1.0, 3.0), std::optional<size_t>(0));
   EXPECT_EQ(
     selectEgoRouteLaneletIndex({0.7, 0.0, 20.0}, 0, 0.5, 1.0, 3.0), std::optional<size_t>(1));
+}
+
+TEST(SelectEgoRouteLaneletIndex, StoppedAtTheUTurnSeamMovesOnToTheUTurnLanelet)
+{
+  // live: ego stopped 0.02 m from 347 (index 2), inside 458 (index 3); 195 (index 4) 1.38 m away
+  const std::vector<double> d{50.0, 20.0, 0.02, 0.0, 1.38, 88.0};
+  EXPECT_EQ(selectEgoRouteLaneletIndex(d, 2, 0.5, 1.0, 3.0), std::optional<size_t>(3));
 }
 
 TEST(SelectEgoRouteLaneletIndex, FallsBackBehindWhenNothingIsAhead)

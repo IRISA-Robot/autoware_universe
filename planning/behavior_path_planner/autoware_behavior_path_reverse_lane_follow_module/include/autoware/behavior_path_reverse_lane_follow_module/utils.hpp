@@ -437,9 +437,9 @@ bool isEgoArrivedAndStoppedAtGoal(
  * reversing the nose points against the direction of travel, so that tie-break picks the lanelet
  * of the *other* leg, and the path is built along it: the robot turns round to follow it.
  *
- * Instead, with a previous pick: look only at it and its route neighbours (one back, two ahead);
- * keep it while it is within @p tie_tolerance_m of the nearest of those, otherwise hand over to
- * the next neighbour along the route that is.  A later leg lying under ego never wins, even when
+ * Instead, with a previous pick: look only at it and its route neighbours (one back, two ahead),
+ * and take the furthest along the route that is within @p tie_tolerance_m of the nearest of
+ * those (at a seam, the next lanelet as soon as ego reaches it).  A later leg lying under ego never wins, even when
  * ego has drifted off its own lanelet.  Only when ego is farther than @p max_drift_m from all of
  * them (relocalised) is the whole route searched: the first candidate at or after the previous
  * pick, else the earliest.  With no previous pick, the earliest candidate in route order.
