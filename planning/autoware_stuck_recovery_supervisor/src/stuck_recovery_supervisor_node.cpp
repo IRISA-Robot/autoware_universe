@@ -1786,6 +1786,25 @@ std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_
   size_t rejected_tight = 0;
   bool first_fit_logged = false;
 
+  // Second-best list, used only when nothing reaches goal_min_clear_length_m.
+  //
+  // [2026-10-13] two obstacles in series, in a 2.85 m wide lane with plenty of room to
+  // get past both: the footprint was blocked 1.75-3.65 m, free for 0.6 m, blocked again
+  // 4.30-5.75 m, and the costmap ran out at 9.15 m.  The longest clear run available was
+  // 3.35 m against a 4.00 m requirement, so EVERY point past the obstacles was rejected
+  // as too tight and the episode held still for the full 60 s without ever publishing a
+  // goal -- "0 escape-goal candidates ... 11 rejected as too tight".  The window simply
+  // is not big enough to prove 4 m of clear path when the obstacles eat the near half of
+  // it; demanding the proof anyway means standing still next to an open road.
+  //
+  // So keep the best of what there is.  The floor is the robot's own length: that is
+  // what the requirement was protecting against in the first place -- a goal wedged a
+  // few centimetres from something solid behind it -- and anything longer than the robot
+  // is a place it can actually come to rest.  The full requirement still wins whenever
+  // the room exists to meet it.
+  const double relaxed_min_clear_m = base_to_front_m_ + base_to_rear_m_;
+  std::vector<geometry_msgs::msg::Pose> relaxed;
+
   for (size_t k = ego_index + 1; k < reference_path_.size(); ++k) {
     const double step = distance2d(reference_path_[k - 1], reference_path_[k]);
     arc += step;
@@ -1822,6 +1841,10 @@ std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_
     }
     if (clear_run_m < param_.goal_min_clear_length_m) {
       ++rejected_tight;  // free here, but not yet far enough from what is behind it
+      if (clear_run_m >= relaxed_min_clear_m) {
+        next_check = arc + param_.goal_check_interval_m;
+        relaxed.push_back(candidate);
+      }
       continue;
     }
     next_check = arc + param_.goal_check_interval_m;
@@ -1832,6 +1855,19 @@ std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_
       first_fit_logged = true;
     }
     candidates.push_back(candidate);
+  }
+
+  const bool relaxed_used = candidates.empty() && !relaxed.empty();
+  if (relaxed_used) {
+    candidates = relaxed;
+    if (verbose) {
+      RCLCPP_WARN(
+        get_logger(),
+        "[episode %u] nothing had the %.1f m of clear path behind it that a goal normally "
+        "needs; falling back to the %zu point(s) with at least the robot's own length "
+        "(%.1f m) behind them",
+        episode_id_, param_.goal_min_clear_length_m, relaxed.size(), relaxed_min_clear_m);
+    }
   }
 
   if (top_large_fit && !candidates.empty()) {
