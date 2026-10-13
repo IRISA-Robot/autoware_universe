@@ -58,8 +58,7 @@ private:
   void setup_parameters(rclcpp::Node & node);
 
   void set_diag_status(
-    DiagnosticStatusWrapper & stat, const bool & is_ok, const std::string & msg,
-    const bool override_error_diag) const;
+    DiagnosticStatusWrapper & stat, const bool & is_ok, const std::string & msg) const;
 
   bool override_all_error_diag_{false};
 

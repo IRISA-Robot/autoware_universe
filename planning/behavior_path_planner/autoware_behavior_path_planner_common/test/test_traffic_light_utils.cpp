@@ -135,9 +135,7 @@ TEST_F(TrafficLightTest, calcDistanceToRedTrafficLight)
     const auto path = planner_data_->route_handler->getCenterLinePath(lanelets, 0.0, 300.0);
     const auto distance = calcDistanceToRedTrafficLight(lanelets, path, planner_data_);
     ASSERT_TRUE(distance.has_value());
-    // getCenterLinePath samples the centerline at 1 m (was 5 m), so the arc length to the stop
-    // line follows the curve slightly more closely.
-    EXPECT_NEAR(distance.value(), 117.1099001, epsilon);
+    EXPECT_NEAR(distance.value(), 117.1096960, epsilon);
   }
 }
 

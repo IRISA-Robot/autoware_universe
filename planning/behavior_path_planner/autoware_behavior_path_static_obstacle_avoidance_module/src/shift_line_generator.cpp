@@ -531,10 +531,7 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
           feasible_shift_profile.value().first - current_ego_shift);
         const auto furthest_avoid_distance = std::max(to_shift_end - minimum_avoid_distance, 1e-3);
 
-        // Not std::clamp: furthest < nearest whenever the steerable floor in
-        // getMinAvoidanceDistance exceeds the profile's distance, and clamp(lo > hi) is undefined.
-        // Nearest wins, as clamp's implementation happened to return.
-        return std::max(nearest_avoid_distance, std::min(data.to_start_point, furthest_avoid_distance));
+        return std::clamp(data.to_start_point, nearest_avoid_distance, furthest_avoid_distance);
       }();
 
       al_avoid.start_idx = utils::static_obstacle_avoidance::findPathIndexFromArclength(

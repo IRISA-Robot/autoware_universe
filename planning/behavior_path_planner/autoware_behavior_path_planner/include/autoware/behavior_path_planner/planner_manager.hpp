@@ -124,14 +124,6 @@ struct SlotOutput
   bool is_upstream_waiting_approved{false};
 };
 
-/// Distance from ego to the polyline of `path` (infinity for an empty path).
-double calcEgoDistanceToPath(const PathWithLaneId & path, const PlannerData & data);
-
-/// A cached path may stand in for a fresh one only while the robot is still on it: every fallback
-/// below used to republish a path from wherever the robot was when it was cached -- before a
-/// recovery manoeuvre, a reroute or a manual drive -- metres or tens of metres away.
-constexpr double max_ego_distance_to_cached_path = 1.0;  // [m]
-
 class SubPlannerManager
 {
 public:
@@ -458,11 +450,6 @@ public:
   {
     std::for_each(manager_ptrs_.begin(), manager_ptrs_.end(), [](const auto & m) { m->reset(); });
     *current_route_lanelet_ = std::nullopt;
-    // The path caches are part of "all member variables": after a reset (new route, scenario
-    // re-entry) they describe a robot pose that no longer exists.
-    last_valid_reference_path_.reset();
-    last_unfolded_path_.reset();
-    fold_substitution_count_ = 0;
     resetProcessingTime();
     for (auto & planner_manager_slot : planner_manager_slots_) {
       planner_manager_slot.reset();
