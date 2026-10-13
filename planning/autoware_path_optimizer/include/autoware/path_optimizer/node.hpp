@@ -32,6 +32,7 @@
 #include <rclcpp/publisher.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <optional>
 #include <string>
@@ -56,6 +57,18 @@ protected:  // for the static_centerline_generator package
   public:
     bool isDrivingForward(const std::vector<PathPoint> & path_points)
     {
+      // A route-reversed path (reverse_lane_follow) carries yaw = direction of travel with
+      // negative velocity, so the yaw test below calls it forward and MPT optimised it with a
+      // forward vehicle: the footprint's 0.9 m front put where the robot's 0.3 m rear is.  In a
+      // tight U-turn that pushed the trajectory ~0.7 m outward, its footprint left the drivable
+      // area, and the outside-drivable-area stop held the robot there.  The velocity sign says
+      // which way the robot actually moves; trust it first.
+      for (const auto & p : path_points) {
+        if (std::abs(p.longitudinal_velocity_mps) > 1e-3) {
+          is_driving_forward_ = p.longitudinal_velocity_mps > 0.0;
+          return is_driving_forward_;
+        }
+      }
       const auto is_driving_forward = autoware::motion_utils::isDrivingForward(path_points);
       is_driving_forward_ = is_driving_forward ? is_driving_forward.value() : is_driving_forward_;
       return is_driving_forward_;
