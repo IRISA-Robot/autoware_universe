@@ -90,7 +90,17 @@
 
     # stable_frames: jumlah frame berturut-turut yang harus sepakat
     # sebelum state di-commit ke output.
-    stable_frames: 3
+    # 1 = tanpa anti-flicker. Debounce dilakukan interlock lampu hijau di FSM
+    # (threshold_*_valid / threshold_*_off). Nilai > 1 di sini bisa menelan fase padam
+    # hijau kedip (kamera ~4.5 Hz → fase padam 0.5 s cuma ~2 frame) sehingga hijau kedip
+    # terbaca hijau solid.
+    stable_frames: 1
+
+    # max_image_age_sec: gambar kamera yang DITERIMA lebih lama dari ini dianggap basi
+    # (kamera macet/mati) → publish NONE. Tanpa ini gambar terakhir diklasifikasi ulang
+    # terus dan warna terakhir (mis. hijau) dilaporkan selamanya.
+    # Harus > interval frame kamera + jitter (kamera ~4.5 Hz → ~0.22 s).
+    max_image_age_sec: 0.5
 
     # min_confidence: confidence minimum agar state baru di-commit.
     # 0.0 = tidak ada syarat confidence.

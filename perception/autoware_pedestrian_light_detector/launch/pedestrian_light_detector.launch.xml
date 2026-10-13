@@ -28,6 +28,9 @@
        RC_PL_BACKEND). Selalu di-set (override param_file dgn nilai yang sama). Default 'hsv'
        buat pemakaian standalone tanpa run script. -->
   <arg name="backend" default="hsv"/>
+  <!-- Lanelet2 OSM the tf_pedestrian lights are read from: must be the map Autoware runs on,
+       or the lights (and their ids, paired with road_crossing lanelets) don't match. -->
+  <arg name="map_path" default="/home/ubuntu/sim_ws/maps/map1/lanelet2_map.osm"/>
 
   <node
     pkg="autoware_pedestrian_light_detector"
@@ -35,8 +38,11 @@
     name="pedestrian_light_detector"
     namespace="/perception/road_crossing"
     output="screen">
-    <param name="use_sim_time" value="$(var use_sim_time)"/>
+    <!-- param file FIRST: in Humble, a node-specific param that appears before the file's
+         "/**" section makes the file's values win over every later override. -->
     <param from="$(var param_file)"/>
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
     <param name="backend" value="$(var backend)"/>
+    <param name="map_path" value="$(var map_path)"/>
   </node>
 </launch>

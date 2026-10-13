@@ -51,7 +51,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 from sensor_msgs.msg import Image, CameraInfo
 from std_srvs.srv import SetBool
 
-from autoware_road_crossing_msgs.msg import PedestrianLightState
+from autoware_road_crossing_msgs.msg import PedestrianLightState, PedestrianLightTarget
 
 try:
     from tier4_perception_msgs.msg import (
@@ -158,6 +158,9 @@ class PedestrianLightDetectorNode(Node):
         self.declare_parameter('s_min', 80)
         self.declare_parameter('v_min', 80)
         self.declare_parameter('min_area', 20)
+        # Gambar kamera lebih tua dari ini (dihitung dari waktu DITERIMA, bukan stamp kamera)
+        # dianggap kamera mati → publish NONE, jangan klasifikasi ulang gambar lama.
+        self.declare_parameter('max_image_age_sec', 0.5)
         # Anti-flicker
         self.declare_parameter('stable_frames', 3)
         self.declare_parameter('min_confidence', 0.0)
@@ -273,6 +276,7 @@ class PedestrianLightDetectorNode(Node):
         classifier_params['result_timeout_sec'] = _autoware_result_timeout_sec
 
         self._stable_frames = max(1, int(self.get_parameter('stable_frames').value))
+        self._max_image_age_sec = float(self.get_parameter('max_image_age_sec').value)
         self._min_confidence = float(self.get_parameter('min_confidence').value)
         self._enable_debug_image = bool(self.get_parameter('enable_debug_image').value)
 
@@ -378,6 +382,8 @@ class PedestrianLightDetectorNode(Node):
         self._clf_signals_sub = None
         # Simpan raw Image msg terakhir dari kamera aktif (untuk di-republish ke clf/image)
         self._last_raw_image = None
+        # Kapan gambar terakhir diterima (node clock) — untuk cek kamera macet.
+        self._last_image_rx_time = None
 
         if self._backend == 'autoware':
             if not _TIER4_MSGS_AVAILABLE:
@@ -413,6 +419,19 @@ class PedestrianLightDetectorNode(Node):
                     f'rois={self._autoware_rois_topic} '
                     f'signals={self._autoware_signals_topic}'
                 )
+
+        # ---------- target light dari FSM (absolut) ----------
+        # FSM mengumumkan lampu yang dipasangkan dengan crossing aktif (tag
+        # forward_pedestrian_tf / reverse_pedestrian_tf).  Selama target sudah pernah
+        # diterima, hanya lampu itu yang diproyeksikan/diklasifikasi — bukan lampu terdekat
+        # di FOV, yang bisa milik crossing lain.  None = FSM belum publish (perilaku lama).
+        self._target_light_ids = None
+        self._target_light_sub = self.create_subscription(
+            PedestrianLightTarget,
+            '/planning/road_crossing/target_light',
+            self._on_target_light,
+            10,
+        )
 
         # ---------- service server (absolut) ----------
         self._enable_srv = self.create_service(
@@ -635,6 +654,7 @@ class PedestrianLightDetectorNode(Node):
         # Reset state
         self._last_frame = None
         self._last_raw_image = None
+        self._last_image_rx_time = None
         self._map_roi_bbox = None
         self._map_tight_bbox = None
         self._active_light = None
@@ -781,6 +801,7 @@ class PedestrianLightDetectorNode(Node):
         self._active_cam_name = cam_name
         self._last_frame = None        # reset frame saat ganti kamera
         self._last_raw_image = None    # reset raw image (autoware backend) saat ganti kamera
+        self._last_image_rx_time = None
         self.get_logger().info(
             f'[Fase 2] Image sub baru: {topic}'
         )
@@ -796,6 +817,7 @@ class PedestrianLightDetectorNode(Node):
         # Selalu simpan raw Image msg untuk backend autoware
         # (direpublish ke ~/clf/image dengan stamp asli)
         self._last_raw_image = msg
+        self._last_image_rx_time = self.get_clock().now()
         try:
             bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             self._last_frame = bgr
@@ -939,6 +961,57 @@ class PedestrianLightDetectorNode(Node):
     # Publish callback (timer utama — publish_rate_hz)
     # ------------------------------------------------------------------
 
+    def _on_target_light(self, msg: 'PedestrianLightTarget'):
+        ids = [int(i) for i in msg.light_ids]
+        if ids != self._target_light_ids:
+            self.get_logger().info(
+                f'Target light: crossing={msg.crossing_id} lights={ids or "none"}')
+            # State yang sudah di-commit milik lampu sebelumnya — jangan dibawa ke target baru.
+            self._raw_state_buf.clear()
+            self._committed_state = STATE_NONE
+            self._committed_conf = 0.0
+        self._target_light_ids = ids
+
+    def _image_is_fresh(self) -> bool:
+        """
+        True jika gambar terakhir diterima <= max_image_age_sec yang lalu.
+
+        Tanpa ini, kamera yang macet membuat gambar terakhir diklasifikasi ulang terus dan
+        warna terakhir (mis. GREEN) dilaporkan selamanya.  Saat basi: buang juga state
+        yang sudah di-commit, supaya tidak terbawa ketika gambar datang lagi.
+        """
+        rx = self._last_image_rx_time
+        fresh = rx is not None and (
+            (self.get_clock().now() - rx).nanoseconds * 1e-9 <= self._max_image_age_sec)
+        if not fresh:
+            self.get_logger().warn(
+                f'Gambar kamera {self._active_cam_name or self._camera_topic!r} basi '
+                f'(> {self._max_image_age_sec:.2f} s) — publish NONE.',
+                throttle_duration_sec=3.0,
+            )
+            self._raw_state_buf.clear()
+            self._committed_state = STATE_NONE
+            self._committed_conf = 0.0
+        return fresh
+
+    def _candidate_lights(self) -> list:
+        """Lampu yang boleh dipilih: target dari FSM, atau semua lampu sebelum ada target."""
+        if self._target_light_ids is None:
+            return self._lights
+        return [lt for lt in self._lights if int(lt.way_id) in self._target_light_ids]
+
+    def _reported_light_id(self) -> int:
+        """light_id untuk PedestrianLightState: lampu yang sedang diklasifikasi.
+
+        Mode map memilih lampu sendiri.  Mode lain (force / full / static) tidak tahu lampu
+        mana yang dilihat kamera; diasumsikan lampu target, karena aimer mengarah ke sana.
+        """
+        if self._active_light is not None:
+            return int(self._active_light.way_id)
+        if self._target_light_ids:
+            return self._target_light_ids[0]
+        return 0
+
     def _publish_cb(self):
         # Mode 'force': perilaku mock lama.
         if self._backend == 'force':
@@ -950,8 +1023,8 @@ class PedestrianLightDetectorNode(Node):
             self._publish_cb_map()
             return
 
-        # Mode full / static (Fase 1): perilaku tidak berubah
-        if self._last_frame is None:
+        # Mode full / static (Fase 1)
+        if self._last_frame is None or not self._image_is_fresh():
             self._publish_state(STATE_NONE, 0.0)
             return
 
@@ -998,14 +1071,16 @@ class PedestrianLightDetectorNode(Node):
             self._publish_state(STATE_NONE, 0.0)
             return
 
-        if not self._lights:
-            # Tidak ada lampu di peta
+        candidates = self._candidate_lights()
+        if not candidates:
+            # Tidak ada lampu di peta, atau crossing aktif tidak punya lampu
+            self._active_light = None
             self._publish_state(STATE_NONE, 0.0)
             return
 
         cameras_list = list(self._cam_states.values())
         result = projector_select(
-            self._lights,
+            candidates,
             cameras_list,
             self._tf_buffer,
             self._roi_margin_px,
@@ -1041,6 +1116,9 @@ class PedestrianLightDetectorNode(Node):
                 f'[Fase 2] Menunggu frame dari {sel_cam_name!r}...',
                 throttle_duration_sec=5.0,
             )
+            self._publish_state(STATE_NONE, 0.0)
+            return
+        if not self._image_is_fresh():
             self._publish_state(STATE_NONE, 0.0)
             return
 
@@ -1294,6 +1372,7 @@ class PedestrianLightDetectorNode(Node):
         msg.state = self._force_state
         msg.confidence = self._force_confidence
         msg.blocked = False
+        msg.light_id = self._reported_light_id()
         self._pub.publish(msg)
 
     def _publish_state(self, state: int, confidence: float):
@@ -1308,6 +1387,7 @@ class PedestrianLightDetectorNode(Node):
         msg.state = state
         msg.confidence = confidence
         msg.blocked = False
+        msg.light_id = 0 if state == STATE_NONE else self._reported_light_id()
         self._pub.publish(msg)
 
     # ------------------------------------------------------------------
