@@ -443,7 +443,7 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
     }
 
     // [OVERLAP-TRIM] A route can go out and back over the same ground on overlapping lanelets
-    // (hibikino_kanan: 382 up, 195/188 back down over it).  A window spanning both passes gives a
+    // (hibikino_kanan: 382 up, 195/188 back down over it), or right beside it (347 / 195).  A window spanning both passes gives a
     // path that lies under ego twice: every yaw-matched nearest search downstream then picks the
     // pass whose heading happens to fit -- the other leg when reversing -- and the overlap cut in
     // the planner manager, which assumes the lanes start at ego, fell behind ego on the return
@@ -453,18 +453,52 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
     //  - ahead, stop before the first lanelet that overlaps an earlier one in the window
     //    (the same rule as utils::cutOverlappedLanes(), applied here where ego is known).
     {
+      // Two lanelets of the window conflict when they overlap, or when they run the opposite way
+      // within the nearest-search distance of each other (347 up beside 195 down, 2.5 m apart):
+      // every yaw-matched nearest search -- planner, optimizer, controller, validator -- takes
+      // the leg whose heading fits ego's nose, which is the other leg when reversing.
+      constexpr double kOppositeLegNearM = 3.0;
+      constexpr double kOppositeCos = -0.7;  // more than ~135 deg apart
       const auto overlaps = [](const lanelet::ConstLanelet & a, const lanelet::ConstLanelet & b) {
-        std::vector<autoware_utils::Polygon2d> intersections;
+        const auto poly_a = ::autoware::behavior_path_planner::utils::toPolygon2d(a);
+        const auto poly_b = ::autoware::behavior_path_planner::utils::toPolygon2d(b);
         try {
-          boost::geometry::intersection(
-            ::autoware::behavior_path_planner::utils::toPolygon2d(a),
-            ::autoware::behavior_path_planner::utils::toPolygon2d(b), intersections);
+          std::vector<autoware_utils::Polygon2d> intersections;
+          boost::geometry::intersection(poly_a, poly_b, intersections);
+          if (std::any_of(intersections.begin(), intersections.end(), [](const auto & polygon) {
+                return boost::geometry::area(polygon) > 1e-3;
+              })) {
+            return true;
+          }
+          if (boost::geometry::distance(poly_a, poly_b) > kOppositeLegNearM) {
+            return false;
+          }
         } catch (const std::exception &) {
           return false;  // e.g. a self-intersecting U-turn lanelet polygon
         }
-        return std::any_of(intersections.begin(), intersections.end(), [](const auto & polygon) {
-          return boost::geometry::area(polygon) > 1e-3;
-        });
+        // Direction of travel (centerline of the route-oriented lanelet) where they come closest.
+        const auto ca = a.centerline2d();
+        const auto cb = b.centerline2d();
+        if (ca.size() < 2 || cb.size() < 2) {
+          return false;
+        }
+        double best = std::numeric_limits<double>::max();
+        size_t ia = 0;
+        size_t ib = 0;
+        for (size_t i = 0; i + 1 < ca.size(); ++i) {
+          for (size_t j = 0; j + 1 < cb.size(); ++j) {
+            const double d = (ca[i].basicPoint() - cb[j].basicPoint()).squaredNorm();
+            if (d < best) {
+              best = d;
+              ia = i;
+              ib = j;
+            }
+          }
+        }
+        const lanelet::BasicPoint2d da = ca[ia + 1].basicPoint() - ca[ia].basicPoint();
+        const lanelet::BasicPoint2d db = cb[ib + 1].basicPoint() - cb[ib].basicPoint();
+        const double norm = da.norm() * db.norm();
+        return norm > 1e-9 && da.dot(db) / norm < kOppositeCos;
       };
       const size_t original_begin = begin_idx;
       const size_t original_end = end_idx;
