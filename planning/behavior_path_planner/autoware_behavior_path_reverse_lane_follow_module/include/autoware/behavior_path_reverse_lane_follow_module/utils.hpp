@@ -22,6 +22,7 @@
 
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace autoware::behavior_path_planner::reverse_lane_follow_utils
 {
@@ -426,6 +427,28 @@ void clampVelocityNearEgoWhenCloseToGoal(
 bool isEgoArrivedAndStoppedAtGoal(
   const double distance_to_goal_m, const double ego_speed_mps,
   const double goal_reach_tolerance_m, const double arrived_stop_velocity_mps);
+
+/**
+ * @brief Pick which of the route's chosen lanelets ego is on, by route order rather than heading.
+ *
+ * A route can pass over the same ground twice in opposite directions (out and back on
+ * overlapping lanelets). Ego then lies inside two chosen lanelets at once, and the generic
+ * nearest-lanelet query breaks the tie by comparing each lanelet's direction with ego's nose. When
+ * reversing the nose points against the direction of travel, so that tie-break picks the lanelet
+ * of the *other* leg, and the path is built along it: the robot turns round to follow it.
+ *
+ * Instead: every lanelet within @p tie_tolerance_m of the nearest one is a candidate; keep the
+ * previously picked one while it is still a candidate; otherwise take the first candidate at or
+ * after it in route order (the next lanelet along the route, never a later leg ahead of an earlier
+ * one); with no previous pick, take the earliest candidate in route order.
+ *
+ * @param distances_m distance from ego to each chosen lanelet, in route order
+ * @param previous_index index picked last cycle on this route, if any
+ * @return index into @p distances_m, or nullopt if the nearest is farther than @p max_distance_m
+ */
+std::optional<size_t> selectEgoRouteLaneletIndex(
+  const std::vector<double> & distances_m, const std::optional<size_t> & previous_index,
+  const double tie_tolerance_m, const double max_distance_m);
 
 }  // namespace autoware::behavior_path_planner::reverse_lane_follow_utils
 

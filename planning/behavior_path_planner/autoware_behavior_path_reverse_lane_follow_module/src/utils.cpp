@@ -150,6 +150,23 @@ void dropNonAdvancingPoints(PathWithLaneId & path, const double max_reversal_rad
 // that starts somewhere else.
 constexpr double kMaxEgoDistanceToRouteLaneletM = 3.0;
 
+// Chosen lanelets this much farther from ego than the nearest one still count as "ego is on it":
+// where a route runs out and back over the same ground, both legs' lanelets contain ego.
+constexpr double kEgoLaneletTieToleranceM = 0.5;
+
+// The chosen-lanelet index picked last cycle, per route.  Shared by both callers below (they look
+// up the same ego), reset whenever the route changes.
+struct EgoRouteLaneletMemory
+{
+  std::optional<unique_identifier_msgs::msg::UUID> route_uuid;
+  std::optional<size_t> index;
+};
+EgoRouteLaneletMemory & egoRouteLaneletMemory()
+{
+  static EgoRouteLaneletMemory memory;
+  return memory;
+}
+
 std::optional<lanelet::ConstLanelet> findEgoRouteLanelet(
   const RouteHandler & route_handler, const Pose & ego_pose)
 {
@@ -158,12 +175,34 @@ std::optional<lanelet::ConstLanelet> findEgoRouteLanelet(
     return boost::geometry::distance(ego_point, llt.polygon2d().basicPolygon());
   };
 
-  lanelet::ConstLanelet lanelet;
-  if (
-    route_handler.getClosestPreferredLaneletWithinRoute(ego_pose, &lanelet) &&
-    distance_to(lanelet) <= kMaxEgoDistanceToRouteLaneletM) {
-    return lanelet;
+  // Not getClosestPreferredLaneletWithinRoute: on overlapping out-and-back lanelets its heading
+  // tie-break picks the other leg whenever the robot is reversing (see selectEgoRouteLaneletIndex).
+  const auto preferred = route_handler.getPreferredLanelets();
+  if (!preferred.empty()) {
+    auto & memory = egoRouteLaneletMemory();
+    const auto route_uuid = route_handler.getRouteUuid();
+    if (!memory.route_uuid || *memory.route_uuid != route_uuid) {
+      memory.route_uuid = route_uuid;
+      memory.index.reset();
+    }
+    if (memory.index && *memory.index >= preferred.size()) {
+      memory.index.reset();
+    }
+
+    std::vector<double> distances;
+    distances.reserve(preferred.size());
+    for (const auto & llt : preferred) {
+      distances.push_back(distance_to(llt));
+    }
+    const auto index = selectEgoRouteLaneletIndex(
+      distances, memory.index, kEgoLaneletTieToleranceM, kMaxEgoDistanceToRouteLaneletM);
+    if (index) {
+      memory.index = index;
+      return preferred.at(*index);
+    }
   }
+
+  lanelet::ConstLanelet lanelet;
   if (!route_handler.getClosestLaneletWithinRoute(ego_pose, &lanelet)) {
     return std::nullopt;
   }
@@ -831,6 +870,48 @@ bool isEgoArrivedAndStoppedAtGoal(
   const bool ego_within_goal_tolerance = distance_to_goal_m < goal_reach_tolerance_m;
   const bool ego_genuinely_stopped = std::abs(ego_speed_mps) < arrived_stop_velocity_mps;
   return ego_within_goal_tolerance && ego_genuinely_stopped;
+}
+
+std::optional<size_t> selectEgoRouteLaneletIndex(
+  const std::vector<double> & distances_m, const std::optional<size_t> & previous_index,
+  const double tie_tolerance_m, const double max_distance_m)
+{
+  if (distances_m.empty()) {
+    return std::nullopt;
+  }
+  const double min_distance = *std::min_element(distances_m.begin(), distances_m.end());
+  if (min_distance > max_distance_m) {
+    return std::nullopt;
+  }
+  const auto is_candidate = [&](const size_t i) {
+    return distances_m.at(i) <= min_distance + tie_tolerance_m;
+  };
+
+  if (previous_index && *previous_index < distances_m.size()) {
+    // Still on it: keep it (no flip-flop at seams or between overlapping lanelets).
+    if (is_candidate(*previous_index)) {
+      return previous_index;
+    }
+    // Moved on: the next candidate along the route.
+    for (size_t i = *previous_index + 1; i < distances_m.size(); ++i) {
+      if (is_candidate(i)) {
+        return i;
+      }
+    }
+    // None ahead (ego went backwards along the route): the nearest candidate behind.
+    for (size_t i = *previous_index; i-- > 0;) {
+      if (is_candidate(i)) {
+        return i;
+      }
+    }
+  }
+
+  for (size_t i = 0; i < distances_m.size(); ++i) {
+    if (is_candidate(i)) {
+      return i;
+    }
+  }
+  return std::nullopt;
 }
 
 }  // namespace autoware::behavior_path_planner::reverse_lane_follow_utils
