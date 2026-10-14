@@ -119,8 +119,12 @@ std::optional<size_t> select_ego_segment(
 
   if (previous && *previous < n) {
     const size_t p = *previous;
+    // One back, one ahead -- never further.  Two ahead let ego skip the U-turn lanelet: reversing
+    // along hibikino_kanan's 347, ego drifted within 0.5 m of 195 (the return leg, two segments
+    // on, 1.4 m beside it), was moved onto 195, and the window dropped 347 under it.  At 10 Hz no
+    // lanelet is short enough to be crossed within one cycle; a real jump is a relocalisation.
     const size_t begin = p > 0 ? p - 1 : 0;
-    const size_t end = std::min(n, p + 3);
+    const size_t end = std::min(n, p + 2);
     double local_min = std::numeric_limits<double>::max();
     for (size_t i = begin; i < end; ++i) {
       local_min = std::min(local_min, distances_m.at(i));

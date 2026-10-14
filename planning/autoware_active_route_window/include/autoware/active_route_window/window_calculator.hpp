@@ -48,7 +48,7 @@ ConflictMatrix compute_conflicts(const std::vector<lanelet::ConstLanelet> & segm
 
 /**
  * @brief The segment ego is on, by route order rather than by which lanelet happens to be nearest.
- * @details With a previous pick: look only at it and its route neighbours (one back, two ahead)
+ * @details With a previous pick: look only at it and its route neighbours (one back, one ahead)
  *          and take the furthest along the route within tie_tolerance_m of the nearest of those --
  *          a later pass lying under ego never wins.  When ego is farther than max_drift_m from all
  *          of them (relocalised) the whole route is searched: the first candidate at or after the

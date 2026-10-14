@@ -149,6 +149,14 @@ TEST(SelectEgoSegment, HandsOverAtTheSeam)
   EXPECT_EQ(select_ego_segment(d, 2, 0.5, 1.0, 3.0), std::optional<size_t>(3));
 }
 
+TEST(SelectEgoSegment, NeverSkipsTheUTurnOntoTheParallelReturnLeg)
+{
+  // Reversing along 347 (index 2), drifted to 0.4 m from 195 (index 4, two on, beside it);
+  // 458 (index 3) is 3 m ahead.  Ego stays on 347.
+  const std::vector<double> d{50.0, 15.0, 0.0, 3.0, 0.4, 70.0};
+  EXPECT_EQ(select_ego_segment(d, 2, 0.5, 1.0, 3.0), std::optional<size_t>(2));
+}
+
 TEST(SelectEgoSegment, ReturnLegKeptOverTheOutboundLeg)
 {
   const std::vector<double> d{0.0, 30.0, 50.0, 60.0, 0.9, 0.0};
