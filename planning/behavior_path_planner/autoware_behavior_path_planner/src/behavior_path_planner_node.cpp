@@ -402,6 +402,47 @@ void BehaviorPathPlannerNode::run()
       planner_data_->prev_modified_goal.reset();
     }
   }
+  // active route window: plan on the part of the route ego is on, so a route passing over the
+  // same ground twice never presents both passes at once.  Falls back to the full route without a
+  // fresh window for this route.
+  {
+    if (const auto msg = active_route_window_subscriber_.take_data()) {
+      active_route_window_ = msg;
+    }
+    constexpr double max_window_age_s = 1.0;
+    const auto & route_handler = planner_data_->route_handler;
+    std::optional<std::pair<size_t, size_t>> window;
+    if (
+      active_route_window_ && active_route_window_->valid && route_handler->isHandlerReady() &&
+      (this->now() - rclcpp::Time(active_route_window_->header.stamp)).seconds() <
+        max_window_age_s &&
+      route_handler->setActiveWindow(
+        active_route_window_->route_uuid, active_route_window_->begin_segment,
+        active_route_window_->end_segment)) {
+      window = route_handler->getActiveWindow();
+    } else {
+      route_handler->clearActiveWindow();
+      if (active_route_window_) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 5000,
+          "[NO-ACTIVE-WINDOW] no fresh active route window for this route: planning on the full "
+          "route");
+      }
+    }
+    if (window != applied_route_window_) {
+      applied_route_window_ = window;
+      // The current route lanelet may just have left the window; pick it again inside it.
+      if (route_handler->isHandlerReady()) {
+        planner_manager_->resetCurrentRouteLanelet(planner_data_);
+      }
+      if (window) {
+        RCLCPP_INFO(
+          get_logger(), "[ACTIVE-WINDOW] planning on route segments %zu..%zu", window->first,
+          window->second);
+      }
+    }
+  }
+
   const auto controlled_by_autoware_autonomously =
     planner_data_->operation_mode->mode == OperationModeState::AUTONOMOUS &&
     planner_data_->operation_mode->is_autoware_control_enabled;

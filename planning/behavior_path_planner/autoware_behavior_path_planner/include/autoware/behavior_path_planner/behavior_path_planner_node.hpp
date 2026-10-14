@@ -30,6 +30,7 @@
 #include <autoware_internal_planning_msgs/msg/velocity_limit.hpp>
 #include <autoware_map_msgs/msg/lanelet_map_bin.hpp>
 #include <autoware_perception_msgs/msg/predicted_objects.hpp>
+#include <autoware_active_route_window_msgs/msg/active_route_window.hpp>
 #include <autoware_planning_msgs/msg/lanelet_route.hpp>
 #include <autoware_planning_msgs/msg/path.hpp>
 #include <autoware_planning_msgs/msg/pose_with_uuid_stamped.hpp>
@@ -45,6 +46,8 @@
 
 #include <map>
 #include <memory>
+#include <utility>
+#include <optional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -90,6 +93,13 @@ private:
   autoware_utils::InterProcessPollingSubscriber<
     LaneletRoute, autoware_utils::polling_policy::Newest>
     route_subscriber_{this, "~/input/route", rclcpp::QoS{1}.transient_local()};
+  // The rolling window of the route to plan on (autoware_active_route_window).  Without a fresh
+  // one for this route, the full route is used.
+  autoware_utils::InterProcessPollingSubscriber<
+    autoware_active_route_window_msgs::msg::ActiveRouteWindow>
+    active_route_window_subscriber_{this, "/planning/mission_planning/active_route_window"};
+  autoware_active_route_window_msgs::msg::ActiveRouteWindow::ConstSharedPtr active_route_window_;
+  std::optional<std::pair<size_t, size_t>> applied_route_window_;
   autoware_utils::InterProcessPollingSubscriber<
     LaneletMapBin, autoware_utils::polling_policy::Newest>
     vector_map_subscriber_{this, "~/input/vector_map", rclcpp::QoS{1}.transient_local()};
