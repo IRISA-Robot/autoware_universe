@@ -172,11 +172,21 @@ Window compute_window(
     return i < conflicts.size() && j < conflicts.at(i).size() && conflicts.at(i).at(j);
   };
 
-  // Ahead: stop before a segment that lies over one between ego's and it.
+  // Behind: always backward_m worth.  The lanelets ego has just left carry the drivable area its
+  // body still sweeps -- dropping the one before a tight U-turn the moment ego entered the U-turn
+  // left the footprint outside the drivable area and path_optimizer stopped the robot there.
+  double behind = std::max(0.0, ego_arc_m);
+  for (size_t i = ego_segment; i-- > 0 && behind < backward_m;) {
+    window.begin = i;
+    behind += segment_lengths_m.at(i);
+  }
+
+  // Ahead: stop before a segment that lies over any earlier one in the window.  The cut lifts as
+  // ego moves on and the overlapped segment falls out of the window behind.
   double ahead = std::max(0.0, segment_lengths_m.at(ego_segment) - ego_arc_m);
   for (size_t j = ego_segment + 1; j < n && ahead < forward_m; ++j) {
     bool overlaps_earlier = false;
-    for (size_t i = ego_segment; i + 2 <= j; ++i) {
+    for (size_t i = window.begin; i + 2 <= j; ++i) {
       if (conflict(i, j)) {
         overlaps_earlier = true;
         break;
@@ -187,23 +197,6 @@ Window compute_window(
     }
     window.end = j;
     ahead += segment_lengths_m.at(j);
-  }
-
-  // Behind: stop at a segment that lies under any later one in the window.
-  double behind = std::max(0.0, ego_arc_m);
-  for (size_t i = ego_segment; i-- > 0 && behind < backward_m;) {
-    bool overlaps_later = false;
-    for (size_t j = i + 2; j <= window.end; ++j) {
-      if (conflict(i, j)) {
-        overlaps_later = true;
-        break;
-      }
-    }
-    if (overlaps_later) {
-      break;
-    }
-    window.begin = i;
-    behind += segment_lengths_m.at(i);
   }
   return window;
 }

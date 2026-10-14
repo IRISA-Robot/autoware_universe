@@ -62,10 +62,12 @@ std::optional<size_t> select_ego_segment(
 
 /**
  * @brief The window of segments around ego that contains no two overlapping segments.
- * @details Ahead: segments are added until forward_m is covered, stopping before the first one
- *          that overlaps a segment between ego's and it.  Behind: segments are added until
- *          backward_m is covered, stopping at the first one that overlaps any later segment in the
- *          window.  Ego's own segment is always in the window.
+ * @details Behind: segments are added until backward_m is covered -- always, since they carry
+ *          the drivable area ego's body still sweeps.  Ahead: segments are added until forward_m is
+ *          covered, stopping before the first one that overlaps any earlier segment in the window.
+ *          The cut lifts once the overlapped segment is more than backward_m behind ego, so the
+ *          route needs at least backward_m (plus a braking distance) without overlap before each
+ *          place it comes back over itself.  Ego's own segment is always in the window.
  * @param ego_arc_m how far along its segment ego is
  */
 Window compute_window(

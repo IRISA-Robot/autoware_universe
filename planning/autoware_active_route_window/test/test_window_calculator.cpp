@@ -20,6 +20,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <vector>
 
 namespace
@@ -56,7 +57,7 @@ TEST(ComputeWindow, OutAndBackRouteNeverHoldsBothPasses)
 {
   // Expected windows, cross-checked against a Python prototype on the real map geometry.
   const std::vector<Expect> cases{
-    {0, 0.0, 0, 3},  {0, 91.7, 0, 3}, {1, 0.0, 0, 3},  {1, 15.5, 1, 3}, {2, 0.0, 2, 7},
+    {0, 0.0, 0, 3},  {0, 91.7, 0, 3}, {1, 0.0, 0, 3},  {1, 15.5, 1, 3}, {2, 0.0, 1, 3},
     {2, 20.9, 2, 7}, {3, 2.5, 2, 7},  {4, 0.0, 2, 7},  {4, 45.5, 4, 7}, {5, 27.7, 5, 7},
     {7, 4.8, 5, 7}};
   const auto conflicts = hibikino_conflicts();
@@ -72,6 +73,39 @@ TEST(ComputeWindow, OutAndBackRouteNeverHoldsBothPasses)
     EXPECT_LE(w.begin, c.ego);
     EXPECT_GE(w.end, c.ego);
   }
+}
+
+TEST(ComputeWindow, KeepsTheLaneletJustLeftAndThePathEndClearOfEgo)
+{
+  // Forward over the same route: 0=294 1=303 2=188 3=195 4=458 5=347 6=373 7=382.
+  const std::vector<double> lengths{4.8, 4.1, 55.5, 91.0, 5.1, 20.9, 31.0, 91.7};
+  ConflictMatrix c(8, std::vector<bool>(8, false));
+  const auto set = [&](size_t i, size_t j) { c[i][j] = c[j][i] = true; };
+  set(2, 7);
+  set(3, 6);
+  set(3, 7);
+  // Just inside the U-turn: 195 (just left) stays for the drivable area, the cut is at 373.
+  auto w = compute_window(4, 0.5, lengths, c, 10.0, 300.0);
+  EXPECT_EQ(w.begin, 3u);
+  EXPECT_EQ(w.end, 5u);
+  // Walking the route in 0.5 m steps, whenever the window is cut short its end stays well ahead.
+  double closest_cut_end = 1e9;
+  for (size_t k = 0; k < lengths.size(); ++k) {
+    for (double arc = 0.0; arc <= lengths[k]; arc += 0.5) {
+      w = compute_window(k, arc, lengths, c, 10.0, 300.0);
+      if (w.end + 1 < lengths.size()) {
+        double ahead = lengths[k] - arc;
+        for (size_t j = k + 1; j <= w.end; ++j) ahead += lengths[j];
+        closest_cut_end = std::min(closest_cut_end, ahead);
+      }
+      for (size_t i = w.begin; i <= w.end; ++i) {
+        for (size_t j = i + 1; j <= w.end; ++j) {
+          EXPECT_FALSE(c[i][j]) << "segments " << i << "/" << j << " ego " << k << " arc " << arc;
+        }
+      }
+    }
+  }
+  EXPECT_GT(closest_cut_end, 15.0);
 }
 
 TEST(ComputeWindow, NothingOverlapsMeansTheWholeRouteAhead)
