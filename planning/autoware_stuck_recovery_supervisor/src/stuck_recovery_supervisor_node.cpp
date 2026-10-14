@@ -2517,6 +2517,50 @@ bool StuckRecoverySupervisorNode::capture_reference_path()
   return capture_reference_path_from_trajectory();
 }
 
+bool StuckRecoverySupervisorNode::find_ego_route_lanelet(lanelet::ConstLanelet * lanelet) const
+{
+  if (!odom_) {
+    return false;
+  }
+  const auto & ego_pose = odom_->pose.pose;
+
+  // getClosestLaneletWithinRoute() goes by distance alone.  Where the route's outbound and
+  // return legs overlap (hibikino_kanan: 382 down over 195, 188 over 382) both lie under ego at
+  // distance 0 and it returned the leg running the other way: the reference path, and every
+  // escape goal along it, pointed back the way the robot had come -- recovery backed the robot
+  // up behind the obstacle, handed back, met the obstacle again, and looped.
+  //
+  // Take the direction lane driving is taking ego -- the order of the trajectory's points at
+  // ego, which is the direction of travel whatever convention their yaw is written in -- and
+  // the route lanelet running that way (route lanelets are already oriented the way the route
+  // runs them).
+  if (trajectory_ && trajectory_->points.size() >= 2) {
+    std::vector<geometry_msgs::msg::Pose> poses;
+    poses.reserve(trajectory_->points.size());
+    for (const auto & point : trajectory_->points) {
+      poses.push_back(point.pose);
+    }
+    if (const auto nearest = find_nearest_index(poses, ego_pose)) {
+      const size_t i = std::min(*nearest, poses.size() - 2);
+      const auto & p0 = poses.at(i).position;
+      const auto & p1 = poses.at(i + 1).position;
+      if (std::hypot(p1.x - p0.x, p1.y - p0.y) > 1e-3) {
+        tf2::Quaternion travel_q;
+        travel_q.setRPY(0.0, 0.0, std::atan2(p1.y - p0.y, p1.x - p0.x));
+        auto travel_pose = ego_pose;
+        travel_pose.orientation = tf2::toMsg(travel_q);
+        constexpr double max_distance_m = 3.0;
+        constexpr double max_yaw_rad = M_PI / 3.0;
+        if (route_handler_.getClosestLaneletWithConstrainsWithinRoute(
+              travel_pose, lanelet, max_distance_m, max_yaw_rad)) {
+          return true;
+        }
+      }
+    }
+  }
+  return route_handler_.getClosestLaneletWithinRoute(ego_pose, lanelet);
+}
+
 bool StuckRecoverySupervisorNode::capture_reference_path_from_centerline()
 {
   if (!odom_ || !map_ready_ || !route_handler_ready_) {
@@ -2524,7 +2568,7 @@ bool StuckRecoverySupervisorNode::capture_reference_path_from_centerline()
   }
 
   lanelet::ConstLanelet current_lane;
-  if (!route_handler_.getClosestLaneletWithinRoute(odom_->pose.pose, &current_lane)) {
+  if (!find_ego_route_lanelet(&current_lane)) {
     return false;
   }
 
@@ -3655,7 +3699,7 @@ void StuckRecoverySupervisorNode::select_preset_for_episode()
   constexpr const char * kTag = "recovery_used";
 
   lanelet::ConstLanelet ego_lanelet;
-  if (!route_handler_.getClosestLaneletWithinRoute(odom_->pose.pose, &ego_lanelet)) {
+  if (!find_ego_route_lanelet(&ego_lanelet)) {
     RCLCPP_INFO(
       get_logger(), "[episode %u] no lanelet under ego; recovery preset \"%s\"", episode_id_,
       presets_.front().name.c_str());

@@ -489,6 +489,9 @@ private:
   /// Reference path from the lanelet centerline, biased by prefer_lateral_ratio.  Returns
   /// false when the map or route are not available yet, so the caller can fall back.
   bool capture_reference_path_from_centerline();
+  /// The route lanelet ego is on, picked to run the way lane driving is taking ego where route
+  /// lanelets overlap (an out-and-back route: the outbound and return legs both lie under ego).
+  bool find_ego_route_lanelet(lanelet::ConstLanelet * lanelet) const;
   /// Reference path copied from the last lane-driving trajectory.  The original behaviour,
   /// kept as the fallback for when the map is not up yet.
   bool capture_reference_path_from_trajectory();
