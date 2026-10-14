@@ -27,6 +27,7 @@
 #include <autoware_utils/ros/published_time_publisher.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <optional>
 #include <string>
@@ -49,6 +50,17 @@ private:
   public:
     bool isDrivingForward(const std::vector<PathPoint> & path_points)
     {
+      // The velocity sign says which way the robot moves; trust it first.  reverse_lane_follow's
+      // paths carry yaw = direction of travel with negative velocity, so the yaw test below calls
+      // them forward and the elastic band was optimised and cropped around ego as a forward path
+      // -- the same mistake that made path_optimizer cut a reversing path onto the return leg of
+      // hibikino_kanan's U-turn.  Backward paths pass straight through, as upstream intends.
+      for (const auto & p : path_points) {
+        if (std::abs(p.longitudinal_velocity_mps) > 1e-3) {
+          is_driving_forward_ = p.longitudinal_velocity_mps > 0.0;
+          return is_driving_forward_;
+        }
+      }
       const auto is_driving_forward = autoware::motion_utils::isDrivingForward(path_points);
       is_driving_forward_ = is_driving_forward ? is_driving_forward.value() : is_driving_forward_;
       return is_driving_forward_;
