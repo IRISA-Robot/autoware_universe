@@ -171,6 +171,20 @@ std::vector<double> calcTrajectoryCurvature(
   const int curvature_smoothing_num, const MPCTrajectory & traj);
 
 /**
+ * @brief index of the point nearest to self_pose among ALL points within max_dist [m] and
+ * max_yaw [rad] of it, compared with the stored yaw (the MPC reference holds the body heading in
+ * both driving directions).  Falls back to motion_utils::findFirstNearestIndexWithSoftConstraints
+ * when no point conforms.
+ * @note findFirstNearestIndexWithSoftConstraints returns the nearest point of the FIRST
+ * contiguous run of conforming points.  Past the apex of a tight corner the leg leading into it
+ * is still within max_dist and max_yaw, and a small wiggle in the path splits the run, so that
+ * "first run" was the leg behind the robot (lanelet 303: 2.0 m back, yaw error 63 deg).
+ */
+size_t findNearestConformingIndex(
+  const MPCTrajectory & traj, const Pose & self_pose, const double max_dist,
+  const double max_yaw);
+
+/**
  * @brief calculate nearest pose on MPCTrajectory with linear interpolation
  * @param [in] traj reference trajectory
  * @param [in] self_pose object pose

@@ -22,7 +22,9 @@
 
 #include <algorithm>
 #include <iostream>
+#include <cmath>
 #include <limits>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -337,6 +339,34 @@ void dynamicSmoothingVelocity(
   calcMPCTrajectoryTime(traj);
 }
 
+size_t findNearestConformingIndex(
+  const MPCTrajectory & traj, const Pose & self_pose, const double max_dist,
+  const double max_yaw)
+{
+  const double self_yaw = tf2::getYaw(self_pose.orientation);
+  const double squared_max_dist = max_dist * max_dist;
+  std::optional<size_t> nearest_index;
+  double min_squared_dist = std::numeric_limits<double>::max();
+  for (size_t i = 0; i < traj.size(); ++i) {
+    const double dx = traj.x.at(i) - self_pose.position.x;
+    const double dy = traj.y.at(i) - self_pose.position.y;
+    const double squared_dist = dx * dx + dy * dy;
+    if (squared_dist > squared_max_dist || squared_dist >= min_squared_dist) {
+      continue;
+    }
+    if (std::abs(normalize_radian(traj.yaw.at(i) - self_yaw)) > max_yaw) {
+      continue;
+    }
+    min_squared_dist = squared_dist;
+    nearest_index = i;
+  }
+  if (nearest_index) {
+    return *nearest_index;
+  }
+  return autoware::motion_utils::findFirstNearestIndexWithSoftConstraints(
+    convertToAutowareTrajectory(traj).points, self_pose, max_dist, max_yaw);
+}
+
 bool calcNearestPoseInterp(
   const MPCTrajectory & traj, const Pose & self_pose, Pose * nearest_pose, size_t * nearest_index,
   double * nearest_time, const double max_dist, const double max_yaw)
@@ -345,16 +375,7 @@ bool calcNearestPoseInterp(
     return false;
   }
 
-  const auto autoware_traj = convertToAutowareTrajectory(traj);
-  if (autoware_traj.points.empty()) {
-    const auto logger = rclcpp::get_logger("mpc_util");
-    auto clock = rclcpp::Clock(RCL_ROS_TIME);
-    RCLCPP_WARN_THROTTLE(logger, clock, 5000, "[calcNearestPoseInterp] input trajectory is empty");
-    return false;
-  }
-
-  *nearest_index = autoware::motion_utils::findFirstNearestIndexWithSoftConstraints(
-    autoware_traj.points, self_pose, max_dist, max_yaw);
+  *nearest_index = findNearestConformingIndex(traj, self_pose, max_dist, max_yaw);
   const size_t traj_size = traj.size();
 
   if (traj.size() == 1) {

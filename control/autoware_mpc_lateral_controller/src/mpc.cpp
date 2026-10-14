@@ -910,10 +910,8 @@ double MPC::getPredictionDeltaTime(
   const double start_time, const MPCTrajectory & input, const Odometry & current_kinematics) const
 {
   // Calculate the time min_prediction_length ahead from current_pose
-  const auto autoware_traj = MPCUtils::convertToAutowareTrajectory(input);
-  const size_t nearest_idx = autoware::motion_utils::findFirstNearestIndexWithSoftConstraints(
-    autoware_traj.points, current_kinematics.pose.pose, ego_nearest_dist_threshold,
-    ego_nearest_yaw_threshold);
+  const size_t nearest_idx = MPCUtils::findNearestConformingIndex(
+    input, current_kinematics.pose.pose, ego_nearest_dist_threshold, ego_nearest_yaw_threshold);
   double sum_dist = 0;
   const double target_time = [&]() {
     const double t_ext = 100.0;  // extra time to prevent mpc calculation failure due to short time
