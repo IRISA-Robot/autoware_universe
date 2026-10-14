@@ -126,6 +126,15 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
     rclcpp::QoS(1).transient_local(),
     std::bind(&RoadCrossingFsmNode::onRoute, this, std::placeholders::_1));
 
+  sub_active_route_window_ =
+    create_subscription<autoware_active_route_window_msgs::msg::ActiveRouteWindow>(
+      declare_parameter<std::string>(
+        "topic_active_route_window", "/planning/mission_planning/active_route_window"),
+      rclcpp::QoS(1),
+      [this](const autoware_active_route_window_msgs::msg::ActiveRouteWindow::ConstSharedPtr msg) {
+        active_route_window_ = msg;
+      });
+
   // Map: transient_local (published once at startup)
   sub_map_ = create_subscription<autoware_map_msgs::msg::LaneletMapBin>(
     param_.topic_map,
@@ -372,12 +381,29 @@ void RoadCrossingFsmNode::updateDrivingDirection()
   }
 }
 
+bool RoadCrossingFsmNode::egoRouteLanelet(lanelet::ConstLanelet * lanelet) const
+{
+  if (!last_odom_ || !route_initialized_) return false;
+  constexpr double max_window_age_s = 1.0;
+  const auto & w = active_route_window_;
+  if (
+    w && w->valid && w->route_uuid == route_handler_.getRouteUuid() &&
+    (now() - rclcpp::Time(w->header.stamp)).seconds() < max_window_age_s &&
+    route_handler_.getLaneletMapPtr() &&
+    route_handler_.getLaneletMapPtr()->laneletLayer.exists(w->ego_lanelet_id)) {
+    // Oriented the way the route runs it (getLaneletsFromId re-applies the route's direction).
+    *lanelet = route_handler_.getLaneletsFromId(w->ego_lanelet_id);
+    return true;
+  }
+  return route_handler_.getClosestLaneletWithinRoute(last_odom_->pose.pose, lanelet);
+}
+
 std::optional<bool> RoadCrossingFsmNode::deriveDrivingDirectionFromRoute() const
 {
   if (!last_odom_ || !route_initialized_) return std::nullopt;
 
   lanelet::ConstLanelet cur;
-  if (!route_handler_.getClosestLaneletWithinRoute(last_odom_->pose.pose, &cur)) {
+  if (!egoRouteLanelet(&cur)) {
     return std::nullopt;
   }
 
@@ -486,7 +512,7 @@ void RoadCrossingFsmNode::onTimer()
     // sequence) so the check is topology-exact, not a velocity/distance heuristic.
     bool at_pre = false;
     lanelet::ConstLanelet cur;
-    if (last_odom_ && route_handler_.getClosestLaneletWithinRoute(last_odom_->pose.pose, &cur)) {
+    if (last_odom_ && egoRouteLanelet(&cur)) {
       bool cur_is_pre = (cur.attributeOr("pre_road_crossing", std::string("false")) == "true");
       if (cur_is_pre) {
         for (size_t i = 0; i + 1 < route_lanelets_.size(); ++i) {
@@ -1353,7 +1379,7 @@ bool RoadCrossingFsmNode::checkArmCondition()
   }
 
   lanelet::ConstLanelet cur;
-  if (!route_handler_.getClosestLaneletWithinRoute(last_odom_->pose.pose, &cur)) {
+  if (!egoRouteLanelet(&cur)) {
     return false;
   }
   for (size_t i = 0; i + 1 < route_lanelets_.size(); ++i) {
@@ -1611,7 +1637,7 @@ bool RoadCrossingFsmNode::egoLeftPreLanelet() const
   if (!map_initialized_ || !route_initialized_) return false;
 
   lanelet::ConstLanelet cur;
-  if (!route_handler_.getClosestLaneletWithinRoute(last_odom_->pose.pose, &cur)) {
+  if (!egoRouteLanelet(&cur)) {
     // Cannot resolve current lanelet — conservatively say not yet departed.
     return false;
   }
@@ -1642,7 +1668,7 @@ std::optional<lanelet::ConstLanelet> RoadCrossingFsmNode::findAlternateInNextBra
   //   2. Fallback A (pre in route but at index 0, or map lookup fails):
   //      use getPreviousLanelets(pre) — same as before.
   //   3. Fallback B (no active pre — crossing-only map):
-  //      use ego's current lanelet via getClosestLaneletWithinRoute.
+  //      use ego's current lanelet via egoRouteLanelet().
   //   4. For each parent candidate, scan getNextLanelets(parent) 1 level only.
   //      Return the first next lanelet tagged "alternate_road_crossing"=="true"
   //      AND NOT in reroute_blocklist_.
@@ -1707,7 +1733,7 @@ std::optional<lanelet::ConstLanelet> RoadCrossingFsmNode::findAlternateInNextBra
   // Fallback B: no active pre (crossing-only map) → use ego's current lanelet.
   if (parents.empty() && last_odom_) {
     lanelet::ConstLanelet ego_llt;
-    if (route_handler_.getClosestLaneletWithinRoute(last_odom_->pose.pose, &ego_llt)) {
+    if (egoRouteLanelet(&ego_llt)) {
       parents.push_back(ego_llt);
       RCLCPP_DEBUG(
         get_logger(),

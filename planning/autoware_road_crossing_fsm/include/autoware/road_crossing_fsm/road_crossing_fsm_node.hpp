@@ -25,6 +25,7 @@
 
 #include <autoware_internal_debug_msgs/msg/int32_stamped.hpp>
 #include <autoware_map_msgs/msg/lanelet_map_bin.hpp>
+#include <autoware_active_route_window_msgs/msg/active_route_window.hpp>
 #include <autoware_planning_msgs/msg/lanelet_route.hpp>
 #include <autoware_road_crossing_msgs/msg/pedestrian_light_state.hpp>
 #include <autoware_road_crossing_msgs/msg/pedestrian_light_target.hpp>
@@ -171,6 +172,11 @@ private:
   rclcpp::Subscription<autoware_road_crossing_msgs::msg::PedestrianLightState>::SharedPtr
     sub_ped_light_;
   rclcpp::Subscription<autoware_planning_msgs::msg::LaneletRoute>::SharedPtr sub_route_;
+  // Where ego is on the route, from autoware_active_route_window: on an out-and-back route over
+  // overlapping lanelets the closest route lanelet can belong to the other pass.
+  rclcpp::Subscription<autoware_active_route_window_msgs::msg::ActiveRouteWindow>::SharedPtr
+    sub_active_route_window_;
+  autoware_active_route_window_msgs::msg::ActiveRouteWindow::ConstSharedPtr active_route_window_;
   rclcpp::Subscription<autoware_map_msgs::msg::LaneletMapBin>::SharedPtr sub_map_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
   // Subscriber output rotary aimer — untuk deteksi aimer sudah running (spam-enable).
@@ -282,6 +288,10 @@ private:
   // (this node has no Trajectory/Path subscription, only the route). Returns
   // nullopt if it cannot be determined (e.g. ego not resolvable on route).
   std::optional<bool> deriveDrivingDirectionFromRoute() const;
+
+  // The route lanelet ego is on: the active route window's, when a fresh valid one exists for
+  // this route, else the closest route lanelet (the previous behaviour).
+  bool egoRouteLanelet(lanelet::ConstLanelet * lanelet) const;
 
   // Ordered sequence of lanelet IDs extracted from the mission-planner route.
   // Populated in onRoute() from msg->segments[i].preferred_primitive.id (in route order).
