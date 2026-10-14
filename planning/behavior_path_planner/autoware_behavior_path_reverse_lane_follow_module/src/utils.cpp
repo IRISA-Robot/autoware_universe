@@ -78,6 +78,8 @@ bool isHeadingContinuousAcross(
   return diff < kMaxContinuousHeadingChangeRad;
 }
 
+}  // namespace
+
 // [SEAM-FOLD 2026-09-17] Drop points that do not advance along the path.
 //
 // getCenterLinePath() concatenates the centreline of each lanelet in the sequence end to end, and
@@ -101,44 +103,88 @@ bool isHeadingContinuousAcross(
 // already being travelled.  At the ~1 m point spacing these centrelines use, no legitimate curve
 // on a vehicle that cannot rotate in place comes close to that, so only true backtracking is
 // removed.
-void dropNonAdvancingPoints(PathWithLaneId & path, const double max_reversal_rad)
+//
+// [SEAM-FOLD 2026-10-14] Two guards against the filter itself eating the path.  Measured on
+// hibikino_kanan 333 -> 322: a 0.26 m sideways step at the seam was accepted, its direction (117 deg
+// against 196 deg of travel) became the reference, every point of the straight 322 then read as
+// "behind", and 60 m of path were deleted -- the planner splined straight across the gap and off
+// the lane.
+//  - The direction of travel is taken over the last min_heading_baseline [m] of kept path, so one
+//    short step cannot re-aim it.
+//  - A seam overlap is about a metre.  A run of dropped points longer than max_drop_length [m] is
+//    not an overlap; it is put back and reported instead of silently deleted.
+SeamFoldResult dropNonAdvancingPoints(
+  PathWithLaneId & path, const double max_reversal_rad, const double min_heading_baseline,
+  const double max_drop_length)
 {
   constexpr double min_step_length = 1.0e-3;
+  SeamFoldResult result;
   if (path.points.size() < 3) {
-    return;
+    return result;
   }
 
-  std::vector<autoware_internal_planning_msgs::msg::PathPointWithLaneId> kept;
+  using Point = autoware_internal_planning_msgs::msg::PathPointWithLaneId;
+  std::vector<Point> kept;
   kept.reserve(path.points.size());
   kept.push_back(path.points.front());
 
-  std::optional<double> travel_dir;
+  // direction from the kept point at least min_heading_baseline behind the last one (or the
+  // first kept point) to the last one
+  const auto travel_direction = [&]() -> std::optional<double> {
+    const auto & last = kept.back().point.pose.position;
+    for (size_t j = kept.size() - 1; j-- > 0;) {
+      const auto & p = kept.at(j).point.pose.position;
+      const double dist = std::hypot(last.x - p.x, last.y - p.y);
+      if (dist >= min_heading_baseline || j == 0) {
+        if (dist < min_step_length) {
+          return std::nullopt;
+        }
+        return std::atan2(last.y - p.y, last.x - p.x);
+      }
+    }
+    return std::nullopt;
+  };
+
+  std::vector<Point> pending;  // dropped since the last kept point
+  double pending_length = 0.0;
   for (size_t i = 1; i < path.points.size(); ++i) {
     const auto & from = kept.back().point.pose.position;
     const auto & to = path.points[i].point.pose.position;
     const double dx = to.x - from.x;
     const double dy = to.y - from.y;
-    const double ds = std::hypot(dx, dy);
-    if (ds < min_step_length) {
+    if (std::hypot(dx, dy) < min_step_length) {
       continue;  // duplicate of the point already kept
     }
-    const double dir = std::atan2(dy, dx);
-    if (travel_dir) {
-      const double raw = dir - *travel_dir;
-      if (std::abs(std::atan2(std::sin(raw), std::cos(raw))) > max_reversal_rad) {
-        continue;  // this point lies behind the one already kept -- a seam overlap
+    const auto dir = travel_direction();
+    const double raw = dir ? std::atan2(dy, dx) - *dir : 0.0;
+    if (dir && std::abs(std::atan2(std::sin(raw), std::cos(raw))) > max_reversal_rad) {
+      // this point lies behind the one already kept -- a seam overlap, unless it goes on too long
+      if (!pending.empty()) {
+        const auto & q = pending.back().point.pose.position;
+        pending_length += std::hypot(to.x - q.x, to.y - q.y);
       }
+      pending.push_back(path.points[i]);
+      if (pending_length > max_drop_length) {
+        result.restored += pending.size();
+        kept.insert(kept.end(), pending.begin(), pending.end());
+        pending.clear();
+        pending_length = 0.0;
+      }
+      continue;
     }
-    travel_dir = dir;
+    result.dropped += pending.size();
+    pending.clear();
+    pending_length = 0.0;
     kept.push_back(path.points[i]);
   }
+  result.dropped += pending.size();  // a fold at the very end
 
   if (kept.size() >= 2) {
     path.points = std::move(kept);
   }
+  return result;
 }
 
-}  // namespace
 
 std::optional<TraveledTail> extractTraveledTailPath(
   const std::shared_ptr<RouteHandler> & route_handler, const Pose & ego_pose,
@@ -397,13 +443,23 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
   // dropNonAdvancingPoints() for the measured geometry and why nothing downstream would catch it.
   {
     const size_t before = path.points.size();
-    dropNonAdvancingPoints(path, M_PI / 2.0);
-    if (path.points.size() != before) {
+    constexpr double min_heading_baseline = 1.0;  // [m]
+    constexpr double max_drop_length = 2.0;       // [m]
+    const auto fold =
+      dropNonAdvancingPoints(path, M_PI / 2.0, min_heading_baseline, max_drop_length);
+    if (fold.dropped > 0) {
       RCLCPP_WARN_THROTTLE(
         logger, steady_clock, 2000,
         "[SEAM-FOLD] dropped %zu point(s) that stepped backwards where the lanelet centrelines "
         "overlap; path %zu -> %zu points",
-        before - path.points.size(), before, path.points.size());
+        fold.dropped, before, path.points.size());
+    }
+    if (fold.restored > 0) {
+      RCLCPP_WARN_THROTTLE(
+        logger, steady_clock, 2000,
+        "[SEAM-FOLD] kept %zu point(s) that read as backwards for more than %.1f m: that is not a "
+        "seam overlap, so the path is left as built",
+        fold.restored, max_drop_length);
     }
   }
 

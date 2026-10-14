@@ -222,6 +222,24 @@ bool shouldSuppressReversedFollowReactivation(
  */
 void truncatePathAtGoal(PathWithLaneId & path, const Pose & goal_pose);
 
+struct SeamFoldResult
+{
+  size_t dropped{0};   // points removed as a backward step at a lanelet seam
+  size_t restored{0};  // points that read as backwards for too long and were kept
+};
+
+/**
+ * @brief remove points that step backwards where two lanelet centrelines overlap at a seam.
+ *
+ * A point is dropped when the step to it turns more than max_reversal_rad away from the
+ * direction of travel, taken over the last min_heading_baseline [m] of kept path.  A run of
+ * dropped points longer than max_drop_length [m] is not a seam overlap: it is kept and counted
+ * in `restored`.
+ */
+SeamFoldResult dropNonAdvancingPoints(
+  PathWithLaneId & path, const double max_reversal_rad, const double min_heading_baseline,
+  const double max_drop_length);
+
 /**
  * @brief [BIDIR-BUG-FIX #5] Cap the magnitude of every point's longitudinal velocity in `path` at
  * `cruise_velocity_mps`, preserving sign and never *increasing* any point's speed.

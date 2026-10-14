@@ -29,6 +29,7 @@
 
 #include <cmath>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace
@@ -37,6 +38,7 @@ using autoware::behavior_path_planner::reverse_lane_follow_utils::applyGoalDecel
 using autoware::behavior_path_planner::reverse_lane_follow_utils::capReverseFollowCruiseVelocity;
 using autoware::behavior_path_planner::reverse_lane_follow_utils::clampVelocityNearEgoWhenCloseToGoal;
 using autoware::behavior_path_planner::reverse_lane_follow_utils::densifyPathNearGoal;
+using autoware::behavior_path_planner::reverse_lane_follow_utils::dropNonAdvancingPoints;
 using autoware::behavior_path_planner::reverse_lane_follow_utils::isEgoArrivedAndStoppedAtGoal;
 using autoware::behavior_path_planner::reverse_lane_follow_utils::reversePathForRetrace;
 using autoware::behavior_path_planner::reverse_lane_follow_utils::
@@ -73,6 +75,19 @@ lanelet::ConstLanelet makeLaneletWithId(const lanelet::Id id)
     id * 100 + 2,
     {lanelet::Point3d(id * 100 + 5, 0.0, 1.0, 0.0), lanelet::Point3d(id * 100 + 6, 1.0, 1.0, 0.0)});
   return lanelet::Lanelet(id, left, right);
+}
+
+PathWithLaneId makeXYPath(const std::vector<std::pair<double, double>> & xys)
+{
+  PathWithLaneId path;
+  for (const auto & [x, y] : xys) {
+    PathPointWithLaneId p;
+    p.point.pose.position.x = x;
+    p.point.pose.position.y = y;
+    p.point.pose.orientation.w = 1.0;
+    path.points.push_back(p);
+  }
+  return path;
 }
 
 Pose makePose(const double x, const double y)
@@ -741,4 +756,52 @@ int main(int argc, char ** argv)
 {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
+}
+
+// hibikino_kanan 67 -> 333 -> 322 reversed, as route_handler built it before the seam ratio fix:
+// 333 ends biased 0.26 m to one side, 322 starts on its centreline, then runs straight on.
+TEST(DropNonAdvancingPoints, SidewaysSeamStepDoesNotDeleteTheNextLanelet)
+{
+  std::vector<std::pair<double, double>> xys = {
+    {282.35, 78.95}, {281.65, 78.53}, {280.89, 78.30}, {280.12, 78.07},
+    {279.35, 77.85}, {278.59, 77.62}, {277.82, 77.40}, {277.70, 77.63}};
+  for (int i = 1; i <= 50; ++i) {  // 322: straight, ~1 m apart, heading about -152 deg
+    xys.emplace_back(277.70 - 0.883 * i, 77.63 - 0.470 * i);
+  }
+  auto path = makeXYPath(xys);
+  const auto result = dropNonAdvancingPoints(path, M_PI / 2.0, 1.0, 2.0);
+
+  EXPECT_LE(result.dropped, 1u);
+  EXPECT_EQ(result.restored, 0u);
+  EXPECT_GE(path.points.size(), xys.size() - 1);
+  EXPECT_DOUBLE_EQ(path.points.back().point.pose.position.x, xys.back().first);
+}
+
+// lanelet 206 -> 21: the next centreline begins 0.85 m behind where the previous one ends
+TEST(DropNonAdvancingPoints, DropsTheBackwardStepOfAnOverlappingSeam)
+{
+  std::vector<std::pair<double, double>> xys;
+  for (int i = 0; i <= 10; ++i) xys.emplace_back(1.0 * i, 0.0);    // ends at x = 10
+  for (int i = 0; i <= 10; ++i) xys.emplace_back(9.15 + 0.5 * i, 0.0);  // restarts at x = 9.15
+  auto path = makeXYPath(xys);
+  const auto result = dropNonAdvancingPoints(path, M_PI / 2.0, 1.0, 2.0);
+
+  EXPECT_EQ(result.dropped, 2u);  // x = 9.15 and 9.65
+  EXPECT_EQ(result.restored, 0u);
+  for (size_t i = 1; i < path.points.size(); ++i) {
+    EXPECT_GT(path.points.at(i).point.pose.position.x, path.points.at(i - 1).point.pose.position.x);
+  }
+}
+
+TEST(DropNonAdvancingPoints, KeepsALongBackwardRunInsteadOfDeletingIt)
+{
+  std::vector<std::pair<double, double>> xys;
+  for (int i = 0; i <= 10; ++i) xys.emplace_back(1.0 * i, 0.0);
+  for (int i = 1; i <= 6; ++i) xys.emplace_back(10.0 - 1.0 * i, 0.3);  // 6 m back: not a seam
+  auto path = makeXYPath(xys);
+  const auto result = dropNonAdvancingPoints(path, M_PI / 2.0, 1.0, 2.0);
+
+  EXPECT_EQ(result.dropped, 0u);
+  EXPECT_GT(result.restored, 0u);
+  EXPECT_EQ(path.points.size(), xys.size());
 }
