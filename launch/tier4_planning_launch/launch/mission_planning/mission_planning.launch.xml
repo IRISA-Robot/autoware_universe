@@ -1,6 +1,7 @@
 <launch>
   <arg name="mission_planner_param_path" default="$(find-pkg-share autoware_mission_planner_universe)/config/mission_planner.param.yaml"/>
   <arg name="allow_reverse_route" default="false"/>
+  <arg name="launch_active_route_window" default="true"/>
   <group>
     <include file="$(find-pkg-share autoware_mission_planner_universe)/launch/mission_planner.launch.xml">
       <arg name="mission_planner_param_path" value="$(var mission_planner_param_path)"/>
@@ -9,5 +10,11 @@
   </group>
   <group>
     <include file="$(find-pkg-share autoware_mission_planner_universe)/launch/goal_pose_visualizer.launch.xml"/>
+  </group>
+  <!-- The rolling window of the route that the planners use: on a route passing over the same
+       ground twice (out and back over overlapping lanelets) only ego's own pass is active.
+       Without it, every consumer falls back to the full route. -->
+  <group if="$(var launch_active_route_window)">
+    <include file="$(find-pkg-share autoware_active_route_window)/launch/active_route_window.launch.xml"/>
   </group>
 </launch>
