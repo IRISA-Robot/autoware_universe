@@ -626,5 +626,15 @@ TEST(TrajectoryCheckerModule, DiagCheckYawDeviation)
       runWithBadTrajectory(straight_trajectory, ego_odom, accel, diag_name);
     }
   }
+  // Reversing trajectory whose yaw is the direction of travel: ego's nose points the other way
+  // -> must be OK
+  {
+    const auto reverse_trajectory = generateTrajectory(1.0, -1.0, 0.0, 10);
+    auto ego_odom = generateDefaultOdometry(0.0, 0.0, 0.0);
+    for (auto yaw = -0.5; yaw <= 0.5; yaw += 0.1) {
+      ego_odom.pose.pose.orientation = autoware_utils::create_quaternion_from_yaw(M_PI + yaw);
+      runWithOKTrajectory(reverse_trajectory, ego_odom, accel, diag_name);
+    }
+  }
 }
 }  // namespace autoware::planning_validator

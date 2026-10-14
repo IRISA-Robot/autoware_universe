@@ -25,6 +25,8 @@
 
 #include <angles/angles/angles.h>
 
+#include <algorithm>
+#include <cmath>
 #include <memory>
 #include <string>
 
@@ -618,10 +620,16 @@ bool TrajectoryChecker::check_valid_yaw_deviation()
 
   const auto interpolated_trajectory_point =
     motion_utils::calcInterpolatedPoint(trajectory, ego_pose);
-  status->yaw_deviation = std::abs(
-    angles::shortest_angular_distance(
-      tf2::getYaw(interpolated_trajectory_point.pose.orientation),
-      tf2::getYaw(ego_pose.orientation)));
+  const double trajectory_yaw = tf2::getYaw(interpolated_trajectory_point.pose.orientation);
+  const double ego_yaw = tf2::getYaw(ego_pose.orientation);
+  status->yaw_deviation = std::abs(angles::shortest_angular_distance(trajectory_yaw, ego_yaw));
+  // A reversing point may carry the body heading or the direction of travel (reverse_lane_follow
+  // writes the latter), which is ego's heading turned by pi; either one is aligned with ego.
+  if (interpolated_trajectory_point.longitudinal_velocity_mps < 0.0) {
+    status->yaw_deviation = std::min(
+      status->yaw_deviation,
+      std::abs(angles::shortest_angular_distance(trajectory_yaw, ego_yaw + M_PI)));
+  }
 
   const auto check_condition =
     !data->last_valid_trajectory ||
