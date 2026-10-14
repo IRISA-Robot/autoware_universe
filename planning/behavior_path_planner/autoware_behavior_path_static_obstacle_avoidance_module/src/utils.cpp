@@ -1461,7 +1461,25 @@ double getRoadShoulderDistance(
   const auto object_closest_pose = data.reference_path.points.at(object_closest_index).point.pose;
 
   const auto rh = planner_data->route_handler;
-  if (!rh->getClosestLaneletWithinRoute(object_closest_pose, &object.overhang_lanelet)) {
+  // The lanelet the reference path itself runs along at the object, taken from that path point's
+  // lane ids: the path is built from the route sequence, so this is the leg ego is on, oriented
+  // the way the route runs it.  getClosestLaneletWithinRoute() goes by distance alone, and where
+  // the route's outbound and return legs overlap (hibikino_kanan: 382 down over 195) it could
+  // return the leg running the other way.  Its centreline orientation below then points the
+  // lateral search the wrong way, the shoulder distance comes out wrong, and an avoidable object
+  // was judged to leave no room (avoid_margin unset): ego stopped behind it.
+  const auto & path_lane_ids = data.reference_path.points.at(object_closest_index).lane_ids;
+  bool found_path_lanelet = false;
+  for (const auto id : path_lane_ids) {
+    if (rh->getLaneletMapPtr()->laneletLayer.exists(id)) {
+      object.overhang_lanelet = rh->getLaneletsFromId(id);
+      found_path_lanelet = true;
+      break;
+    }
+  }
+  if (
+    !found_path_lanelet &&
+    !rh->getClosestLaneletWithinRoute(object_closest_pose, &object.overhang_lanelet)) {
     return 0.0;
   }
 
