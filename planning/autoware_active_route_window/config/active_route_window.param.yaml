@@ -1,0 +1,18 @@
+/**:
+  ros__parameters:
+    # How far behind ego the window reaches [m].  Covers behavior_path_planner's 5 m backward
+    # path and the stuck recovery reference path's 5 m behind ego.
+    backward_distance_m: 10.0
+    # How far ahead of ego the window reaches when nothing overlaps [m] (behavior_path_planner's
+    # forward_path_length).
+    forward_distance_m: 300.0
+    # Ego is "on" a route segment up to this far outside it; the furthest one along the route
+    # within it wins, so the window hands over at a seam as soon as ego reaches it [m].
+    tie_tolerance_m: 0.5
+    # Farther than this outside its segment and its neighbours, ego counts as relocalised and the
+    # whole route is searched again [m].
+    max_drift_m: 1.0
+    # Farther than this from every route lanelet, no window is published (valid=false) and
+    # consumers use the full route [m].
+    max_ego_distance_m: 3.0
+    publish_rate_hz: 10.0
