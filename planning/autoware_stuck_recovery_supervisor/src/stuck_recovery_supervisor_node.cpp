@@ -393,6 +393,14 @@ void StuckRecoverySupervisorNode::setup_interfaces()
         route_handler_ready_ = true;
       }
     });
+  sub_active_route_window_ =
+    create_subscription<autoware_active_route_window_msgs::msg::ActiveRouteWindow>(
+      declare_parameter<std::string>(
+        "topic_active_route_window", "/planning/mission_planning/active_route_window"),
+      rclcpp::QoS{1},
+      [this](const autoware_active_route_window_msgs::msg::ActiveRouteWindow::ConstSharedPtr msg) {
+        active_route_window_ = msg;
+      });
   sub_route_state_ = create_subscription<autoware_adapi_v1_msgs::msg::RouteState>(
     param_.topic_route_state, latched,
     [this](const autoware_adapi_v1_msgs::msg::RouteState::ConstSharedPtr msg) {
@@ -2517,10 +2525,34 @@ bool StuckRecoverySupervisorNode::capture_reference_path()
   return capture_reference_path_from_trajectory();
 }
 
-bool StuckRecoverySupervisorNode::find_ego_route_lanelet(lanelet::ConstLanelet * lanelet) const
+bool StuckRecoverySupervisorNode::apply_active_route_window(lanelet::ConstLanelet * ego_lanelet)
+{
+  constexpr double max_window_age_s = 1.0;
+  const auto & w = active_route_window_;
+  if (
+    !route_handler_ready_ || !w || !w->valid ||
+    (now() - rclcpp::Time(w->header.stamp)).seconds() >= max_window_age_s ||
+    !route_handler_.setActiveWindow(w->route_uuid, w->begin_segment, w->end_segment) ||
+    !route_handler_.getLaneletMapPtr()->laneletLayer.exists(w->ego_lanelet_id)) {
+    if (route_handler_ready_) {
+      route_handler_.clearActiveWindow();
+    }
+    return false;
+  }
+  // Oriented the way the route runs it (getLaneletsFromId re-applies the route's direction).
+  *ego_lanelet = route_handler_.getLaneletsFromId(w->ego_lanelet_id);
+  return true;
+}
+
+bool StuckRecoverySupervisorNode::find_ego_route_lanelet(lanelet::ConstLanelet * lanelet)
 {
   if (!odom_) {
     return false;
+  }
+  // The active route window says where ego is on the route, the same answer every planner gets,
+  // and limits the reference path below to ego's own pass of an out-and-back route.
+  if (apply_active_route_window(lanelet)) {
+    return true;
   }
   const auto & ego_pose = odom_->pose.pose;
 

@@ -27,6 +27,7 @@
 #include <autoware_internal_debug_msgs/msg/int32_stamped.hpp>
 #include <autoware_internal_planning_msgs/msg/planning_factor_array.hpp>
 #include <autoware_internal_planning_msgs/msg/scenario.hpp>
+#include <autoware_active_route_window_msgs/msg/active_route_window.hpp>
 #include <autoware_planning_msgs/msg/lanelet_route.hpp>
 #include <autoware_planning_msgs/msg/trajectory.hpp>
 #include <autoware_stuck_recovery_msgs/msg/recovery_state.hpp>
@@ -491,7 +492,10 @@ private:
   bool capture_reference_path_from_centerline();
   /// The route lanelet ego is on, picked to run the way lane driving is taking ego where route
   /// lanelets overlap (an out-and-back route: the outbound and return legs both lie under ego).
-  bool find_ego_route_lanelet(lanelet::ConstLanelet * lanelet) const;
+  bool find_ego_route_lanelet(lanelet::ConstLanelet * lanelet);
+  /// Set the active route window (autoware_active_route_window) on route_handler_ and return the
+  /// lanelet ego is on by it; false, with the full route in use, without a fresh valid window.
+  bool apply_active_route_window(lanelet::ConstLanelet * ego_lanelet);
   /// Reference path copied from the last lane-driving trajectory.  The original behaviour,
   /// kept as the fallback for when the map is not up yet.
   bool capture_reference_path_from_trajectory();
@@ -818,6 +822,9 @@ private:
   rclcpp::Subscription<autoware_control_msgs::msg::Control>::SharedPtr sub_control_cmd_{};
   rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr sub_trajectory_{};
   rclcpp::Subscription<autoware_planning_msgs::msg::LaneletRoute>::SharedPtr sub_route_{};
+  rclcpp::Subscription<autoware_active_route_window_msgs::msg::ActiveRouteWindow>::SharedPtr
+    sub_active_route_window_{};
+  autoware_active_route_window_msgs::msg::ActiveRouteWindow::ConstSharedPtr active_route_window_{};
   rclcpp::Subscription<autoware_adapi_v1_msgs::msg::RouteState>::SharedPtr sub_route_state_{};
   rclcpp::Subscription<autoware_adapi_v1_msgs::msg::OperationModeState>::SharedPtr sub_op_mode_{};
   rclcpp::Subscription<autoware_vehicle_msgs::msg::ControlModeReport>::SharedPtr sub_control_mode_{};
