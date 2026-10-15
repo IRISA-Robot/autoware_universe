@@ -34,6 +34,7 @@
 #include <pcl/filters/voxel_grid_occlusion_estimation.h>
 
 #include <cmath>
+#include <utility>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -206,6 +207,24 @@ void DummyPerceptionPublisherNode::timerCallback()
     }
   }
 
+  // [2026-10-15] An object beyond visible_range is out of sight, not gone: leave it out of this
+  // cycle's output and keep it.  It used to be deleted from the movement plugins, so a scenario
+  // loaded across a whole map lost every object more than visible_range (300 m in the planning
+  // simulator) from the robot on the first cycle, and they never came back as the robot drove up.
+  {
+    std::vector<DummyObject> visible_objects;
+    std::vector<ObjectInfo> visible_infos;
+    for (size_t i = 0; i < all_objects.size(); ++i) {
+      const auto origin = (tf_base_link2map * obj_infos.at(i).tf_map2moved_object).getOrigin();
+      if (std::hypot(origin.x(), origin.y()) <= visible_range_) {
+        visible_objects.push_back(all_objects.at(i));
+        visible_infos.push_back(obj_infos.at(i));
+      }
+    }
+    all_objects = std::move(visible_objects);
+    obj_infos = std::move(visible_infos);
+  }
+
   for (size_t i = 0; i < all_objects.size(); ++i) {
     if (detection_successful_rate_ >= detection_successful_random(random_generator_)) {
       selected_indices.push_back(i);
@@ -251,8 +270,6 @@ void DummyPerceptionPublisherNode::timerCallback()
     const auto pointclouds = pointcloud_creator_->create_pointclouds(
       detected_obj_infos, tf_base_link2map, random_generator_, detected_merged_pointcloud_ptr);
 
-    std::vector<unique_identifier_msgs::msg::UUID> delete_uuids;
-
     for (size_t i = 0; i < selected_indices.size(); ++i) {
       const auto & pointcloud = pointclouds[i];
       const size_t selected_idx = selected_indices[i];
@@ -287,22 +304,6 @@ void DummyPerceptionPublisherNode::timerCallback()
       pcl::toROSMsg(pointcloud_xyzirc, feature_object.feature.cluster);
       output_dynamic_object_msg.feature_objects.push_back(feature_object);
 
-      // check delete idx
-      tf2::Transform tf_base_link2moved_object;
-      tf_base_link2moved_object = tf_base_link2map * object_info.tf_map2moved_object;
-      double dist = std::sqrt(
-        tf_base_link2moved_object.getOrigin().x() * tf_base_link2moved_object.getOrigin().x() +
-        tf_base_link2moved_object.getOrigin().y() * tf_base_link2moved_object.getOrigin().y());
-      if (visible_range_ < dist) {
-        delete_uuids.push_back(object.id);
-      }
-    }
-
-    // delete
-    for (const auto & uuid : delete_uuids) {
-      for (auto & plugin : movement_plugins_) {
-        plugin->delete_object(uuid);
-      }
     }
   }
 
