@@ -375,6 +375,37 @@ void StaticObstacleAvoidanceModule::fillFundamentalData(
   data.to_start_point = utils::static_obstacle_avoidance::calcDistanceToAvoidStartLine(
     data.current_lanelets, parameters_, data.distance_to_red_traffic_light);
 
+  // [TAG-ZONE 2026-10-15] disable_static_avoidance used to act only on objects inside the tagged
+  // lanelet (getAvoidMargin()); a shift begun for an object before it carried straight in.
+  // Measured on higashida_helm: a 0.8 m shift for a pedestrian ran into narrow lanelet 871,
+  // its return was generated but never approved, and the robot stopped at the lane edge where
+  // recovery could not help.  The tagged stretch is now a return dead line: the path must be
+  // back on the centreline, with the front of the vehicle, before it.
+  data.avoidance_disabled_zone = utils::static_obstacle_avoidance::calcAvoidanceDisabledZone(
+    data.reference_path, data.arclength_from_ego, planner_data_);
+  if (data.avoidance_disabled_zone) {
+    const auto [zone_start, zone_end] = data.avoidance_disabled_zone.value();
+    const double zone_buffer =
+      utils::static_obstacle_avoidance::getAvoidanceDisabledZoneBuffer(planner_data_);
+    const double current_shift =
+      std::max(std::abs(helper_->getEgoShift()), std::abs(path_shifter_.getLastShiftLength()));
+    const bool has_shift = current_shift > parameters_->lateral_execution_threshold;
+    if (zone_start > 0.0) {
+      data.to_return_point = std::min(data.to_return_point, zone_start - zone_buffer);
+    }
+    const double distance_needed_to_return = helper_->getNominalReturnPrepareDistance() +
+                                             helper_->getMaxReturnDistance(current_shift) +
+                                             zone_buffer;
+    data.must_return_for_zone = has_shift && zone_start < distance_needed_to_return;
+    if (data.must_return_for_zone) {
+      RCLCPP_WARN_THROTTLE(
+        getLogger(), *clock_, 2000,
+        "[TAG-ZONE] disable_static_avoidance lanelet %s (%.1f m .. %.1f m) with a %.2f m shift: "
+        "returning to the centreline now, without waiting for the usual return holds.",
+        zone_start > 0.0 ? "ahead" : "under ego", zone_start, zone_end, current_shift);
+    }
+  }
+
   // filter only for the latest detected objects.
   fillAvoidanceTargetObjects(data, debug);
 
@@ -666,6 +697,19 @@ void StaticObstacleAvoidanceModule::fillShiftLine(
   const auto avoidance_ready = helper_->isReady(data.target_objects);
   data.ready = helper_->isReady(data.new_shift_line, path_shifter_.getLastShiftLength()) &&
                avoidance_ready.first;
+
+  // [TAG-ZONE 2026-10-15] A return forced by a disable_static_avoidance lanelet does not wait for
+  // ego to reach 90 % of the current shift (ratio_for_return_shift_approval) and may be sharper
+  // than the comfort jerk: it is shaped to fit before the lanelet, and leaving the shift in force
+  // there is what strands the robot at the lane edge.  Validity and safety still apply.
+  const auto only_returns = std::all_of(
+    data.new_shift_line.begin(), data.new_shift_line.end(), [](const auto & line) {
+      return std::abs(line.end_shift_length) <= std::abs(line.start_shift_length) + 1.0e-3;
+    });
+  if (data.must_return_for_zone && !data.new_shift_line.empty() && only_returns) {
+    data.ready = true;
+    data.comfortable = true;
+  }
   data.request_operator =
     is_operator_approval_required(data.candidate_path, debug) || avoidance_ready.second;
 }

@@ -680,6 +680,39 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
       al_return.object_on_right = utils::static_obstacle_avoidance::isOnRight(o);
     }
 
+    // [TAG-ZONE 2026-10-15] No shift may run into a disable_static_avoidance lanelet.  Before
+    // committing to an object, check that the whole manoeuvre fits outside it: the return at its
+    // nominal (gentle) length must end before the lanelet, or the avoid must start after it.  If
+    // not, the object is treated like one inside the lanelet -- not avoidable, ego yields behind
+    // it -- instead of starting a shift that would have to be held, or crammed, into the
+    // lanelet.  An object already being avoided keeps its shift; the zone's dead line then
+    // shapes its return (calcDistanceToReturnDeadLine / insertReturnDeadLine).
+    if (data.avoidance_disabled_zone && !is_approved(o)) {
+      const auto [zone_start, zone_end] = data.avoidance_disabled_zone.value();
+      const double zone_buffer =
+        utils::static_obstacle_avoidance::getAvoidanceDisabledZoneBuffer(data_);
+      const double return_end =
+        al_return.start_longitudinal + helper_->getMaxReturnDistance(al_avoid.end_shift_length);
+      const bool returns_before_zone = return_end <= zone_start - zone_buffer;
+      const bool starts_after_zone = al_avoid.start_longitudinal >= zone_end + zone_buffer;
+      if (!returns_before_zone && !starts_after_zone) {
+        static auto logger = rclcpp::get_logger("static_obstacle_avoidance_shift_line_generator");
+        static rclcpp::Clock steady_clock{RCL_ROS_TIME};
+        RCLCPP_WARN_THROTTLE(
+          logger, steady_clock, 1000,
+          "[TAG-ZONE] id=%s not avoided: the shift (%.1f m .. return done at %.1f m) would run "
+          "into the disable_static_avoidance lanelet at %.1f m .. %.1f m; yielding instead.",
+          autoware_utils::to_hex_string(o.object.object_id).c_str(), al_avoid.start_longitudinal,
+          return_end, zone_start, zone_end);
+        o.info = ObjectInfo::INSUFFICIENT_DRIVABLE_SPACE;
+        if (o.avoid_required && is_forward_object(o) && is_on_path(o)) {
+          break;
+        }
+        unavoidable_objects.push_back(o);
+        continue;
+      }
+    }
+
     const bool skip_return_shift = [&]() {
       if (!utils::isAllowedGoalModification(data_->route_handler)) {
         return false;
@@ -1608,7 +1641,14 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
   // indistinguishable from one frozen by any other. An unavoidable object ahead is in fact the
   // most likely way to reach the deadlock: ego stops for it (obstacle_stop), which makes it
   // permanently "ahead", which permanently suppresses the return shift, which keeps ego stopped.
-  if (exist_unavoidable_object) {
+  // [TAG-ZONE 2026-10-15] None of the holds below may keep a shift into a
+  // disable_static_avoidance lanelet (an object inside it is itself "unavoidable", so the
+  // unavoidable-object hold would otherwise pin the shift right up to it).
+  const bool zone_forces_return = data.must_return_for_zone;
+  const bool ego_inside_zone =
+    data.avoidance_disabled_zone && data.avoidance_disabled_zone->first <= 0.0;
+
+  if (exist_unavoidable_object && !zone_forces_return) {
     if (!isEgoStuckStationary()) {
       RCLCPP_WARN_THROTTLE(
         generatorLogger(), generatorClock(), 2000,
@@ -1660,7 +1700,7 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
   // frozen path is driving into, in which case holding the shift for its sake is backwards.
   //
   // Bound it by ego's progress rather than removing it: while ego moves, behaviour is unchanged.
-  if (exist_object_still_ahead) {
+  if (exist_object_still_ahead && !zone_forces_return) {
     if (!isEgoStuckStationary()) {
       RCLCPP_WARN_THROTTLE(
         generatorLogger(), generatorClock(), 500,
@@ -1773,7 +1813,11 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
 
   const auto & arclength_from_ego = data.arclength_from_ego;
 
-  const auto nominal_prepare_distance = helper_->getNominalReturnPrepareDistance();
+  // [TAG-ZONE 2026-10-15] Inside a disable_static_avoidance lanelet with a shift still in force,
+  // return now: no prepare stretch.
+  const auto min_return_prepare_distance =
+    ego_inside_zone ? 0.0 : helper_->getNominalReturnPrepareDistance();
+  const auto nominal_prepare_distance = min_return_prepare_distance;
   const auto nominal_avoid_distance = helper_->getMaxReturnDistance(last_sl.end_shift_length);
 
   if (arclength_from_ego.empty()) {
@@ -1814,16 +1858,14 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
   const double variable_prepare_distance =
     std::max(nominal_prepare_distance - last_sl_distance, 0.0);
 
-  double prepare_distance_scaled = std::max(
-    helper_->getNominalReturnPrepareDistance(),
-    std::max(nominal_prepare_distance, last_sl_distance));
+  double prepare_distance_scaled =
+    std::max(min_return_prepare_distance, std::max(nominal_prepare_distance, last_sl_distance));
   double avoid_distance_scaled = nominal_avoid_distance;
   if (remaining_distance < prepare_distance_scaled + avoid_distance_scaled) {
     const auto scale = (remaining_distance - last_sl_distance) /
                        std::max(nominal_avoid_distance + variable_prepare_distance, 0.1);
-    prepare_distance_scaled = std::max(
-      helper_->getNominalReturnPrepareDistance(),
-      last_sl_distance + scale * nominal_prepare_distance);
+    prepare_distance_scaled =
+      std::max(min_return_prepare_distance, last_sl_distance + scale * nominal_prepare_distance);
     avoid_distance_scaled *= scale;
   }
 

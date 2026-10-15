@@ -622,6 +622,99 @@ TEST(TestUtils, getAvoidMarginDisableStaticAvoidanceLanelet)
   EXPECT_DOUBLE_EQ(output.value(), 1.9);
 }
 
+TEST(TestUtils, findFirstTaggedRunAhead)
+{
+  const std::vector<double> s{-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0};
+  // ahead of ego
+  {
+    const auto run = findFirstTaggedRunAhead(s, {0, 0, 0, 0, 0, 1, 1, 0, 0});
+    ASSERT_TRUE(run.has_value());
+    EXPECT_DOUBLE_EQ(run->first, 2.0);
+    EXPECT_DOUBLE_EQ(run->second, 3.0);
+  }
+  // ego inside it
+  {
+    const auto run = findFirstTaggedRunAhead(s, {0, 0, 1, 1, 1, 0, 0, 0, 0});
+    ASSERT_TRUE(run.has_value());
+    EXPECT_DOUBLE_EQ(run->first, -1.0);
+    EXPECT_DOUBLE_EQ(run->second, 1.0);
+  }
+  // a run wholly behind ego is skipped for the next one ahead; a run reaching the end counts
+  {
+    const auto run = findFirstTaggedRunAhead(s, {1, 1, 0, 0, 0, 0, 0, 1, 1});
+    ASSERT_TRUE(run.has_value());
+    EXPECT_DOUBLE_EQ(run->first, 4.0);
+    EXPECT_DOUBLE_EQ(run->second, 5.0);
+  }
+  // only behind, or none
+  EXPECT_FALSE(findFirstTaggedRunAhead(s, {1, 1, 0, 0, 0, 0, 0, 0, 0}).has_value());
+  EXPECT_FALSE(findFirstTaggedRunAhead(s, std::vector<bool>(s.size(), false)).has_value());
+}
+
+TEST(TestUtils, calcAvoidanceDisabledZone)
+{
+  auto planner_data = get_planner_data();
+
+  // [0, 100] untagged, [100, 130] disable_static_avoidance=true, [130, 200] untagged
+  const auto make_lanelet = [](const double x0, const double x1, const bool tagged) {
+    lanelet::LineString3d left(lanelet::utils::getId());
+    left.push_back(lanelet::Point3d(lanelet::utils::getId(), x0, 1.75, 0.0));
+    left.push_back(lanelet::Point3d(lanelet::utils::getId(), x1, 1.75, 0.0));
+    lanelet::LineString3d right(lanelet::utils::getId());
+    right.push_back(lanelet::Point3d(lanelet::utils::getId(), x0, -1.75, 0.0));
+    right.push_back(lanelet::Point3d(lanelet::utils::getId(), x1, -1.75, 0.0));
+    lanelet::Lanelet ll(lanelet::utils::getId(), left, right);
+    ll.attributes()[lanelet::AttributeName::Subtype] = lanelet::AttributeValueString::Road;
+    if (tagged) {
+      ll.attributes()["disable_static_avoidance"] = "true";
+    }
+    return ll;
+  };
+  const auto before = make_lanelet(0.0, 100.0, false);
+  const auto zone = make_lanelet(100.0, 130.0, true);
+  const auto after = make_lanelet(130.0, 200.0, false);
+  const auto map = std::make_shared<lanelet::LaneletMap>();
+  map->add(before);
+  map->add(zone);
+  map->add(after);
+  autoware_map_msgs::msg::LaneletMapBin map_bin_msg;
+  map_bin_msg.header.frame_id = "map";
+  lanelet::utils::conversion::toBinMsg(map, &map_bin_msg);
+  auto route_handler = std::make_shared<autoware::route_handler::RouteHandler>();
+  route_handler->setMap(map_bin_msg);
+  planner_data->route_handler = route_handler;
+
+  autoware_internal_planning_msgs::msg::PathWithLaneId path;
+  for (int x = 0; x <= 200; ++x) {
+    autoware_internal_planning_msgs::msg::PathPointWithLaneId p;
+    p.point.pose.position.x = x;
+    if (x <= 100) p.lane_ids.push_back(before.id());
+    if (x >= 100 && x <= 130) p.lane_ids.push_back(zone.id());
+    if (x >= 130) p.lane_ids.push_back(after.id());
+    path.points.push_back(p);
+  }
+  const auto arclength_from = [&](const double ego_x) {
+    std::vector<double> s;
+    for (const auto & p : path.points) s.push_back(p.point.pose.position.x - ego_x);
+    return s;
+  };
+
+  {  // ego at x = 60: the zone is 40 m .. 70 m ahead
+    const auto z = calcAvoidanceDisabledZone(path, arclength_from(60.0), planner_data);
+    ASSERT_TRUE(z.has_value());
+    EXPECT_DOUBLE_EQ(z->first, 40.0);
+    EXPECT_DOUBLE_EQ(z->second, 70.0);
+  }
+  {  // ego at x = 110: inside it
+    const auto z = calcAvoidanceDisabledZone(path, arclength_from(110.0), planner_data);
+    ASSERT_TRUE(z.has_value());
+    EXPECT_DOUBLE_EQ(z->first, -10.0);
+    EXPECT_DOUBLE_EQ(z->second, 20.0);
+  }
+  // ego at x = 150: past it
+  EXPECT_FALSE(calcAvoidanceDisabledZone(path, arclength_from(150.0), planner_data).has_value());
+}
+
 TEST(TestUtils, isAvoidanceOpportunityRunningOut)
 {
   // Keep front-constant-distance computation independent of PlannerData vehicle geometry, which

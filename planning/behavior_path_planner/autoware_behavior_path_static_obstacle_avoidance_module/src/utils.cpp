@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -3435,6 +3436,67 @@ double calcDistanceToAvoidStartLine(
   }
 
   return distance_to_return_dead_line;
+}
+
+double getAvoidanceDisabledZoneBuffer(const std::shared_ptr<const PlannerData> & planner_data)
+{
+  constexpr double margin = 0.5;  // [m]
+  return planner_data->parameters.base_link2front + margin;
+}
+
+std::optional<std::pair<double, double>> findFirstTaggedRunAhead(
+  const std::vector<double> & arclength, const std::vector<bool> & tagged)
+{
+  const size_t n = std::min(arclength.size(), tagged.size());
+  std::optional<size_t> run_begin;
+  for (size_t i = 0; i <= n; ++i) {
+    const bool is_tagged = i < n && tagged.at(i);
+    if (is_tagged && !run_begin) {
+      run_begin = i;
+    }
+    if (!is_tagged && run_begin) {
+      const double run_end = arclength.at(i - 1);
+      if (run_end >= 0.0) {
+        return std::make_pair(arclength.at(*run_begin), run_end);
+      }
+      run_begin.reset();
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<std::pair<double, double>> calcAvoidanceDisabledZone(
+  const PathWithLaneId & path, const std::vector<double> & arclength_from_ego,
+  const std::shared_ptr<const PlannerData> & planner_data)
+{
+  if (!planner_data || !planner_data->route_handler) {
+    return std::nullopt;
+  }
+  const auto & route_handler = planner_data->route_handler;
+  const auto lanelet_map_ptr = route_handler->getLaneletMapPtr();
+  if (!lanelet_map_ptr) {
+    return std::nullopt;
+  }
+
+  std::map<lanelet::Id, bool> is_tagged_lanelet;
+  const auto lanelet_is_tagged = [&](const lanelet::Id id) {
+    const auto itr = is_tagged_lanelet.find(id);
+    if (itr != is_tagged_lanelet.end()) {
+      return itr->second;
+    }
+    const bool tagged = lanelet_map_ptr->laneletLayer.exists(id) &&
+                        lanelet_map_ptr->laneletLayer.get(id).attributeOr(
+                          "disable_static_avoidance", false);
+    is_tagged_lanelet.emplace(id, tagged);
+    return tagged;
+  };
+
+  std::vector<bool> tagged(path.points.size(), false);
+  for (size_t i = 0; i < path.points.size(); ++i) {
+    const auto & ids = path.points.at(i).lane_ids;
+    tagged.at(i) = std::any_of(ids.begin(), ids.end(), lanelet_is_tagged);
+  }
+  return findFirstTaggedRunAhead(arclength_from_ego, tagged);
 }
 
 double calcDistanceToReturnDeadLine(

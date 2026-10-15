@@ -784,6 +784,15 @@ struct AvoidancePlanningData
 
   double to_return_point{std::numeric_limits<double>::max()};
 
+  // [TAG-ZONE 2026-10-15] The first stretch of the path ahead (or under ego) whose lanelets carry
+  // disable_static_avoidance=true, as [start, end] arc length from ego.  start <= 0 means ego is
+  // already inside it.  The path must be back on the centreline there: no shift may run into it,
+  // and a shift that would has to return before it.
+  std::optional<std::pair<double, double>> avoidance_disabled_zone{std::nullopt};
+
+  // the zone is close enough that the current shift has to start returning now (or ego is in it)
+  bool must_return_for_zone{false};
+
   std::optional<double> distance_to_red_traffic_light{std::nullopt};
 
   std::optional<lanelet::ConstLanelet> closest_lanelet{std::nullopt};
@@ -827,6 +836,8 @@ struct AvoidancePlanningData
     to_stop_line = std::numeric_limits<double>::max();
     to_start_point = std::numeric_limits<double>::lowest();
     to_return_point = std::numeric_limits<double>::max();
+    avoidance_disabled_zone = std::nullopt;
+    must_return_for_zone = false;
     distance_to_red_traffic_light = std::nullopt;
     closest_lanelet = std::nullopt;
     is_allowed_goal_modification = false;

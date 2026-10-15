@@ -20,6 +20,7 @@
 #include "autoware/behavior_path_static_obstacle_avoidance_module/data_structs.hpp"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -353,6 +354,30 @@ DrivableLanes generateNotExpandedDrivableLanes(const lanelet::ConstLanelet & lan
 DrivableLanes generateExpandedDrivableLanes(
   const lanelet::ConstLanelet & lanelet, const std::shared_ptr<const PlannerData> & planner_data,
   const std::string & use_lane_type);
+
+/**
+ * @brief first run of tagged points that contains or lies ahead of s = 0.
+ * @param arclength arc length of each point from ego (negative behind ego).
+ * @param tagged whether each point lies on a tagged lanelet; same size as arclength.
+ * @return [start, end] arc length of that run; start <= 0 when ego is inside it.
+ */
+std::optional<std::pair<double, double>> findFirstTaggedRunAhead(
+  const std::vector<double> & arclength, const std::vector<bool> & tagged);
+
+/**
+ * @brief the first stretch of `path` ahead of (or under) ego whose lanelets carry
+ * disable_static_avoidance=true, as [start, end] arc length from ego.
+ */
+std::optional<std::pair<double, double>> calcAvoidanceDisabledZone(
+  const PathWithLaneId & path, const std::vector<double> & arclength_from_ego,
+  const std::shared_ptr<const PlannerData> & planner_data);
+
+/**
+ * @brief how far before a disable_static_avoidance lanelet the path must be back on the
+ * centreline, and how far past its end a new shift may begin: the front of the vehicle plus a
+ * margin.
+ */
+double getAvoidanceDisabledZoneBuffer(const std::shared_ptr<const PlannerData> & planner_data);
 
 double calcDistanceToReturnDeadLine(
   const lanelet::ConstLanelets & lanelets, const PathWithLaneId & path,
