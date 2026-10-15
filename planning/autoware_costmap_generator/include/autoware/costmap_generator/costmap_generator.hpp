@@ -60,6 +60,7 @@
 
 #include <autoware_internal_debug_msgs/msg/float64_stamped.hpp>
 #include <autoware_internal_planning_msgs/msg/scenario.hpp>
+#include <autoware_active_route_window_msgs/msg/active_route_window.hpp>
 #include <autoware_map_msgs/msg/lanelet_map_bin.hpp>
 #include <autoware_perception_msgs/msg/predicted_objects.hpp>
 #include <autoware_planning_msgs/msg/lanelet_route.hpp>
@@ -92,9 +93,16 @@ private:
   geometry_msgs::msg::PoseStamped::ConstSharedPtr current_pose_;
 
   lanelet::LaneletMapPtr lanelet_map_;
-  /// Ids of the lanelets the mission route actually uses.  Empty means "no route seen
+  /// Ids of the lanelets the road area is carved from.  Empty means "no route seen
   /// yet"; see rebuild_primitives_polygons() for what that falls back to.
   std::set<lanelet::Id> route_lanelet_ids_;
+  /// The route itself, kept because the window below re-selects from it as ego advances.
+  autoware_planning_msgs::msg::LaneletRoute::ConstSharedPtr route_;
+  /// Which stretch of that route is ego's current pass.  See refresh_route_lanelet_ids().
+  autoware_active_route_window_msgs::msg::ActiveRouteWindow::ConstSharedPtr
+    active_route_window_;
+  /// Whether route_lanelet_ids_ came from that window or from the whole route.  Log only.
+  bool windowed_road_area_{false};
   PredictedObjects::ConstSharedPtr objects_;
   sensor_msgs::msg::PointCloud2::ConstSharedPtr points_;
 
@@ -119,6 +127,9 @@ private:
   rclcpp::Subscription<autoware_map_msgs::msg::LaneletMapBin>::SharedPtr sub_lanelet_bin_map_;
   /// Only created when wayarea_from_route is true.
   rclcpp::Subscription<autoware_planning_msgs::msg::LaneletRoute>::SharedPtr sub_route_;
+  /// Only created when wayarea_from_route is true, alongside sub_route_.
+  rclcpp::Subscription<autoware_active_route_window_msgs::msg::ActiveRouteWindow>::SharedPtr
+    sub_active_route_window_;
   autoware_utils::InterProcessPollingSubscriber<sensor_msgs::msg::PointCloud2> sub_points_{
     this, "~/input/points_no_ground", autoware_utils::single_depth_sensor_qos()};
   autoware_utils::InterProcessPollingSubscriber<PredictedObjects> sub_objects_{
@@ -155,6 +166,11 @@ private:
   /// \brief callback for the mission route, used to narrow the free area to the
   ///        lanelets the route actually drives through
   void onRoute(const autoware_planning_msgs::msg::LaneletRoute::ConstSharedPtr msg);
+  void onActiveRouteWindow(
+    const autoware_active_route_window_msgs::msg::ActiveRouteWindow::ConstSharedPtr msg);
+  /// Recompute route_lanelet_ids_ from the route and the active window, and rebuild the
+  /// road-area polygons if the set changed.
+  void refresh_route_lanelet_ids();
 
   /// \brief rebuild primitives_polygons_ from the map and, when wayarea_from_route is
   ///        on, the current route.  Called whenever either of those two changes.

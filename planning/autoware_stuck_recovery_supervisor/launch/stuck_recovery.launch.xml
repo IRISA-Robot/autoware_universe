@@ -59,6 +59,10 @@
              /planning/recovery/route carries only start and goal poses and no segments,
              so it could not serve as the filter. -->
         <remap from="~/input/route" to="/planning/mission_planning/route"/>
+        <!-- Which stretch of that route is ego's CURRENT pass.  Without it an
+             out-and-back route carves both passes free at once, and the return leg's
+             lanelets become drivable ground right beside the robot. -->
+        <remap from="~/input/active_route_window" to="/planning/mission_planning/active_route_window"/>
         <remap from="~/output/grid_map" to="costmap_generator/grid_map"/>
         <remap from="~/output/occupancy_grid" to="costmap_generator/occupancy_grid"/>
         <!-- The points layer on its own: obstacles with the drivable-area walls left

@@ -176,6 +176,10 @@ CostmapGenerator::CostmapGenerator(const rclcpp::NodeOptions & node_options)
     sub_route_ = this->create_subscription<autoware_planning_msgs::msg::LaneletRoute>(
       "~/input/route", rclcpp::QoS{1}.transient_local(),
       std::bind(&CostmapGenerator::onRoute, this, std::placeholders::_1));
+    sub_active_route_window_ =
+      this->create_subscription<autoware_active_route_window_msgs::msg::ActiveRouteWindow>(
+        "~/input/active_route_window", rclcpp::QoS{1},
+        std::bind(&CostmapGenerator::onActiveRouteWindow, this, std::placeholders::_1));
   }
 
   // Publishers
@@ -259,29 +263,90 @@ void CostmapGenerator::onLaneletMapBin(
 
 void CostmapGenerator::onRoute(const autoware_planning_msgs::msg::LaneletRoute::ConstSharedPtr msg)
 {
-  std::set<lanelet::Id> ids;
-  for (const auto & segment : msg->segments) {
-    // Every primitive of the segment, not just the preferred one: the alternatives are
-    // lanelets the robot is allowed to be in, and leaving them out would put a wall
-    // alongside the robot the moment it sat in a non-preferred lane.
-    for (const auto & primitive : segment.primitives) {
-      ids.insert(static_cast<lanelet::Id>(primitive.id));
-    }
-  }
-
-  if (ids.empty()) {
+  if (msg->segments.empty()) {
     // A route with no segments carries no free area at all.  Ignoring it leaves the
     // previous one standing, which is strictly better than walling the robot in.
     RCLCPP_WARN(get_logger(), "route has no segments; keeping the previous road area");
     return;
   }
+  route_ = msg;
+  refresh_route_lanelet_ids();
+}
 
-  if (ids == route_lanelet_ids_) {
+void CostmapGenerator::onActiveRouteWindow(
+  const autoware_active_route_window_msgs::msg::ActiveRouteWindow::ConstSharedPtr msg)
+{
+  active_route_window_ = msg;
+  refresh_route_lanelet_ids();
+}
+
+void CostmapGenerator::refresh_route_lanelet_ids()
+{
+  if (!route_) {
+    return;
+  }
+
+  // Which segments count as road.
+  //
+  // Every segment of the route was the obvious answer and it is wrong on a route that
+  // passes over the same ground twice.  Measured on hibikino_kanan, where the window node
+  // reports "overlapping segment pairs: 382/195 382/188 373/195": the return leg's
+  // lanelets lie under -- or alongside -- the outbound one, so painting the whole route as
+  // road carved the opposite pass free right next to the robot.  Freespace could then plan
+  // an escape into a lane the mission is not on at that moment, and the sweep read ground
+  // as drivable that lane driving would never use.
+  //
+  // The active route window is the answer every other geometric consumer already takes
+  // (autoware_stuck_recovery_supervisor::apply_active_route_window), and it is filtered for
+  // exactly this: it names the stretch of segments that is ego's CURRENT pass.  Outside
+  // that -- no window, stale, a different route, or ego off the route -- fall back to the
+  // whole route, which is what this node did before and is never less permissive.
+  constexpr double max_window_age_s = 1.0;
+  size_t begin = 0;
+  size_t end = route_->segments.size() - 1;
+  bool windowed = false;
+  const auto & w = active_route_window_;
+  if (
+    w && w->valid && w->route_uuid == route_->uuid &&
+    (now() - rclcpp::Time(w->header.stamp)).seconds() < max_window_age_s &&
+    w->begin_segment <= w->end_segment && w->end_segment < route_->segments.size()) {
+    begin = w->begin_segment;
+    end = w->end_segment;
+    windowed = true;
+  }
+
+  std::set<lanelet::Id> ids;
+  for (size_t i = begin; i <= end; ++i) {
+    // Every primitive of the segment, not just the preferred one: the alternatives are
+    // lanelets the robot is allowed to be in, and leaving them out would put a wall
+    // alongside the robot the moment it sat in a non-preferred lane.
+    for (const auto & primitive : route_->segments[i].primitives) {
+      ids.insert(static_cast<lanelet::Id>(primitive.id));
+    }
+  }
+
+  if (ids.empty() || ids == route_lanelet_ids_) {
     return;
   }
 
   route_lanelet_ids_ = std::move(ids);
+  windowed_road_area_ = windowed;
   rebuild_primitives_polygons();
+  // At INFO because the drivable ground just changed under every consumer of this grid,
+  // and because an unexpected "whole route" here is the thing that is hard to spot
+  // afterwards.  It fires when the window slides to a new segment, not every cycle.
+  if (windowed) {
+    RCLCPP_INFO(
+      get_logger(),
+      "road area: %zu lanelet(s) from route segments %u-%u of %zu (active route window)",
+      route_lanelet_ids_.size(), active_route_window_->begin_segment,
+      active_route_window_->end_segment, route_->segments.size());
+  } else {
+    RCLCPP_INFO(
+      get_logger(), "road area: %zu lanelet(s) from the whole %zu-segment route (no active "
+      "route window; both passes of an out-and-back count as road)",
+      route_lanelet_ids_.size(), route_->segments.size());
+  }
 }
 
 void CostmapGenerator::rebuild_primitives_polygons()
@@ -302,10 +367,9 @@ void CostmapGenerator::rebuild_primitives_polygons()
         "wayarea_from_route is on but no route has arrived yet; using every road lanelet");
       loadRoadAreasFromLaneletMap(lanelet_map_, primitives_polygons_);
     } else if (param_->wayarea_from_route) {
+      // Logged by refresh_route_lanelet_ids(), which is the only place that knows WHICH
+      // stretch of the route these ids came from.
       loadRoadAreasFromLaneletMap(lanelet_map_, primitives_polygons_, route_lanelet_ids_);
-      RCLCPP_INFO(
-        get_logger(), "road area restricted to the %zu lanelet(s) the route uses",
-        route_lanelet_ids_.size());
     } else {
       loadRoadAreasFromLaneletMap(lanelet_map_, primitives_polygons_);
     }
@@ -331,6 +395,10 @@ void CostmapGenerator::set_current_pose()
 void CostmapGenerator::onTimer()
 {
   update_data();
+
+  // Also here, not only on the window's own callback: a window that stops arriving has to
+  // age out into the whole-route fallback, and a callback that never fires cannot do that.
+  refresh_route_lanelet_ids();
 
   autoware_utils::ScopedTimeTrack scoped_time_track(__func__, *time_keeper_);
   stop_watch.tic();
