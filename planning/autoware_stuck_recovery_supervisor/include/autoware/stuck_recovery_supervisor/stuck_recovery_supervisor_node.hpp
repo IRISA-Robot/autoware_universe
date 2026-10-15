@@ -176,6 +176,12 @@ private:
     double escape_shape_margin_m{0.05};
     double recovery_timeout_sec{60.0};
     double clear_hold_sec{1.0};
+    /// How far ahead handback_clearance_ok() looks, along both the driven plan and the
+    /// centerline.  It is not corridor_scan_distance_m: that one asks where the blockage
+    /// is, this one asks whether lane driving would stop again once it had the robot.
+    double handback_horizon_m{6.0};
+    /// Fallback for a preset that does not set handback_margin_m of its own.
+    double handback_margin_m{0.26};
     // Recovery may only hand back once the robot has REJOINED the path.  Judging the exit
     // purely on "the corridor ahead is clear" let it hand back while still standing beside
     // the obstacle: the robot's projection onto the path had already advanced past the
@@ -391,6 +397,8 @@ private:
     std::string topic_gear;
     std::string topic_scenario;
     std::string topic_occupancy_grid;
+    /// The same costmap with the drivable-area walls left out: obstacles only.
+    std::string topic_points_occupancy_grid;
     std::string topic_recovery_trajectory;
     std::string topic_freespace_full_trajectory;
     std::string topic_recovery_is_completed;
@@ -468,6 +476,22 @@ private:
   /// off-grid.
   std::pair<size_t, size_t> footprint_blocked_count(
     const geometry_msgs::msg::Pose & pose, double margin, int threshold) const;
+  /// footprint_blocked_count() against an explicit grid.  `off_grid_blocks` decides what a
+  /// sample outside the grid counts as: true for the combined costmap, where leaving the
+  /// known world is itself a reason to stop, false for the obstacle-only grid, where it
+  /// only means nothing has been seen there.
+  std::pair<size_t, size_t> footprint_blocked_count_in(
+    const nav_msgs::msg::OccupancyGrid & grid, const geometry_msgs::msg::Pose & pose,
+    double margin, int threshold, bool off_grid_blocks) const;
+  /// Is every obstacle far enough from the robot that lane driving will not stop the
+  /// moment it is handed back?  Walks the plan the robot is driving AND the lane
+  /// centerline, out to handback_horizon_m, with the footprint grown by the preset's
+  /// handback_margin_m, against the obstacle-only grid.  When `first_violation_out` is
+  /// non-null it receives the arc and pose of the first offending sample.
+  /// Not const: it throttles its own diagnostics, which needs the node clock.
+  bool handback_clearance_ok(
+    std::optional<std::pair<double, geometry_msgs::msg::Pose>> * first_violation_out);
+  bool points_grid_is_fresh() const;
   /// Optimizer cost of driving `plan` from where the robot is now.
   double plan_cost(const autoware_planning_msgs::msg::Trajectory & plan, bool * needs_flip);
   /// recovery_path_is_blocked() through the onset/release hysteresis.  True = brake.
@@ -729,6 +753,9 @@ private:
     /// shared 2.0 s budget -- barely three attempts before the goal was thrown away, out of a
     /// 60 s episode.  A slower searcher needs a longer leash, not a shorter episode.
     double goal_retry_sec{};
+    /// Lateral clearance, obstacle to footprint, required before this preset may hand the
+    /// robot back to lane driving.  See handback_clearance_ok().
+    double handback_margin_m{};
     rclcpp::Publisher<autoware_internal_planning_msgs::msg::Scenario>::SharedPtr pub_scenario{};
     rclcpp::Publisher<autoware_planning_msgs::msg::LaneletRoute>::SharedPtr pub_route{};
     rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr sub_full_traj{};
@@ -758,6 +785,11 @@ private:
   autoware_internal_planning_msgs::msg::Scenario::ConstSharedPtr scenario_{};
   nav_msgs::msg::OccupancyGrid::ConstSharedPtr grid_{};
   rclcpp::Time grid_at_{0, 0, RCL_ROS_TIME};
+  nav_msgs::msg::OccupancyGrid::ConstSharedPtr points_grid_{};
+  rclcpp::Time points_grid_at_{0, 0, RCL_ROS_TIME};
+  /// When the robot last started standing still inside RECOVERY.  recovery_timeout_sec is
+  /// measured from here, not from state_since_: see the abort in handle_recovery().
+  rclcpp::Time recovery_still_since_{0, 0, RCL_ROS_TIME};
   autoware_planning_msgs::msg::Trajectory::ConstSharedPtr recovery_trajectory_{};
   autoware_planning_msgs::msg::Trajectory::ConstSharedPtr freespace_trajectory_{};
   /// The whole plan freespace_trajectory_ is a segment of, cusps and all.
@@ -831,6 +863,7 @@ private:
   rclcpp::Subscription<autoware_vehicle_msgs::msg::GearReport>::SharedPtr sub_gear_{};
   rclcpp::Subscription<autoware_internal_planning_msgs::msg::Scenario>::SharedPtr sub_scenario_{};
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr sub_grid_{};
+  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr sub_points_grid_{};
   rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr sub_recovery_traj_{};
   rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr
     sub_freespace_full_traj_{};

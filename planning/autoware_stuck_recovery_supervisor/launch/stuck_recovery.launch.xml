@@ -61,6 +61,10 @@
         <remap from="~/input/route" to="/planning/mission_planning/route"/>
         <remap from="~/output/grid_map" to="costmap_generator/grid_map"/>
         <remap from="~/output/occupancy_grid" to="costmap_generator/occupancy_grid"/>
+        <!-- The points layer on its own: obstacles with the drivable-area walls left
+             out.  The supervisor measures its hand-back clearance against this, because
+             a lanelet wall 0.40 m away is not something lane driving stops for. -->
+        <remap from="~/output/points_occupancy_grid" to="costmap_generator/points_occupancy_grid"/>
         <param from="$(var vehicle_param_file)"/>
         <param from="$(var recovery_costmap_generator_param_path)"/>
         <extra_arg name="use_intra_process_comms" value="false"/>

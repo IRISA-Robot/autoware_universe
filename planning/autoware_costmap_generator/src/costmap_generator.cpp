@@ -182,6 +182,8 @@ CostmapGenerator::CostmapGenerator(const rclcpp::NodeOptions & node_options)
   pub_costmap_ = this->create_publisher<grid_map_msgs::msg::GridMap>("~/output/grid_map", 1);
   pub_occupancy_grid_ =
     this->create_publisher<nav_msgs::msg::OccupancyGrid>("~/output/occupancy_grid", 1);
+  pub_points_occupancy_grid_ =
+    this->create_publisher<nav_msgs::msg::OccupancyGrid>("~/output/points_occupancy_grid", 1);
   pub_processing_time_ =
     create_publisher<autoware_utils::ProcessingTimeDetail>("processing_time", 1);
   time_keeper_ = std::make_shared<autoware_utils::TimeKeeper>(pub_processing_time_);
@@ -545,6 +547,15 @@ void CostmapGenerator::publishCostmap(
   out_occupancy_grid.header = header;
   out_occupancy_grid.info.origin.position.z = tf.transform.translation.z;
   pub_occupancy_grid_->publish(out_occupancy_grid);
+
+  // Publish the points layer on its own, same geometry, for consumers that must measure
+  // against obstacles without the drivable-area walls mixed in.
+  nav_msgs::msg::OccupancyGrid out_points_grid;
+  grid_map::GridMapRosConverter::toOccupancyGrid(
+    costmap, LayerName::points, param_->grid_min_value, param_->grid_max_value, out_points_grid);
+  out_points_grid.header = header;
+  out_points_grid.info.origin.position.z = tf.transform.translation.z;
+  pub_points_occupancy_grid_->publish(out_points_grid);
 
   // Publish GridMap
   auto out_gridmap_msg = grid_map::GridMapRosConverter::toMessage(costmap);

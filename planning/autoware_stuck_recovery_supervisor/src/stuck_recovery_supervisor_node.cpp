@@ -160,6 +160,8 @@ void StuckRecoverySupervisorNode::load_parameters()
   p.escape_shape_margin_m = declare_parameter<double>("escape_shape_margin_m", 0.05);
   p.recovery_timeout_sec = declare_parameter<double>("recovery_timeout_sec", 60.0);
   p.clear_hold_sec = declare_parameter<double>("clear_hold_sec", 1.0);
+  p.handback_horizon_m = declare_parameter<double>("handback_horizon_m", 6.0);
+  p.handback_margin_m = declare_parameter<double>("handback_margin_m", 0.26);
   p.transit_yaw_tolerance_rad =
     declare_parameter<double>("transit_yaw_tolerance_rad", 0.26);
   p.transit_hold_sec = declare_parameter<double>("transit_hold_sec", 1.0);
@@ -250,6 +252,9 @@ void StuckRecoverySupervisorNode::load_parameters()
     declare_parameter<std::string>("topic_scenario", "/planning/scenario_planning/scenario");
   p.topic_occupancy_grid = declare_parameter<std::string>(
     "topic_occupancy_grid", "/planning/recovery/costmap_generator/occupancy_grid");
+  p.topic_points_occupancy_grid = declare_parameter<std::string>(
+    "topic_points_occupancy_grid",
+    "/planning/recovery/costmap_generator/points_occupancy_grid");
   p.topic_recovery_trajectory =
     declare_parameter<std::string>("topic_recovery_trajectory", "/planning/recovery/trajectory");
   p.topic_freespace_full_trajectory = declare_parameter<std::string>(
@@ -441,6 +446,12 @@ void StuckRecoverySupervisorNode::setup_interfaces()
       grid_occupied_fraction_ =
         msg->data.empty() ? 0.0
                           : static_cast<double>(occupied) / static_cast<double>(msg->data.size());
+    });
+  sub_points_grid_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+    param_.topic_points_occupancy_grid, qos,
+    [this](const nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg) {
+      points_grid_ = msg;
+      points_grid_at_ = this->now();
     });
   sub_recovery_traj_ = create_subscription<autoware_planning_msgs::msg::Trajectory>(
     param_.topic_recovery_trajectory, qos,
@@ -932,6 +943,9 @@ void StuckRecoverySupervisorNode::transition(State next, const std::string & rea
   aeb_holding_ = false;
   aeb_raw_since_.reset();
   aeb_clear_since_.reset();
+  if (next == State::RECOVERY) {
+    recovery_still_since_ = state_since_;
+  }
   if (next == State::TRANSIT) {
     // The manoeuvre is over; only the line-up remains.  Drop the freespace plan so a stale
     // one can never be relayed here, and start the hold from now rather than from whatever
@@ -1384,7 +1398,18 @@ void StuckRecoverySupervisorNode::step_recovery()
     abort_episode("emergency code raised during recovery");
     return;
   }
-  if ((now - state_since_).seconds() > param_.recovery_timeout_sec) {
+  // The budget measures STANDSTILL, not wall clock.  A recovery crawling past an obstacle
+  // at recovery_speed_limit_mps is working, however long that takes; one that has not moved
+  // for recovery_timeout_sec is not.  Measured on 2026-10-14, three episodes out of four
+  // left RECOVERY this way at 20 s -- and because abort_episode() hands the robot straight
+  // back to lane driving, they left by the ONE exit that skips the hand-back clearance
+  // test, each time with the obstacle still inside it.  max_episode_duration_sec just below
+  // remains the wall-clock backstop, so this can never run forever.
+  if (!is_stopped_) {
+    recovery_still_since_ = now;
+  }
+  const double standstill_sec = (now - recovery_still_since_).seconds();
+  if (standstill_sec > param_.recovery_timeout_sec) {
     abort_episode("recovery timed out");
     return;
   }
@@ -1536,7 +1561,14 @@ void StuckRecoverySupervisorNode::step_recovery()
   // current costmap from where the robot is now: an obstacle dropped onto the goal chosen at
   // the start used to be driven straight towards.
   reselect_escape_goal();
-  const bool clear_now = last_sweep_.valid && last_sweep_.clear;
+  // Two tests, deliberately measured with two different margins.  The sweep asks whether
+  // the robot fits, with lateral_margin_m -- that is physics, and it is what decides there
+  // is a blockage to recover from in the first place.  handback_clearance_ok() asks whether
+  // LANE DRIVING will fit, with the preset's larger handback_margin_m, because the only
+  // thing leaving RECOVERY decides is who drives next.
+  std::optional<std::pair<double, geometry_msgs::msg::Pose>> handback_violation;
+  const bool handback_ok = handback_clearance_ok(&handback_violation);
+  const bool clear_now = last_sweep_.valid && last_sweep_.clear && handback_ok;
   if (!clear_now) {
     clear_since_ = now;
   }
@@ -1559,7 +1591,7 @@ void StuckRecoverySupervisorNode::step_recovery()
         get_logger(), *get_clock(), 2000,
         "[episode %u] waiting to hand back: the corridor sweep produced no samples (%.0f s of "
         "%.0f s used)",
-        episode_id_, (now - state_since_).seconds(), param_.recovery_timeout_sec);
+        episode_id_, standstill_sec, param_.recovery_timeout_sec);
     } else if (!last_sweep_.clear) {
       if (last_sweep_.has_blockage) {
         RCLCPP_INFO_THROTTLE(
@@ -1569,7 +1601,7 @@ void StuckRecoverySupervisorNode::step_recovery()
           episode_id_, last_sweep_.first_blocked_arc_m, last_sweep_.narrowest_pose.position.x,
           last_sweep_.narrowest_pose.position.y, last_sweep_.free_left_m,
           last_sweep_.free_right_m, last_sweep_.required_width_m,
-          (now - state_since_).seconds(), param_.recovery_timeout_sec);
+          standstill_sec, param_.recovery_timeout_sec);
       } else {
         RCLCPP_INFO_THROTTLE(
           get_logger(), *get_clock(), 2000,
@@ -1577,7 +1609,24 @@ void StuckRecoverySupervisorNode::step_recovery()
           "not fit centred on the path -- free left %.2f m right %.2f m, need %.2f m "
           "(%.0f s of %.0f s used)",
           episode_id_, last_sweep_.free_left_m, last_sweep_.free_right_m,
-          last_sweep_.required_width_m, (now - state_since_).seconds(),
+          last_sweep_.required_width_m, standstill_sec, param_.recovery_timeout_sec);
+      }
+    } else if (!handback_ok) {
+      if (handback_violation) {
+        RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "[episode %u] waiting to hand back: the robot fits, but an obstacle is still "
+          "within %.2f m of the footprint %.2f m along at (%.2f, %.2f) -- lane driving "
+          "would stop on it (%.0f s of %.0f s used)",
+          episode_id_, preset().handback_margin_m, handback_violation->first,
+          handback_violation->second.position.x, handback_violation->second.position.y,
+          standstill_sec, param_.recovery_timeout_sec);
+      } else {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "[episode %u] waiting to hand back: no obstacle-only costmap yet, so the %.2f m "
+          "hand-back clearance cannot be judged (%.0f s of %.0f s used)",
+          episode_id_, preset().handback_margin_m, standstill_sec,
           param_.recovery_timeout_sec);
       }
     } else {
@@ -1612,16 +1661,13 @@ void StuckRecoverySupervisorNode::step_recovery()
     return;
   }
 
-  const double offset = lateral_offset_from_path();
-  if (offset > param_.rejoin_lateral_tolerance_m) {
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 2000,
-      "[episode %u] corridor clear but still %.2f m off the path (need <= %.2f m before "
-      "lane driving can take it back)",
-      episode_id_, offset, param_.rejoin_lateral_tolerance_m);
-    return;
-  }
-
+  // No lateral-offset gate here any more.  It used to demand the robot already be on the
+  // path before it could enter the state whose whole job is to put it there, which only
+  // delayed the thing that would have fixed the offset.  Two things replace it: the
+  // hand-back clearance above already walks the robot's OWN pose and plan, so a bad offset
+  // shows up as an obstacle near the footprint rather than as a number; and
+  // rejoin_lateral_tolerance_m still gates TRANSIT -> COOLDOWN, which is the interlock that
+  // actually matters -- lane driving does not get the robot until it is back on the path.
   if (!may_enter_transit()) {
     return;
   }
@@ -3268,7 +3314,17 @@ std::pair<size_t, size_t> StuckRecoverySupervisorNode::footprint_blocked_count(
   if (!costmap_is_fresh() || grid_->info.resolution <= 0.0 || grid_->data.empty()) {
     return {1, 1};
   }
-  const double res = grid_->info.resolution;
+  return footprint_blocked_count_in(*grid_, pose, margin, threshold, true);
+}
+
+std::pair<size_t, size_t> StuckRecoverySupervisorNode::footprint_blocked_count_in(
+  const nav_msgs::msg::OccupancyGrid & grid, const geometry_msgs::msg::Pose & pose, double margin,
+  int threshold, bool off_grid_blocks) const
+{
+  const double res = grid.info.resolution;
+  if (res <= 0.0 || grid.data.empty()) {
+    return {1, 1};
+  }
   const double yaw = tf2::getYaw(pose.orientation);
   const double cos_yaw = std::cos(yaw);
   const double sin_yaw = std::sin(yaw);
@@ -3283,17 +3339,22 @@ std::pair<size_t, size_t> StuckRecoverySupervisorNode::footprint_blocked_count(
       ++total;
       const double x = pose.position.x + cos_yaw * lon - sin_yaw * lat;
       const double y = pose.position.y + sin_yaw * lon + cos_yaw * lat;
-      const int col = static_cast<int>(std::floor((x - grid_->info.origin.position.x) / res));
-      const int row = static_cast<int>(std::floor((y - grid_->info.origin.position.y) / res));
+      const int col = static_cast<int>(std::floor((x - grid.info.origin.position.x) / res));
+      const int row = static_cast<int>(std::floor((y - grid.info.origin.position.y) / res));
       if (
-        col < 0 || row < 0 || col >= static_cast<int>(grid_->info.width) ||
-        row >= static_cast<int>(grid_->info.height)) {
-        ++blocked;
+        col < 0 || row < 0 || col >= static_cast<int>(grid.info.width) ||
+        row >= static_cast<int>(grid.info.height)) {
+        if (off_grid_blocks) {
+          ++blocked;
+        }
         continue;
       }
       const auto value =
-        grid_->data[static_cast<size_t>(row) * grid_->info.width + static_cast<size_t>(col)];
-      if (value < 0 || value >= threshold) {
+        grid.data[static_cast<size_t>(row) * grid.info.width + static_cast<size_t>(col)];
+      // An unknown cell (-1) is "nothing has been seen here".  On the combined costmap that
+      // is a reason to stop; on the obstacle-only grid it is the ordinary state of every
+      // cell no obstacle has ever fallen in, so it must not read as one.
+      if ((value < 0 && off_grid_blocks) || (value >= 0 && value >= threshold)) {
         ++blocked;
       }
     }
@@ -3572,6 +3633,126 @@ bool StuckRecoverySupervisorNode::costmap_is_fresh() const
   return (this->now() - grid_at_).seconds() <= param_.costmap_timeout_sec;
 }
 
+bool StuckRecoverySupervisorNode::points_grid_is_fresh() const
+{
+  if (!points_grid_) {
+    return false;
+  }
+  return (this->now() - points_grid_at_).seconds() <= param_.costmap_timeout_sec;
+}
+
+bool StuckRecoverySupervisorNode::handback_clearance_ok(
+  std::optional<std::pair<double, geometry_msgs::msg::Pose>> * first_violation_out)
+{
+  // Leaving RECOVERY is not a question about physics, it is a prediction about another
+  // module.  Lane driving is about to be handed a robot, and it stops for an obstacle whose
+  // lateral distance to its swept footprint falls under ITS margin -- which is larger than
+  // anything recovery was measuring with:
+  //
+  //   obstacle_stop        lateral_margin.nominal {default,unknown,pointcloud}   0.10 m
+  //   obstacle_slow_down   max_lat_margin 0.10 + lat_hysteresis_margin/2 0.10    0.20 m
+  //   obstacle_cruise      max_lat_margin                                        0.20 m
+  //   road_user_stop       trajectory_lateral_margin                             0.25 m
+  //
+  // (Those four are in motion_velocity_planner/*.param.yaml.  obstacle_slow_down's effective
+  // reach is twice the number written on its max_lat_margin line; its own YAML says so.)
+  //
+  // With recovery exiting on its own 0.10 m, a gap it called clear was one lane driving
+  // refused: hand back, stop, SUSPECT, RECOVERY, a metre of crawling, repeat -- the robot
+  // inched past an obstacle in a dozen episodes instead of one.  So the exit test measures
+  // with a margin of its own, set per preset above every one of those numbers.
+  //
+  // Two paths are walked, because two different things will drive:
+  //   - the plan the robot is on, which is what it will finish doing, and
+  //   - the lane centerline, which is what lane driving will steer back onto.
+  // Either coming within the margin of an obstacle holds the episode.  That pair is also why
+  // no separate lateral-offset gate is needed here any more: the robot's own pose is already
+  // in the test.
+  //
+  // Measured against the OBSTACLE-ONLY grid, never the combined one.  The combined costmap
+  // paints everything outside the road lanelets occupied, and in a 1.5 m lanelet those walls
+  // sit 0.40 m from the footprint -- inside any margin worth having, for ever.  Walls are
+  // not what lane driving stops for.
+  if (!points_grid_) {
+    // The topic has never arrived at all.  That is a deployment fault -- an old
+    // costmap_generator, a missing remap -- not a blocked road, and turning it into "this
+    // robot can never leave recovery" would be a far worse failure than the one this test
+    // was added to fix.  Fall back to the behaviour that existed before this gate, loudly.
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 10000,
+      "no message on %s -- the hand-back clearance test is DISABLED and recovery is exiting "
+      "on the sweep alone, as it did before this gate existed",
+      param_.topic_points_occupancy_grid.c_str());
+    return true;
+  }
+  if (!points_grid_is_fresh()) {
+    return false;  // it was there and went stale: that is a reason to hold, not to guess
+  }
+  const double margin = preset().handback_margin_m;
+  const int threshold = param_.aeb_occupancy_threshold;
+
+  const auto walk = [&](const std::vector<geometry_msgs::msg::Pose> & poses, size_t from) {
+    double arc = 0.0;
+    for (size_t i = from; i < poses.size(); ++i) {
+      if (i > from) {
+        arc += distance2d(poses[i - 1], poses[i]);
+      }
+      if (arc > param_.handback_horizon_m) {
+        return true;
+      }
+      const auto [blocked, total] =
+        footprint_blocked_count_in(*points_grid_, poses[i], margin, threshold, false);
+      if (total > 0 && blocked > 0) {
+        if (first_violation_out != nullptr && !*first_violation_out) {
+          *first_violation_out = std::make_pair(arc, poses[i]);
+        }
+        return false;
+      }
+    }
+    return true;
+  };
+
+  // The plan being driven, from the pose nearest the robot onwards.
+  if (adopted_plan_ && adopted_plan_->points.size() >= 2 && odom_) {
+    std::vector<geometry_msgs::msg::Pose> poses;
+    poses.reserve(adopted_plan_->points.size());
+    for (const auto & p : adopted_plan_->points) {
+      poses.push_back(p.pose);
+    }
+    size_t from = 0;
+    if (const auto nearest = find_nearest_index(poses, odom_->pose.pose)) {
+      from = *nearest;
+    }
+    if (!walk(poses, from)) {
+      return false;
+    }
+  } else if (odom_) {
+    // No plan in hand: the robot itself is the only thing we know it occupies.
+    const auto [blocked, total] =
+      footprint_blocked_count_in(*points_grid_, odom_->pose.pose, margin, threshold, false);
+    if (total > 0 && blocked > 0) {
+      if (first_violation_out != nullptr && !*first_violation_out) {
+        *first_violation_out = std::make_pair(0.0, odom_->pose.pose);
+      }
+      return false;
+    }
+  }
+
+  // The centerline lane driving will steer back onto.
+  if (reference_path_.size() >= 2) {
+    size_t from = 0;
+    if (odom_) {
+      if (const auto nearest = find_nearest_index(reference_path_, odom_->pose.pose)) {
+        from = *nearest;
+      }
+    }
+    if (!walk(reference_path_, from)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 CorridorResult StuckRecoverySupervisorNode::sweep(size_t from_index) const
 {
   return sweep_path(reference_path_, from_index);
@@ -3676,6 +3857,7 @@ void StuckRecoverySupervisorNode::build_recovery_presets()
     preset.aeb_margin_m = param_.aeb_margin_m;
     preset.goal_shape_margin_m = param_.goal_shape_margin_m;
     preset.goal_retry_sec = param_.goal_retry_sec;
+    preset.handback_margin_m = param_.handback_margin_m;
     preset.pub_scenario = pub_scenario_;
     preset.pub_route = pub_route_;
     subscribe(preset, param_.topic_freespace_full_trajectory, param_.topic_recovery_is_completed);
@@ -3701,6 +3883,8 @@ void StuckRecoverySupervisorNode::build_recovery_presets()
       declare_parameter<double>(ns + "goal_shape_margin_m", param_.goal_shape_margin_m);
     preset.goal_retry_sec =
       declare_parameter<double>(ns + "goal_retry_sec", param_.goal_retry_sec);
+    preset.handback_margin_m =
+      declare_parameter<double>(ns + "handback_margin_m", param_.handback_margin_m);
     preset.pub_scenario = create_publisher<autoware_internal_planning_msgs::msg::Scenario>(
       declare_parameter<std::string>(ns + "scenario_topic", param_.topic_out_scenario),
       rclcpp::QoS{1});
@@ -3715,9 +3899,9 @@ void StuckRecoverySupervisorNode::build_recovery_presets()
     RCLCPP_INFO(
       get_logger(),
       "recovery preset [%zu] \"%s\": aeb_margin %.3f m, goal_shape_margin %.3f m, goal_retry "
-      "%.1f s",
+      "%.1f s, handback_margin %.3f m",
       presets_.size(), name.c_str(), preset.aeb_margin_m, preset.goal_shape_margin_m,
-      preset.goal_retry_sec);
+      preset.goal_retry_sec, preset.handback_margin_m);
     presets_.push_back(preset);
   }
 }

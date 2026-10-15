@@ -103,6 +103,15 @@ private:
 
   rclcpp::Publisher<grid_map_msgs::msg::GridMap>::SharedPtr pub_costmap_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pub_occupancy_grid_;
+  /// The `points` layer on its own, as an OccupancyGrid.
+  ///
+  /// The combined grid answers "may the robot be here", which mixes two things that are
+  /// not alike: real obstacles, and the edge of the drivable area painted in from the
+  /// lanelet map.  A consumer that has to reason about obstacles ALONE -- how far the
+  /// nearest one is, whether anything lies within a margin of the robot -- cannot use it,
+  /// because in a 1.5 m lanelet the walls are always within any margin worth having.
+  /// Both layers already exist here; only the combined one was ever published.
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pub_points_occupancy_grid_;
   rclcpp::Publisher<autoware_utils::ProcessingTimeDetail>::SharedPtr pub_processing_time_;
   rclcpp::Publisher<autoware_internal_debug_msgs::msg::Float64Stamped>::SharedPtr
     pub_processing_time_ms_;
