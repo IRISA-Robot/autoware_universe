@@ -18,6 +18,8 @@
 #include <autoware_internal_debug_msgs/msg/int32_stamped.hpp>
 #include <autoware_road_crossing_msgs/msg/road_crossing_gate.hpp>
 
+#include "vehicle_check.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -53,11 +55,16 @@ public:
     // deadlock the module forever. Also still used as the WARN_THROTTLE threshold.
     double timeout_sec{30.0};
 
-    // Prediction check
-    double predict_horizon_sec{5.0};
+    // Vehicle check ("can this vehicle still stop?", see vehicle_check.hpp).
+    // false: the module never stops for vehicles -- only the gate stops it, and obstacle_stop
+    // handles anything actually in the way.  true: checked continuously while approaching and
+    // crossing; the robot stops before a dangerous vehicle's conflict zone, never inside one.
+    bool vehicle_check_enable{false};
+    vehicle_check::Params vehicle_check;
+    double vehicle_check_lateral_margin{0.5};  // [m] added to the robot's half width
+    double vehicle_check_stop_debounce_sec{0.5};  // [s] danger this long before stopping mid-way
     double min_confidence{0.5};
-    bool enable_dynamic_horizon{true};
-    double crossing_speed_for_horizon{0.833};
+    double crossing_speed_for_horizon{0.833};  // [m/s] robot speed used to time the crossing
 
     // Object class filter (which labels block the crossing)
     bool block_on_car{true};
@@ -149,6 +156,10 @@ private:
   // stuck true (e.g. stale/false-positive predicted-object block) with no real obstacle.
   std::optional<rclcpp::Time> go_blocked_since_;
   bool was_inside_polygon_{false};  // CROSSING exit detection: ever entered polygon?
+  // Vehicle check while CROSSING: debounced hold before a dangerous vehicle's conflict zone.
+  std::optional<rclcpp::Time> vehicle_danger_since_;
+  std::optional<rclcpp::Time> vehicle_clear_since_;
+  std::optional<geometry_msgs::msg::Pose> vehicle_hold_pose_;  // where the robot holds, in map
   DebugData debug_data_;
 
   // Per-scene state publisher for PlotJuggler. Topic:
@@ -171,12 +182,13 @@ private:
   /** Get the road_crossing lanelet from the map by module_id_. Returns empty optional if missing. */
   std::optional<lanelet::ConstLanelet> getCrossingLanelet(const PlannerData & planner_data) const;
 
-  /** Compute the dynamic prediction horizon based on crossing length. */
-  double computeHorizon(const lanelet::ConstLanelet & crossing) const;
-
-  /** Return true if any tracked vehicle's predicted path enters the crossing polygon within horizon. */
-  bool isPredictedBlocked(
-    const lanelet::ConstLanelet & crossing, const PlannerData & planner_data) const;
+  /**
+   * The start (arc length on `path`) of the nearest conflict zone ahead with a vehicle that can no
+   * longer stop for the robot, see vehicle_check.hpp.
+   */
+  std::optional<double> findVehicleDangerZone(
+    const Trajectory & path, double ego_s, const lanelet::ConstLanelet & crossing,
+    const PlannerData & planner_data) const;
 
   /** Class filter: should an object with this label block? */
   bool shouldBlockOnLabel(uint8_t label) const;

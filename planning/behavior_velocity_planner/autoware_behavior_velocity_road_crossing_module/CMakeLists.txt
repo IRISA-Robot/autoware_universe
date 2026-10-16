@@ -10,6 +10,13 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/scene.cpp
   src/experimental/manager.cpp
   src/experimental/scene.cpp
+  src/experimental/vehicle_check.cpp
 )
+
+if(BUILD_TESTING)
+  ament_auto_add_gtest(test_${PROJECT_NAME}_vehicle_check
+    test/test_vehicle_check.cpp
+  )
+endif()
 
 ament_auto_package(INSTALL_TO_SHARE config)

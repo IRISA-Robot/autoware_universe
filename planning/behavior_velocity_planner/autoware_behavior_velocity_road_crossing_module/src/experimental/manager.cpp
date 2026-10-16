@@ -38,13 +38,23 @@ RoadCrossingModuleManager::RoadCrossingModuleManager(rclcpp::Node & node)
     get_or_declare_parameter<double>(node, ns + ".sustained_clear_sec");
   p.timeout_sec = get_or_declare_parameter<double>(node, ns + ".timeout_sec");
 
-  p.predict_horizon_sec =
-    get_or_declare_parameter<double>(node, ns + ".predict_horizon_sec");
   p.min_confidence = get_or_declare_parameter<double>(node, ns + ".min_confidence");
-  p.enable_dynamic_horizon =
-    get_or_declare_parameter<bool>(node, ns + ".enable_dynamic_horizon");
   p.crossing_speed_for_horizon =
     get_or_declare_parameter<double>(node, ns + ".crossing_speed_for_horizon");
+
+  const std::string vc = ns + ".vehicle_check";
+  p.vehicle_check_enable = get_or_declare_parameter<bool>(node, vc + ".enable");
+  p.vehicle_check.stop_deceleration =
+    get_or_declare_parameter<double>(node, vc + ".stop_deceleration");
+  p.vehicle_check.distance_margin =
+    get_or_declare_parameter<double>(node, vc + ".distance_margin");
+  p.vehicle_check.time_margin = get_or_declare_parameter<double>(node, vc + ".time_margin");
+  p.vehicle_check.min_distance = get_or_declare_parameter<double>(node, vc + ".min_distance");
+  p.vehicle_check.min_speed = get_or_declare_parameter<double>(node, vc + ".min_speed");
+  p.vehicle_check_lateral_margin =
+    get_or_declare_parameter<double>(node, vc + ".lateral_margin");
+  p.vehicle_check_stop_debounce_sec =
+    get_or_declare_parameter<double>(node, vc + ".stop_debounce_sec");
 
   p.block_on_car = get_or_declare_parameter<bool>(node, ns + ".block_on_car");
   p.block_on_truck = get_or_declare_parameter<bool>(node, ns + ".block_on_truck");

@@ -8,13 +8,27 @@
       sustained_clear_sec: 1.5          # [s] hysteresis: stay clear this long before releasing
       timeout_sec: 30.0                 # [s] after this much waiting, log WARN
 
-      # Prediction check
-      predict_horizon_sec: 3.0          # [s] how far ahead to scan predicted_paths
+      # Vehicle check ("can this vehicle still stop?").  The gate (traffic light) applies either way.
+      #   enable: false -> never stop for vehicles here; only the gate holds the robot, and
+      #                    obstacle_stop handles anything actually in its way.
+      #   enable: true  -> checked continuously while approaching and crossing.  A vehicle is a danger
+      #                    only if it can no longer stop before the robot's path (v^2 / 2a >= distance -
+      #                    distance_margin) and would arrive before the robot is through (+ time_margin),
+      #                    or it is within min_distance of the robot's path.  The robot then stops at the
+      #                    line, or mid-way just before that vehicle's lane -- never inside it.
+      vehicle_check:
+        enable: false
+        stop_deceleration: 3.0   # [m/s^2] braking a vehicle is assumed to be able to apply
+        distance_margin: 3.0     # [m] it must be able to stop this much before the robot's path
+        time_margin: 2.0         # [s] it must arrive this much after the robot is through
+        min_distance: 3.0        # [m] this close to the robot's path: always a danger
+        min_speed: 0.5           # [m/s] slower counts as standing
+        lateral_margin: 0.5      # [m] added to the robot's half width for its path
+        stop_debounce_sec: 0.5   # [s] danger this long before the robot stops mid-way (hold-to-go uses sustained_clear_sec)
       min_confidence: 0.5               # [-] drop predicted_paths below this confidence
-      enable_dynamic_horizon: true      # extend horizon to cover full crossing time (max of static + L/v)
-      crossing_speed_for_horizon: 0.833 # [m/s] used when computing dynamic horizon (≈3 km/h)
+      crossing_speed_for_horizon: 0.833 # [m/s] robot speed assumed through the crossing when it is slower (≈3 km/h)
 
-      # Object class filter — only these labels block the crossing.
+      # Object class filter — the labels the vehicle check looks at.
       # ObjectClassification enum: UNKNOWN=0 CAR=1 TRUCK=2 BUS=3 TRAILER=4 MOTORCYCLE=5 BICYCLE=6 PEDESTRIAN=7
       # Per design: vehicles only (we cross alongside pedestrians/bicycles)
       block_on_car: true

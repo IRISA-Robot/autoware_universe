@@ -20,6 +20,7 @@
 #include <autoware_road_crossing_msgs/msg/road_crossing_gate.hpp>
 
 #include <boost/geometry/algorithms/covered_by.hpp>
+#include <boost/geometry/algorithms/distance.hpp>
 #include <boost/geometry/algorithms/length.hpp>
 #include <boost/geometry/algorithms/within.hpp>
 
@@ -28,6 +29,7 @@
 #include <lanelet2_core/primitives/BoundingBox.h>
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <utility>
@@ -122,54 +124,68 @@ std::optional<lanelet::ConstLanelet> RoadCrossingModule::getCrossingLanelet(
   }
 }
 
-double RoadCrossingModule::computeHorizon(const lanelet::ConstLanelet & crossing) const
+std::optional<double> RoadCrossingModule::findVehicleDangerZone(
+  const Trajectory & path, const double ego_s, const lanelet::ConstLanelet & crossing,
+  const PlannerData & planner_data) const
 {
-  double horizon = planner_param_.predict_horizon_sec;
-  if (planner_param_.enable_dynamic_horizon) {
-    const double L = boost::geometry::length(crossing.centerline2d().basicLineString());
-    const double v = std::max(planner_param_.crossing_speed_for_horizon, 1e-3);
-    horizon = std::max(horizon, L / v);
-  }
-  return horizon;
-}
+  if (!planner_data.predicted_objects) return std::nullopt;
 
-bool RoadCrossingModule::isPredictedBlocked(
-  const lanelet::ConstLanelet & crossing, const PlannerData & planner_data) const
-{
-  if (!planner_data.predicted_objects) return false;
+  const auto & info = planner_data.vehicle_info_;
+  vehicle_check::Ego ego;
+  ego.s = ego_s;
+  ego.front_offset = planner_data.is_driving_forward ? info.max_longitudinal_offset_m
+                                                     : -info.min_longitudinal_offset_m;
+  ego.rear_offset = planner_data.is_driving_forward ? -info.min_longitudinal_offset_m
+                                                    : info.max_longitudinal_offset_m;
+  ego.half_width = 0.5 * info.vehicle_width_m + planner_param_.vehicle_check_lateral_margin;
+  ego.crossing_speed = std::max(
+    planner_data.current_velocity ? std::abs(planner_data.current_velocity->twist.linear.x) : 0.0,
+    planner_param_.crossing_speed_for_horizon);
 
+  // The robot's path over the crossing (and a little either side of it), from its rear on.
+  constexpr double kStep = 0.25;        // [m]
+  constexpr double kPadding = 1.0;      // [m] around the crossing polygon
+  constexpr double kMaxLength = 80.0;   // [m] ahead of the robot
   const auto polygon = crossing.polygon2d().basicPolygon();
-  const double horizon = computeHorizon(crossing);
-
-  for (const auto & obj : planner_data.predicted_objects->objects) {
-    // Class filter — pick highest-probability classification
-    bool block = false;
-    for (const auto & cls : obj.classification) {
-      if (shouldBlockOnLabel(cls.label)) {
-        block = true;
-        break;
-      }
+  std::vector<vehicle_check::CorridorPoint> corridor;
+  const double s_end = std::min(path.length(), ego_s + kMaxLength);
+  for (double s = std::max(0.0, ego_s - ego.rear_offset); s <= s_end; s += kStep) {
+    const auto & q = path.compute(s).point.pose.position;
+    const lanelet::BasicPoint2d p{q.x, q.y};
+    if (boost::geometry::distance(p, polygon) <= kPadding) {
+      corridor.push_back({s, {q.x, q.y}});
     }
-    if (!block) continue;
+  }
+  if (corridor.empty()) return std::nullopt;
 
-    // Predicted path scan
+  std::vector<vehicle_check::Vehicle> vehicles;
+  for (const auto & obj : planner_data.predicted_objects->objects) {
+    const bool is_target = std::any_of(
+      obj.classification.begin(), obj.classification.end(),
+      [this](const auto & cls) { return shouldBlockOnLabel(cls.label); });
+    if (!is_target) continue;
+
+    vehicle_check::Vehicle vehicle;
+    const auto & twist = obj.kinematics.initial_twist_with_covariance.twist.linear;
+    vehicle.speed = std::hypot(twist.x, twist.y);
+    const auto & dims = obj.shape.dimensions;
+    vehicle.half_width = dims.y > 0.0 ? 0.5 * dims.y : 0.5 * std::max(dims.x, 1.0);
+    const auto & current = obj.kinematics.initial_pose_with_covariance.pose.position;
     for (const auto & pred_path : obj.kinematics.predicted_paths) {
       if (pred_path.confidence < planner_param_.min_confidence) continue;
-
-      const double dt = rclcpp::Duration(pred_path.time_step).seconds();
-      for (size_t i = 0; i < pred_path.path.size(); ++i) {
-        const double t = static_cast<double>(i) * dt;
-        if (t > horizon) break;
-
-        const lanelet::BasicPoint2d p{
-          pred_path.path[i].position.x, pred_path.path[i].position.y};
-        if (boost::geometry::within(p, polygon)) {
-          return true;
-        }
+      std::vector<vehicle_check::Point> points{{current.x, current.y}};
+      for (const auto & pose : pred_path.path) {
+        points.push_back({pose.position.x, pose.position.y});
       }
+      vehicle.predicted_paths.push_back(std::move(points));
     }
+    if (vehicle.predicted_paths.empty()) {
+      vehicle.predicted_paths.push_back({{current.x, current.y}});  // standing where it is
+    }
+    vehicles.push_back(std::move(vehicle));
   }
-  return false;
+
+  return vehicle_check::findNearestDangerZone(corridor, vehicles, ego, planner_param_.vehicle_check);
 }
 
 std::pair<double, std::optional<double>> RoadCrossingModule::findEgoAndStopPoint(
@@ -372,6 +388,21 @@ void RoadCrossingModule::updateState(
         break;
       }
 
+      // ---- ROAD mode, vehicle check off: only the gate holds the robot ----
+      if (!planner_param_.vehicle_check_enable) {
+        if (!planner_param_.require_fsm_gate || isGoCommand(current_gate)) {
+          state_ = State::CROSSING;
+          RCLCPP_INFO(
+            logger_, "RoadCrossing %ld [ROAD]: CHECKING → CROSSING (gate GO, vehicle check off)",
+            getModuleId());
+        } else {
+          RCLCPP_INFO_THROTTLE(
+            logger_, *clock_, 2000, "RoadCrossing %ld [ROAD]: waiting for FSM gate=GO",
+            getModuleId());
+        }
+        break;
+      }
+
       // ---- ROAD mode: vehicle-scan logic with GO_GREEN bounded timeout ----
 
       // GO_GREEN path: keep predicted-path safety block, but bounded by green_block_timeout_sec.
@@ -566,17 +597,23 @@ bool RoadCrossingModule::modifyPathVelocity(
 
   // Obstacle scan (only relevant in CHECKING state but we compute for transition logic).
   // PRE mode never scans vehicles — its CHECKING only waits for the FSM crosswalk gate.
-  bool blocked = false;
-  if (state_ == State::CHECKING && kind_ == CrossingKind::ROAD) {
-    blocked = isPredictedBlocked(crossing, planner_data);
-    debug_data_.last_check_blocked = blocked;
-  } else {
-    debug_data_.last_check_blocked = false;
+  // [VEHICLE-CHECK 2026-10-16] Replaces the old scan (any vehicle predicted to enter the crossing
+  // polygon blocked it).  Constant-speed predictions held the robot on a green for a car slowing
+  // to its own red light, and for a turning car that has to yield.  Now only a vehicle that can
+  // no longer stop for the robot holds it (vehicle_check.hpp), and only when vehicle_check.enable;
+  // otherwise the gate is the only thing that stops the robot here.
+  std::optional<double> danger_zone_s;
+  if (
+    kind_ == CrossingKind::ROAD && planner_param_.vehicle_check_enable &&
+    state_ != State::DONE) {
+    danger_zone_s = findVehicleDangerZone(path, ego_s, crossing, planner_data);
   }
+  const bool blocked = danger_zone_s.has_value();
+  debug_data_.last_check_blocked = blocked;
 
-  if (kind_ == CrossingKind::ROAD && planner_param_.require_fsm_gate) {
-    uint8_t gate = autoware_road_crossing_msgs::msg::RoadCrossingGate::HOLD;
-    {
+  if (kind_ == CrossingKind::ROAD) {
+    uint8_t gate = autoware_road_crossing_msgs::msg::RoadCrossingGate::GO;
+    if (planner_param_.require_fsm_gate) {
       std::lock_guard<std::mutex> lk(gate_mutex_);
       gate = gate_command_;
     }
@@ -586,25 +623,21 @@ bool RoadCrossingModule::modifyPathVelocity(
 
     if (
       (state_ == State::APPROACHING || state_ == State::STOPPING) && stop_s &&
-      gate == autoware_road_crossing_msgs::msg::RoadCrossingGate::GO_GREEN) {
-      // The FSM already confirmed a solid green before ego reached the stop line: no point
-      // braking to a halt there just to read that gate.  Same vehicle check as CHECKING's
-      // green path; if it is blocked, keep approaching and stop at the line as usual.
-      const bool green_blocked = isPredictedBlocked(crossing, planner_data);
-      debug_data_.last_check_blocked = green_blocked;
-      if (!green_blocked) {
-        state_ = State::CROSSING;
-        green_blocked_since_.reset();
-        go_blocked_since_.reset();
-        RCLCPP_INFO(
-          logger_,
-          "RoadCrossing %ld [ROAD]: GREEN + clear before the stop line → CROSSING without "
-          "stopping",
-          getModuleId());
-      }
+      isGoCommand(gate) && !blocked) {
+      // The gate already lets the robot go before it reached the stop line, and no vehicle is a
+      // danger: no point braking to a halt there.  The vehicle check keeps running while
+      // crossing.  If it is blocked, keep approaching and stop at the line as usual.
+      state_ = State::CROSSING;
+      green_blocked_since_.reset();
+      go_blocked_since_.reset();
+      RCLCPP_INFO(
+        logger_,
+        "RoadCrossing %ld [ROAD]: gate GO + clear before the stop line → CROSSING without "
+        "stopping",
+        getModuleId());
     } else if (
-      state_ == State::CROSSING && !was_inside_polygon_ && !ego_inside &&
-      gate == autoware_road_crossing_msgs::msg::RoadCrossingGate::HOLD) {
+      planner_param_.require_fsm_gate && state_ == State::CROSSING && !was_inside_polygon_ &&
+      !ego_inside && gate == autoware_road_crossing_msgs::msg::RoadCrossingGate::HOLD) {
       // Released but not on the crossing yet, and the release is gone (the FSM dropped the
       // episode, e.g. relocalized): stop at the line again instead of crossing on a stale GO.
       state_ = State::APPROACHING;
@@ -683,6 +716,66 @@ bool RoadCrossingModule::modifyPathVelocity(
     debug_data_.stop_pose = path.compute(ego_s).point.pose;
   }
 
+  // [VEHICLE-CHECK 2026-10-16] While crossing, keep checking.  A vehicle that can no longer stop
+  // and whose zone the robot has not reached yet holds it just before that zone -- never inside
+  // one (findNearestDangerZone skips zones the robot's front is already in).  Debounced on the
+  // way in so a noisy velocity does not make the robot stop-and-go on the road, and released
+  // only after sustained_clear_sec of no danger.
+  std::optional<double> crossing_hold_s;
+  if (
+    kind_ == CrossingKind::ROAD && planner_param_.vehicle_check_enable &&
+    state_ == State::CROSSING) {
+    const auto now = clock_->now();
+    if (danger_zone_s) {
+      vehicle_clear_since_.reset();
+      if (!vehicle_danger_since_) vehicle_danger_since_ = now;
+      if ((now - *vehicle_danger_since_).seconds() >= planner_param_.vehicle_check_stop_debounce_sec) {
+        const double hold_s = std::max(
+          *danger_zone_s - debug_data_.base_link2front - planner_param_.stop_margin, ego_s);
+        vehicle_hold_pose_ = path.compute(hold_s).point.pose;
+      }
+    } else {
+      vehicle_danger_since_.reset();
+      if (vehicle_hold_pose_) {
+        if (!vehicle_clear_since_) vehicle_clear_since_ = now;
+        if ((now - *vehicle_clear_since_).seconds() >= planner_param_.sustained_clear_sec) {
+          vehicle_hold_pose_.reset();
+          RCLCPP_INFO(
+            logger_, "RoadCrossing %ld [VEHICLE-CHECK]: clear %.1f s → crossing on",
+            getModuleId(), planner_param_.sustained_clear_sec);
+        }
+      }
+    }
+    if (vehicle_hold_pose_) {
+      const double hold_s = autoware::experimental::trajectory::closest(path, *vehicle_hold_pose_);
+      constexpr double kPassedTolerance = 0.3;  // [m]
+      if (hold_s < ego_s - kPassedTolerance) {
+        vehicle_hold_pose_.reset();  // could not stop before it: going on is the way out
+      } else {
+        crossing_hold_s = std::max(hold_s, ego_s);
+        RCLCPP_WARN_THROTTLE(
+          logger_, *clock_, 1000,
+          "RoadCrossing %ld [VEHICLE-CHECK]: a vehicle cannot stop for the robot -- holding %.1f m "
+          "ahead, before its conflict zone",
+          getModuleId(), *crossing_hold_s - ego_s);
+      }
+    }
+  } else {
+    vehicle_danger_since_.reset();
+    vehicle_clear_since_.reset();
+    vehicle_hold_pose_.reset();
+  }
+  if (crossing_hold_s && *crossing_hold_s < path.length()) {
+    path.longitudinal_velocity_mps().range(*crossing_hold_s, path.length()).set(0.0);
+    planning_factor_interface_->add(
+      path.restore(), planner_data.current_odometry->pose,
+      path.compute(*crossing_hold_s).point.pose,
+      autoware_internal_planning_msgs::msg::PlanningFactor::STOP,
+      autoware_internal_planning_msgs::msg::SafetyFactorArray{}, planner_data.is_driving_forward,
+      0.0, 0.0 /*shift distance*/, "road_crossing");
+    debug_data_.stop_pose = path.compute(*crossing_hold_s).point.pose;
+  }
+
   // Insert stop velocity if in STOPPING or CHECKING state.
   const bool should_stop = (state_ == State::STOPPING || state_ == State::CHECKING);
   if (should_stop && stop_s && *stop_s > 0.0 && *stop_s < path.length()) {
@@ -744,7 +837,8 @@ autoware::motion_utils::VirtualWalls RoadCrossingModule::createVirtualWalls()
 {
   autoware::motion_utils::VirtualWalls walls;
   if (debug_data_.stop_pose &&
-      (state_ == State::STOPPING || state_ == State::CHECKING)) {
+      (state_ == State::STOPPING || state_ == State::CHECKING ||
+       (state_ == State::CROSSING && vehicle_hold_pose_))) {
     autoware::motion_utils::VirtualWall wall;
     wall.text = "road_crossing";
     wall.style = autoware::motion_utils::VirtualWallType::stop;
