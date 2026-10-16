@@ -71,13 +71,20 @@ lanelet::BoundingBox2d prepare_relevent_bounding_box(
 
 void add_ignore_and_cut_lanelets(
   FilteringDataPerLabel & data_per_label, const std::vector<lanelet::Lanelet> & lanelets,
-  const std::vector<uint8_t> & labels, const std::vector<ObjectParameters> & params_per_label)
+  const std::vector<uint8_t> & labels, const std::vector<ObjectParameters> & params_per_label,
+  const bool ignore_collisions_in_road_crossing)
 {
   for (const auto & ll : lanelets) {
     const auto lanelet_subtype = ll.attributeOr(lanelet::AttributeName::Subtype, std::string());
+    const bool is_road_crossing = ll.attributeOr("road_crossing", false);
     for (const auto label : labels) {
       auto & data = data_per_label[label];
       const auto & params = params_per_label[label];
+      if (ignore_collisions_in_road_crossing && is_road_crossing) {
+        universe_utils::LinearRing2d polygon;
+        boost::geometry::convert(ll.polygon2d().basicPolygon(), polygon);
+        data.ignore_collisions_polygons.push_back(polygon);
+      }
       if (contains_type(params.cut_lanelet_subtypes, lanelet_subtype)) {
         for (auto i = 0UL; i < ll.polygon2d().numSegments(); ++i) {
           data.cut_predicted_paths_segments.push_back(convert(ll.polygon2d().segment(i)));
@@ -178,7 +185,9 @@ FilteringDataPerLabel calculate_filtering_data(
   }
   const auto lanelets_in_range = map_ptr->laneletLayer.search(bounding_box);
   const auto polygons_in_range = map_ptr->polygonLayer.search(bounding_box);
-  add_ignore_and_cut_lanelets(data_per_label, lanelets_in_range, target_labels, params_per_label);
+  add_ignore_and_cut_lanelets(
+    data_per_label, lanelets_in_range, target_labels, params_per_label,
+    parameters.ignore_collisions_in_road_crossing);
   add_ignore_and_cut_polygons(data_per_label, polygons_in_range, target_labels, params_per_label);
   const auto linestrings_in_range = map_ptr->lineStringLayer.search(bounding_box);
   add_cut_segments(data_per_label, linestrings_in_range, target_labels, params_per_label);
