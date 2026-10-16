@@ -6,6 +6,11 @@
         time_overlap_tolerance: 0.1  # [s] when calculating overlap time intervals, intervals are grouped if they are separated by less than this tolerance value
         same_direction_angle_threshold: 0.5  # [rad] threshold to determine if a collision is going in the same direction as the ego trajectory
         opposite_direction_angle_threshold: 0.5  # [rad] threshold around pi to determine if a collision is going in a direction opposite to the ego trajectory
+        # if true, collisions on lanelets tagged road_crossing=true are ignored, so run_out never stops
+        # the robot in the middle of the road. While crossing, nothing else then anticipates a vehicle
+        # (road_crossing only checks before entering); obstacle_stop/dynamic_obstacle_stop still act on
+        # what reaches the robot's path. Off until tried on the robot.
+        ignore_in_road_crossing: false
 
         ignore_conditions:  # ignore collisions in some conditions
           if_ego_arrives_first: # collision where ego arrives first

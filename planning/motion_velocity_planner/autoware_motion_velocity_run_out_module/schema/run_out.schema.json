@@ -41,6 +41,11 @@
               "description": "[rad] threshold around pi to determine if a collision is going in a direction opposite to the ego trajectory",
               "default": 0.5
             },
+            "ignore_in_road_crossing": {
+              "type": "boolean",
+              "description": "if true, collisions on lanelets tagged road_crossing=true are ignored (run_out does not stop the robot on the road)",
+              "default": false
+            },
             "ignore_conditions": {
               "description": "conditions to ignore some collisions",
               "type": "object",
@@ -111,6 +116,7 @@
             "time_overlap_tolerance",
             "same_direction_angle_threshold",
             "opposite_direction_angle_threshold",
+            "ignore_in_road_crossing",
             "ignore_conditions"
           ]
         },

@@ -127,6 +127,9 @@ struct Parameters
                                                         // collision is going in a direction
                                                         // opposite to the ego trajectory
   IgnoreCollisionConditionsParameters ignore_collision_conditions;
+  // ignore collisions on lanelets tagged road_crossing=true (the road crossing module decides
+  // about vehicles there)
+  bool ignore_collisions_in_road_crossing{false};
   // object parameters
   std::vector<std::string> objects_target_labels;
   std::vector<ObjectParameters> object_parameters_per_label;
@@ -205,6 +208,8 @@ struct Parameters
       getOrDeclareParameter<double>(node, ns + ".collision.same_direction_angle_threshold");
     collision_opposite_direction_angle_threshold =
       getOrDeclareParameter<double>(node, ns + ".collision.opposite_direction_angle_threshold");
+    ignore_collisions_in_road_crossing =
+      getOrDeclareParameter<bool>(node, ns + ".collision.ignore_in_road_crossing");
 
     const auto all_object_labels = all_labels();
     object_parameters_per_label.resize(
@@ -314,6 +319,8 @@ struct Parameters
     updateParam(params, ns + ".ego.lateral_margin", ego_lateral_margin);
     updateParam(params, ns + ".ego.longitudinal_margin", ego_longitudinal_margin);
     updateParam(params, ns + ".collision.time_margin", collision_time_margin);
+    updateParam(
+      params, ns + ".collision.ignore_in_road_crossing", ignore_collisions_in_road_crossing);
     updateParam(params, ns + ".collision.time_overlap_tolerance", collision_time_overlap_tolerance);
     updateParam(
       params, ns + ".collision.same_direction_angle_threshold",
