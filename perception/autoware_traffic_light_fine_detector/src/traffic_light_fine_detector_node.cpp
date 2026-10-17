@@ -50,6 +50,9 @@ TrafficLightFineDetectorNode::TrafficLightFineDetectorNode(const rclcpp::NodeOpt
   // This threshold will be ignored if specified model contains EfficientNMS_TRT module in it
   float nms_threshold = static_cast<float>(this->declare_parameter<double>("nms_thresh"));
   is_approximate_sync_ = this->declare_parameter<bool>("approximate_sync");
+  // Keep only detections whose class matches the rough ROI's traffic_light_type (a car light
+  // inside a pedestrian light's search ROI must not be matched to it). Off = upstream behaviour.
+  match_detection_type_ = this->declare_parameter<bool>("match_detection_type", false);
 
   int num_class;
   if (!readLabelFile(label_path, tlr_label_id_, num_class)) {
@@ -139,6 +142,7 @@ void TrafficLightFineDetectorNode::callback(
   autoware::tensorrt_yolox::ObjectArrays inference_results;
   std::vector<cv::Point> lts;
   std::vector<size_t> roi_ids;
+  std::vector<uint8_t> roi_types;
 
   for (size_t roi_i = 0; roi_i < rough_roi_msg->rois.size(); roi_i++) {
     const auto & rough_roi = rough_roi_msg->rois[roi_i];
@@ -149,6 +153,7 @@ void TrafficLightFineDetectorNode::callback(
     rois.emplace_back(lt, rb);
     lts.emplace_back(lt);
     roi_ids.emplace_back(rough_roi.traffic_light_id);
+    roi_types.emplace_back(rough_roi.traffic_light_type);
     // keep the actual batch size
     size_t true_batch_size = rois.size();
     // insert fake rois since the TRT model requires static batch size
@@ -162,6 +167,9 @@ void TrafficLightFineDetectorNode::callback(
       for (size_t batch_i = 0; batch_i < true_batch_size; batch_i++) {
         for (const autoware::tensorrt_yolox::Object & detection : inference_results[batch_i]) {
           if (detection.score < score_thresh_) {
+            continue;
+          }
+          if (match_detection_type_ && !detectionMatchesType(detection.type, roi_types[batch_i])) {
             continue;
           }
           cv::Point lt_roi(
@@ -181,6 +189,7 @@ void TrafficLightFineDetectorNode::callback(
       lts.clear();
       inference_results.clear();
       roi_ids.clear();
+      roi_types.clear();
     }
   }
   detectionMatch(id2expectRoi, id2detections, out_rois);
@@ -296,6 +305,18 @@ bool TrafficLightFineDetectorNode::rosMsg2CvMat(
   return true;
 }
 
+bool TrafficLightFineDetectorNode::detectionMatchesType(
+  const int32_t detection_class, const uint8_t traffic_light_type) const
+{
+  if (traffic_light_type == TrafficLightRoi::PEDESTRIAN_TRAFFIC_LIGHT) {
+    return detection_class == pedestrian_label_id_;
+  }
+  if (traffic_light_type == TrafficLightRoi::CAR_TRAFFIC_LIGHT) {
+    return detection_class == car_label_id_;
+  }
+  return true;
+}
+
 bool TrafficLightFineDetectorNode::readLabelFile(
   const std::string & filepath, std::vector<int> & tlr_label_id_, int & num_class)
 {
@@ -309,6 +330,11 @@ bool TrafficLightFineDetectorNode::readLabelFile(
   while (getline(labelsFile, label)) {
     if (label == "traffic_light" || label == "pedestrian_traffic_light") {
       tlr_label_id_.push_back(idx);
+    }
+    if (label == "traffic_light") {
+      car_label_id_ = idx;
+    } else if (label == "pedestrian_traffic_light") {
+      pedestrian_label_id_ = idx;
     }
     idx++;
   }

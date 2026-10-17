@@ -137,6 +137,7 @@ private:
    */
   bool readLabelFile(
     const std::string & filepath, std::vector<int> & tlr_label_id_, int & num_class);
+  bool detectionMatchesType(const int32_t detection_class, const uint8_t traffic_light_type) const;
 
   // variables
   image_transport::SubscriberFilter image_sub_;
@@ -162,6 +163,9 @@ private:
   bool is_approximate_sync_;
   double score_thresh_;
   std::vector<int> tlr_label_id_;
+  bool match_detection_type_;
+  int car_label_id_{-1};
+  int pedestrian_label_id_{-1};
 
   int batch_size_;
   std::unique_ptr<autoware::tensorrt_yolox::TrtYoloX> trt_yolox_;

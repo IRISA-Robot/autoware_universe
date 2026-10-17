@@ -30,6 +30,11 @@
           "type": "integer",
           "description": "ID for selecting the CUDA GPU device.",
           "default": 0
+        },
+        "match_detection_type": {
+          "type": "boolean",
+          "description": "Keep only detections whose class matches the rough ROI's traffic_light_type.",
+          "default": false
         }
       },
       "required": ["precision", "score_thresh", "nms_thresh", "approximate_sync", "gpu_id"],
