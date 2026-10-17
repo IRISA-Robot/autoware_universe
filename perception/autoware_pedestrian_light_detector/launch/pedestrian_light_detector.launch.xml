@@ -28,6 +28,11 @@
        RC_PL_BACKEND). Selalu di-set (override param_file dgn nilai yang sama). Default 'hsv'
        buat pemakaian standalone tanpa run script. -->
   <arg name="backend" default="hsv"/>
+  <!-- backend=autoware: true = clf/rois is a loose search ROI for autoware_traffic_light_fine_detector
+       (launched by tier4_road_crossing_component), plus fine/expect_rois. -->
+  <arg name="fine_detector" default="false"/>
+  <!-- backend=autoware: fullframe | fine | none ('' = follow fine_detector). -->
+  <arg name="roi_refiner" default=""/>
   <!-- Lanelet2 OSM the tf_pedestrian lights are read from: must be the map Autoware runs on,
        or the lights (and their ids, paired with road_crossing lanelets) don't match. -->
   <arg name="map_path" default="/home/ubuntu/sim_ws/maps/map1/lanelet2_map.osm"/>
@@ -43,6 +48,8 @@
     <param from="$(var param_file)"/>
     <param name="use_sim_time" value="$(var use_sim_time)"/>
     <param name="backend" value="$(var backend)"/>
+    <param name="autoware_fine_detector" value="$(var fine_detector)"/>
+    <param name="autoware_roi_refiner" value="$(var roi_refiner)"/>
     <param name="map_path" value="$(var map_path)"/>
   </node>
 </launch>

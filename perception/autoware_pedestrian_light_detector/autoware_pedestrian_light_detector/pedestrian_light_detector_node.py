@@ -58,6 +58,7 @@ try:
         TrafficLightRoiArray,
         TrafficLightRoi,
         TrafficLightArray,
+        DetectedObjectsWithFeature,
     )
     _TIER4_MSGS_AVAILABLE = True
 except ImportError:
@@ -76,6 +77,7 @@ except ImportError:
     _TF2_AVAILABLE = False
 
 from autoware_pedestrian_light_detector.classifiers import make_classifier, geometric_gate
+from autoware_pedestrian_light_detector import roi_refine
 from autoware_pedestrian_light_detector.roi_projector import (
     parse_tf_pedestrian_lights,
     project_point,
@@ -225,6 +227,47 @@ class PedestrianLightDetectorNode(Node):
         self.declare_parameter('autoware_image_topic', '~/clf/image')
         self.declare_parameter('autoware_rois_topic', '~/clf/rois')
         self.declare_parameter('autoware_signals_topic', '~/clf/traffic_signals')
+        # autoware_fine_detector: true = ~/clf/rois membawa ROI KASAR (area cari longgar) untuk
+        # autoware_traffic_light_fine_detector (YOLOX); fine detector mencari bbox lampu di
+        # dalamnya dan classifier mengklasifikasi bbox itu (classifier input/rois di-remap ke
+        # output fine detector di launch). false = ~/clf/rois langsung ke classifier (lama).
+        self.declare_parameter('autoware_fine_detector', False)
+        self.declare_parameter('autoware_expect_rois_topic', '~/fine/expect_rois')
+        # ROI kasar = tight bbox (proyeksi peta) + margin ini [px] tiap sisi: toleransi error
+        # kalibrasi/proyeksi.  Fine detector butuh konteks di sekitar lampu.
+        self.declare_parameter('autoware_rough_margin_px', 20)
+        # Ukuran fisik housing lampu [m] untuk expect ROI.  Fine detector menggeser expect ROI
+        # ke tiap deteksi dan memilih yang weighted-IoU-nya terbesar, jadi yang dipakai hanya
+        # UKURANNYA (bukan posisinya): deteksi seukuran housing menang atas objek lain.
+        self.declare_parameter('autoware_expect_width_m', 0.35)
+        self.declare_parameter('autoware_expect_height_m', 0.9)
+        # Output fine detector (bbox ketat) masuk ke node ini, lalu diteruskan ke classifier lewat
+        # autoware_final_rois_topic.  Kalau fine detector miss satu frame (lampu kecil -> skor
+        # YOLOX rendah), bbox terakhir dipakai ulang selama autoware_fine_hold_sec, asal masih di
+        # dalam ROI kasar sekarang.  Lampu statis + robot diam menunggu -> bbox itu masih valid.
+        # 0 = tanpa hold (miss langsung jadi UNKNOWN di classifier).
+        self.declare_parameter('autoware_fine_rois_topic', '~/fine/rois')
+        self.declare_parameter('autoware_final_rois_topic', '~/clf/final_rois')
+        self.declare_parameter('autoware_fine_hold_sec', 1.0)
+        # autoware_roi_refiner: cara mendapat bbox ketat lampu untuk classifier.
+        #   'fullframe' -> YOLOX full-frame (tensorrt_yolox, model sama dgn tools/ped_tl_test)
+        #                  di-AND dengan ROI kasar peta (roi_refine.py); miss -> hold -> kotak peta.
+        #   'fine'      -> autoware_traffic_light_fine_detector (YOLOX pada crop ROI kasar).
+        #   'none'      -> tight bbox peta langsung ke classifier.
+        #   ''          -> ikut autoware_fine_detector lama ('fine' kalau true, 'none' kalau false).
+        # Evaluasi rosbag 2026-10-17 (senja, lampu ~6x11 px): fine ~0% bbox, fullframe 72%.
+        self.declare_parameter('autoware_roi_refiner', '')
+        self.declare_parameter('autoware_ff_objects_topic', '~/ff/objects')
+        # Filter deteksi full-frame (lihat roi_refine.select_detection)
+        self.declare_parameter('autoware_ff_min_aspect', 1.0)
+        self.declare_parameter('autoware_ff_min_h_ratio', 0.3)
+        self.declare_parameter('autoware_ff_max_h_ratio', 3.0)
+        # Kotak fallback peta = expect box (ukuran housing) x skala ini
+        self.declare_parameter('autoware_fallback_scale_w', 2.0)
+        self.declare_parameter('autoware_fallback_scale_h', 2.0)
+        # Hasil classifier dengan confidence di bawah ini dianggap NONE.  Frame transisi saat
+        # lampu kedip padam terbaca RED/GREEN dgn conf 0.45-0.61 (rosbag 2026-10-17).
+        self.declare_parameter('autoware_min_confidence', 0.7)
 
         # debug_all_cameras: publish debug image SEMUA kamera saat roi_source=map.
         # Sekarang AMAN karena di-rate-limit oleh debug_rate_hz.
@@ -270,6 +313,38 @@ class PedestrianLightDetectorNode(Node):
         self._autoware_signals_topic = str(
             self.get_parameter('autoware_signals_topic').value
         )
+        self._autoware_fine_detector = bool(self.get_parameter('autoware_fine_detector').value)
+        self._autoware_expect_rois_topic = str(
+            self.get_parameter('autoware_expect_rois_topic').value)
+        self._autoware_rough_margin_px = max(
+            0, int(self.get_parameter('autoware_rough_margin_px').value))
+        self._autoware_expect_width_m = float(self.get_parameter('autoware_expect_width_m').value)
+        self._autoware_expect_height_m = float(
+            self.get_parameter('autoware_expect_height_m').value)
+        self._autoware_fine_rois_topic = str(self.get_parameter('autoware_fine_rois_topic').value)
+        self._autoware_final_rois_topic = str(
+            self.get_parameter('autoware_final_rois_topic').value)
+        self._autoware_fine_hold_sec = max(
+            0.0, float(self.get_parameter('autoware_fine_hold_sec').value))
+        refiner = str(self.get_parameter('autoware_roi_refiner').value).strip().lower()
+        if refiner == '':
+            refiner = 'fine' if self._autoware_fine_detector else 'none'
+        if refiner not in ('fullframe', 'fine', 'none'):
+            self.get_logger().error(
+                f"autoware_roi_refiner='{refiner}' tidak dikenal -> 'none'")
+            refiner = 'none'
+        self._roi_refiner = refiner
+        # fine path lama memakai flag ini di banyak tempat
+        self._autoware_fine_detector = (refiner == 'fine')
+        self._autoware_ff_objects_topic = str(
+            self.get_parameter('autoware_ff_objects_topic').value)
+        self._ff_min_aspect = float(self.get_parameter('autoware_ff_min_aspect').value)
+        self._ff_min_h_ratio = float(self.get_parameter('autoware_ff_min_h_ratio').value)
+        self._ff_max_h_ratio = float(self.get_parameter('autoware_ff_max_h_ratio').value)
+        self._fallback_scale_w = float(self.get_parameter('autoware_fallback_scale_w').value)
+        self._fallback_scale_h = float(self.get_parameter('autoware_fallback_scale_h').value)
+        self._autoware_min_confidence = float(
+            self.get_parameter('autoware_min_confidence').value)
 
         # Gabung params agar AutowareClassifier mendapat result_timeout_sec
         classifier_params = dict(hsv_params)
@@ -379,6 +454,19 @@ class PedestrianLightDetectorNode(Node):
         # tapi data hanya dipublish saat backend='autoware' aktif.
         self._clf_image_pub = None
         self._clf_rois_pub = None
+        self._fine_expect_pub = None
+        self._fine_rois_sub = None
+        self._final_rois_pub = None
+        self._ff_objects_sub = None
+        # fullframe: per stamp gambar -> (rough, center, expect_wh, img_wh) menunggu deteksi
+        self._ff_pending = collections.OrderedDict()
+        self._ff_hold = roi_refine.DetectionHold(self._autoware_fine_hold_sec)
+        self._ff_source_count = collections.Counter()
+        # Hold bbox fine detector: (x, y, w, h) terakhir yang terdeteksi + kapan (node clock)
+        self._fine_last_box = None
+        self._fine_last_time = None
+        # ROI kasar terakhir yang dikirim ke fine detector (x1, y1, x2, y2)
+        self._fine_last_rough = None
         self._clf_signals_sub = None
         # Simpan raw Image msg terakhir dari kamera aktif (untuk di-republish ke clf/image)
         self._last_raw_image = None
@@ -413,11 +501,51 @@ class PedestrianLightDetectorNode(Node):
                     self._on_clf_signals,
                     _SENSOR_QOS,
                 )
+                if self._autoware_fine_detector:
+                    # Fine detector expect_roi_sub juga rclcpp::QoS{1} (reliable).
+                    self._fine_expect_pub = self.create_publisher(
+                        TrafficLightRoiArray,
+                        self._autoware_expect_rois_topic,
+                        _INFO_QOS,
+                    )
+                    # fine detector output_roi_pub = QoS 1 reliable; classifier roi_sub juga.
+                    self._fine_rois_sub = self.create_subscription(
+                        TrafficLightRoiArray,
+                        self._autoware_fine_rois_topic,
+                        self._on_fine_rois,
+                        _INFO_QOS,
+                    )
+                    self._final_rois_pub = self.create_publisher(
+                        TrafficLightRoiArray,
+                        self._autoware_final_rois_topic,
+                        _INFO_QOS,
+                    )
+                if self._roi_refiner == 'fullframe':
+                    # tensorrt_yolox ~/out/objects = QoS 1 reliable.
+                    self._ff_objects_sub = self.create_subscription(
+                        DetectedObjectsWithFeature,
+                        self._autoware_ff_objects_topic,
+                        self._on_ff_objects,
+                        _INFO_QOS,
+                    )
+                    self._final_rois_pub = self.create_publisher(
+                        TrafficLightRoiArray,
+                        self._autoware_final_rois_topic,
+                        _INFO_QOS,
+                    )
                 self.get_logger().info(
                     f'[autoware backend] Topics: '
                     f'image={self._autoware_image_topic} '
                     f'rois={self._autoware_rois_topic} '
-                    f'signals={self._autoware_signals_topic}'
+                    f'signals={self._autoware_signals_topic} '
+                    + f'| roi_refiner={self._roi_refiner} '
+                    + (f'(objects={self._autoware_ff_objects_topic} -> '
+                       f'{self._autoware_final_rois_topic}, hold={self._autoware_fine_hold_sec}s, '
+                       f'min_conf={self._autoware_min_confidence})'
+                       if self._roi_refiner == 'fullframe' else
+                       f'(rois=ROI kasar +{self._autoware_rough_margin_px}px, '
+                       f'expect={self._autoware_expect_rois_topic})'
+                       if self._roi_refiner == 'fine' else '')
                 )
 
         # ---------- target light dari FSM (absolut) ----------
@@ -459,6 +587,16 @@ class PedestrianLightDetectorNode(Node):
         self._cam_states: dict = {}
         # Dict nama_kamera -> Subscription camera_info (lazy, saat enable)
         self._cam_info_subs: dict = {}
+        # Dict nama_kamera -> CameraInfo terakhir (K/ukuran kalibrasi mentah, belum di-skala)
+        self._cam_calib: dict = {}
+        # Dict nama_kamera -> (w, h) image_raw yang BENAR-BENAR dipublish kamera.
+        # Driver bisa videoscale (publish_width/height) tanpa menyesuaikan camera_info,
+        # jadi K di-skala ke ukuran ini (sama seperti irisa_aw_ui_overlay_node).
+        self._cam_img_size: dict = {}
+        # Dict nama_kamera -> Subscription image_raw sementara untuk tahu ukuran image
+        # (hanya kamera yang tidak di-subscribe debug_all_cameras); dihancurkan setelah dapat.
+        self._size_probe_subs: dict = {}
+        self._scale_warned: set = set()
         # Nama kamera aktif (yang image_raw-nya di-subscribe untuk klasifikasi)
         self._active_cam_name: str = ''
         # Subscription image_raw kamera aktif (Fase 2, untuk klasifikasi)
@@ -598,6 +736,8 @@ class PedestrianLightDetectorNode(Node):
             if self._debug_all_cameras and self._enable_debug_image:
                 self._subscribe_all_debug_images()
                 self._start_debug_timer()
+            # Ukuran image_raw tiap kamera (untuk skala K) — kamera yang belum di-subscribe.
+            self._subscribe_size_probes()
         else:
             # Fase 1: subscribe satu kamera tetap
             if self._cam_sub is None:
@@ -639,6 +779,10 @@ class PedestrianLightDetectorNode(Node):
         for cam_name, sub in list(self._cam_info_subs.items()):
             self.destroy_subscription(sub)
         self._cam_info_subs.clear()
+        for cam_name, sub in list(self._size_probe_subs.items()):
+            self.destroy_subscription(sub)
+        self._size_probe_subs.clear()
+        self._cam_img_size.clear()
         if self._cam_states:
             self.get_logger().info('Camera info subscriptions dihancurkan.')
 
@@ -659,6 +803,7 @@ class PedestrianLightDetectorNode(Node):
         self._map_tight_bbox = None
         self._active_light = None
         self._last_gate_result = (True, 'init', None)
+        self._reset_fine_hold()
         self._enabled = False
 
     # ------------------------------------------------------------------
@@ -709,6 +854,40 @@ class PedestrianLightDetectorNode(Node):
             self._cam_info_subs[cam_name] = sub
             self.get_logger().info(f'[Fase 2] Camera info sub: {topic}')
 
+    def _subscribe_size_probes(self):
+        """Subscribe image_raw sementara untuk kamera yang ukuran image-nya belum diketahui.
+
+        Dipanggil setelah _subscribe_all_debug_images (kalau aktif), jadi kamera yang
+        sudah punya debug sub tidak di-probe dua kali.
+        """
+        for cam_name in self._camera_names:
+            if (cam_name in self._debug_image_subs or cam_name in self._size_probe_subs or
+                    cam_name in self._cam_img_size):
+                continue
+
+            def make_probe_cb(name):
+                def cb(msg: Image):
+                    self._note_image_size(name, msg)
+                return cb
+
+            self._size_probe_subs[cam_name] = self.create_subscription(
+                Image,
+                f'/camera/{cam_name}/image_raw',
+                make_probe_cb(cam_name),
+                _SENSOR_QOS,
+            )
+
+    def _drop_finished_size_probes(self):
+        """Hancurkan probe yang sudah dapat ukuran (di luar callback probe itu sendiri)."""
+        for cam_name in [c for c in self._size_probe_subs if c in self._cam_img_size]:
+            self.destroy_subscription(self._size_probe_subs.pop(cam_name))
+
+    def _note_image_size(self, cam_name: str, msg: Image):
+        size = (int(msg.width), int(msg.height))
+        if self._cam_img_size.get(cam_name) != size:
+            self._cam_img_size[cam_name] = size
+            self._rebuild_cam_state(cam_name)
+
     def _subscribe_all_debug_images(self):
         """
         Subscribe image_raw SEMUA kamera untuk keperluan debug_all_cameras.
@@ -748,14 +927,40 @@ class PedestrianLightDetectorNode(Node):
         """
         # Simpan msg mentah — O(1), tidak ada alokasi array besar
         self._debug_raw[cam_name] = msg
+        self._note_image_size(cam_name, msg)
 
     def _camera_info_cb(self, cam_name: str, msg: CameraInfo):
         """Simpan intrinsic + frame_id dari camera_info."""
+        self._cam_calib[cam_name] = msg
+        self._rebuild_cam_state(cam_name)
+
+    def _rebuild_cam_state(self, cam_name: str):
+        """CameraState dari camera_info, K di-skala ke ukuran image_raw sebenarnya."""
+        msg = self._cam_calib.get(cam_name)
+        if msg is None:
+            return
         # Ambil K sebagai 3x3 array (row-major dari msg.k)
         K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
         frame_id = msg.header.frame_id
         w = msg.width
         h = msg.height
+
+        img_size = self._cam_img_size.get(cam_name)
+        if img_size is not None and w > 0 and h > 0 and img_size != (w, h):
+            sx = img_size[0] / w
+            sy = img_size[1] / h
+            K[0, :] *= sx   # fx, skew, cx
+            K[1, :] *= sy   # fy, cy
+            key = (cam_name, w, h) + img_size
+            if key not in self._scale_warned:
+                self._scale_warned.add(key)
+                aspect = '' if abs(sx - sy) < 1e-3 else \
+                    ' ASPECT RATIO BEDA (image di-stretch) — cek kalibrasi/publish size.'
+                self.get_logger().warn(
+                    f'[Fase 2] Kamera {cam_name!r}: image {img_size[0]}x{img_size[1]} tapi '
+                    f'camera_info {w}x{h} — K di-skala (sx={sx:.3f} sy={sy:.3f}).{aspect}'
+                )
+            w, h = img_size
 
         if cam_name not in self._cam_states or \
                 self._cam_states[cam_name].frame_id != frame_id:
@@ -802,6 +1007,7 @@ class PedestrianLightDetectorNode(Node):
         self._last_frame = None        # reset frame saat ganti kamera
         self._last_raw_image = None    # reset raw image (autoware backend) saat ganti kamera
         self._last_image_rx_time = None
+        self._reset_fine_hold()        # bbox kamera lama tidak berlaku di kamera baru
         self.get_logger().info(
             f'[Fase 2] Image sub baru: {topic}'
         )
@@ -818,6 +1024,8 @@ class PedestrianLightDetectorNode(Node):
         # (direpublish ke ~/clf/image dengan stamp asli)
         self._last_raw_image = msg
         self._last_image_rx_time = self.get_clock().now()
+        if self._active_cam_name:
+            self._note_image_size(self._active_cam_name, msg)
         try:
             bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             self._last_frame = bgr
@@ -950,6 +1158,8 @@ class PedestrianLightDetectorNode(Node):
             state = STATE_GREEN
         else:
             state = STATE_NONE
+        if float(element.confidence) < self._autoware_min_confidence:
+            state = STATE_NONE
 
         now_sec = self.get_clock().now().nanoseconds * 1e-9
 
@@ -970,6 +1180,7 @@ class PedestrianLightDetectorNode(Node):
             self._raw_state_buf.clear()
             self._committed_state = STATE_NONE
             self._committed_conf = 0.0
+            self._reset_fine_hold()
         self._target_light_ids = ids
 
     def _image_is_fresh(self) -> bool:
@@ -1078,6 +1289,7 @@ class PedestrianLightDetectorNode(Node):
             self._publish_state(STATE_NONE, 0.0)
             return
 
+        self._drop_finished_size_probes()
         cameras_list = list(self._cam_states.values())
         result = projector_select(
             candidates,
@@ -1162,6 +1374,118 @@ class PedestrianLightDetectorNode(Node):
     # Autoware backend: sub-routine publish_cb_map
     # ------------------------------------------------------------------
 
+    def _make_rois_msg(self, bbox, stamp, frame_id: str) -> 'TrafficLightRoiArray':
+        """TrafficLightRoiArray satu ROI pedestrian (autoware_light_id) dari bbox (x1,y1,x2,y2)."""
+        from sensor_msgs.msg import RegionOfInterest
+        x1, y1, x2, y2 = bbox
+        roi_msg = RegionOfInterest()
+        roi_msg.x_offset = max(0, int(x1))
+        roi_msg.y_offset = max(0, int(y1))
+        roi_msg.width = max(0, int(x2) - max(0, int(x1)))
+        roi_msg.height = max(0, int(y2) - max(0, int(y1)))
+        roi_msg.do_rectify = False
+
+        tl_roi = TrafficLightRoi()
+        tl_roi.roi = roi_msg
+        tl_roi.traffic_light_id = self._autoware_light_id
+        tl_roi.traffic_light_type = 1  # PEDESTRIAN_TRAFFIC_LIGHT
+
+        rois_msg = TrafficLightRoiArray()
+        rois_msg.header.stamp = stamp  # EXACT same stamp as republished image
+        rois_msg.header.frame_id = frame_id
+        rois_msg.rois = [tl_roi]
+        return rois_msg
+
+    def _reset_fine_hold(self):
+        self._fine_last_box = None
+        self._fine_last_time = None
+        self._fine_last_rough = None
+        self._ff_hold.reset()
+        self._ff_pending.clear()
+
+    def _on_ff_objects(self, msg: 'DetectedObjectsWithFeature'):
+        """Deteksi YOLOX full-frame -> bbox lampu target -> classifier (clf/final_rois).
+
+        Pilihan bbox di roi_refine.refine(): deteksi tegak seukuran housing di dalam ROI kasar
+        peta yang paling dekat ke titik proyeksi; miss -> bbox terakhir (hold); masih kosong ->
+        kotak peta di titik proyeksi.  Stamp = stamp gambar, jadi classifier tetap exact-sync.
+        """
+        if self._final_rois_pub is None:
+            return
+        pending = self._ff_pending.pop((msg.header.stamp.sec, msg.header.stamp.nanosec), None)
+        if pending is None:
+            return   # frame lama / kamera atau target sudah ganti
+        rough, center, expect_wh, img_wh, frame_id = pending
+        dets = []
+        for obj in msg.feature_objects:
+            r = obj.feature.roi
+            dets.append((int(r.x_offset), int(r.y_offset), int(r.width), int(r.height),
+                         float(obj.object.existence_probability)))
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        box, source = roi_refine.refine(
+            dets, rough, center, expect_wh, img_wh, self._ff_hold, now_sec,
+            self._ff_min_aspect, self._ff_min_h_ratio, self._ff_max_h_ratio,
+            self._fallback_scale_w, self._fallback_scale_h)
+        self._ff_source_count[source] += 1
+        x, y, w, h = box
+        self._final_rois_pub.publish(
+            self._make_rois_msg((x, y, x + w, y + h), msg.header.stamp, frame_id))
+        total = sum(self._ff_source_count.values())
+        if total >= 100:
+            self.get_logger().info(
+                '[fullframe] sumber ROI 100 frame terakhir: '
+                + ' '.join(f'{k}={v}' for k, v in sorted(self._ff_source_count.items())))
+            self._ff_source_count.clear()
+
+    def _on_fine_rois(self, msg: 'TrafficLightRoiArray'):
+        """Output fine detector -> classifier, isi frame yang miss dengan bbox terakhir.
+
+        Stamp msg = stamp image yang sama (fine detector menyalin header ROI kasar), jadi
+        classifier tetap bisa exact-sync dengan ~/clf/image.
+        """
+        if self._final_rois_pub is None:
+            return
+        now = self.get_clock().now()
+        out = TrafficLightRoiArray()
+        out.header = msg.header
+        for tl_roi in msg.rois:
+            r = tl_roi.roi
+            if tl_roi.traffic_light_id == self._autoware_light_id:
+                if r.width > 0 and r.height > 0:
+                    self._fine_last_box = (r.x_offset, r.y_offset, r.width, r.height)
+                    self._fine_last_time = now
+                elif self._fine_hold_valid(now):
+                    x, y, w, h = self._fine_last_box
+                    tl_roi.roi.x_offset, tl_roi.roi.y_offset = x, y
+                    tl_roi.roi.width, tl_roi.roi.height = w, h
+            out.rois.append(tl_roi)
+        self._final_rois_pub.publish(out)
+
+    def _fine_hold_valid(self, now) -> bool:
+        """bbox terakhir masih boleh dipakai: belum basi dan masih di dalam ROI kasar sekarang."""
+        if (self._fine_last_box is None or self._fine_last_time is None or
+                self._autoware_fine_hold_sec <= 0.0):
+            return False
+        if (now - self._fine_last_time).nanoseconds * 1e-9 > self._autoware_fine_hold_sec:
+            return False
+        rough = self._fine_last_rough
+        if rough is None:
+            return False
+        x, y, w, h = self._fine_last_box
+        return rough[0] <= x and rough[1] <= y and x + w <= rough[2] and y + h <= rough[3]
+
+    def _expect_size_px(self, cam_state, fallback_w: float, fallback_h: float) -> tuple:
+        """Ukuran housing lampu aktif dalam piksel (dari jarak kamera), fallback = tight bbox."""
+        light = self._active_light
+        if cam_state is not None and light is not None:
+            res = project_point(light.midpoint, cam_state.K, cam_state.frame_id,
+                                self._tf_buffer, stamp=None)
+            if res is not None and res[2] > 0.1:
+                depth = res[2]
+                return (max(4.0, cam_state.K[0, 0] * self._autoware_expect_width_m / depth),
+                        max(8.0, cam_state.K[1, 1] * self._autoware_expect_height_m / depth))
+        return float(fallback_w), float(fallback_h)
+
     def _publish_cb_map_autoware(
         self,
         sel_padded_bbox: tuple,
@@ -1210,30 +1534,44 @@ class PedestrianLightDetectorNode(Node):
             # tight degenerate → pakai padded biar classifier tetap dpt crop valid
             x1, y1, x2, y2 = sel_padded_bbox
 
-        from sensor_msgs.msg import RegionOfInterest
-        roi_msg = RegionOfInterest()
-        roi_msg.x_offset = max(0, int(x1))
-        roi_msg.y_offset = max(0, int(y1))
-        roi_msg.width = max(0, int(x2) - max(0, int(x1)))
-        roi_msg.height = max(0, int(y2) - max(0, int(y1)))
-        roi_msg.do_rectify = False
-
-        tl_roi = TrafficLightRoi()
-        tl_roi.roi = roi_msg
-        tl_roi.traffic_light_id = self._autoware_light_id
-        tl_roi.traffic_light_type = 1  # PEDESTRIAN_TRAFFIC_LIGHT
-
-        rois_msg = TrafficLightRoiArray()
-        rois_msg.header.stamp = img_stamp  # EXACT same stamp as republished image
-        # Usa camera frame_id dari kamera aktif
         cam_state = self._cam_states.get(sel_cam_name)
-        if cam_state is not None:
-            rois_msg.header.frame_id = cam_state.frame_id
-        else:
-            rois_msg.header.frame_id = f'camera_{sel_cam_name}'
-        rois_msg.rois = [tl_roi]
+        frame_id = cam_state.frame_id if cam_state is not None else f'camera_{sel_cam_name}'
 
-        self._clf_rois_pub.publish(rois_msg)
+        if self._roi_refiner == 'fullframe':
+            # YOLOX full-frame mendeteksi di clf/image; hasilnya dipadankan di _on_ff_objects
+            # dengan ROI kasar + titik proyeksi frame yang sama (key = stamp gambar).
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            m = self._autoware_rough_margin_px
+            img_w = int(raw_img.width)
+            img_h = int(raw_img.height)
+            rough = (max(0, int(x1) - m), max(0, int(y1) - m),
+                     min(img_w, int(x2) + m), min(img_h, int(y2) + m))
+            ew, eh = self._expect_size_px(cam_state, x2 - x1, y2 - y1)
+            self._ff_pending[(img_stamp.sec, img_stamp.nanosec)] = (
+                rough, (cx, cy), (ew, eh), (img_w, img_h), frame_id)
+            while len(self._ff_pending) > 30:
+                self._ff_pending.popitem(last=False)
+            # clf/rois = ROI kasar, hanya untuk debug/visualisasi (classifier baca final_rois)
+            self._clf_rois_pub.publish(self._make_rois_msg(rough, img_stamp, frame_id))
+        elif self._autoware_fine_detector:
+            # Fine detector: tight bbox = pusat lampu menurut peta; kirim area cari longgar
+            # di sekitarnya (ROI kasar) + expect ROI seukuran housing di pusat yang sama.
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            m = self._autoware_rough_margin_px
+            img_w = int(raw_img.width)
+            img_h = int(raw_img.height)
+            rough = (max(0, int(x1) - m), max(0, int(y1) - m),
+                     min(img_w, int(x2) + m), min(img_h, int(y2) + m))
+            ew, eh = self._expect_size_px(cam_state, x2 - x1, y2 - y1)
+            expect = (max(0, int(round(cx - ew / 2.0))), max(0, int(round(cy - eh / 2.0))),
+                      min(img_w, int(round(cx + ew / 2.0))), min(img_h, int(round(cy + eh / 2.0))))
+            # expect dulu: fine detector exact-sync image+rough+expect, ketiganya stamp sama.
+            self._fine_expect_pub.publish(self._make_rois_msg(expect, img_stamp, frame_id))
+            self._clf_rois_pub.publish(self._make_rois_msg(rough, img_stamp, frame_id))
+            self._fine_last_rough = rough
+        else:
+            self._clf_rois_pub.publish(
+                self._make_rois_msg((x1, y1, x2, y2), img_stamp, frame_id))
 
         # --- Ambil state dari cache (dengan staleness check) ---
         now_sec = self.get_clock().now().nanoseconds * 1e-9
