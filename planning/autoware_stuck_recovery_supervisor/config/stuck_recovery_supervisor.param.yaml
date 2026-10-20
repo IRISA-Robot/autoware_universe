@@ -470,7 +470,7 @@
       - "intersection_collision_checker"
 
     # road_crossing FSM states that mean "it is deliberately holding":
-    # ARMED_CROSSWALK(1), REROUTING_TO_ALT(3), ARMED_LIGHT(4), WAIT_GREEN(5),
+    # APPROACH_PRE(1), REROUTING_TO_ALT(3), ARMED_LIGHT(4), WAIT_GREEN(5),
     # REROUTING_TO_GOAL(8).  That FSM has its own watchdog -- never compete with it.
     road_crossing_hold_states: [1, 3, 4, 5, 8]
 

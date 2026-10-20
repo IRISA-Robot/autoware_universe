@@ -19,7 +19,7 @@
   <!-- Sim time (true saat jalan di Isaac sim) -->
   <arg name="use_sim_time" default="false"/>
 
-  <!-- External aim target topic dari FSM (road_crossing approach phase).
+  <!-- External aim target topic (FSM tidak lagi mempublish; untuk uji manual).
        Default kosong = pakai nilai dari param file (~/aim_target).
        Override kalau FSM publish ke namespace lain. -->
   <arg name="target_topic" default="~/aim_target"/>

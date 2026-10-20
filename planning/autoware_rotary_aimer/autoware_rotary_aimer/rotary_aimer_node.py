@@ -75,6 +75,26 @@ Parameters
   target_fresh_sec     float  -- max age (s) for an external target to be considered
                                  fresh (default: 0.5).  Older targets are ignored and
                                  the node falls back to the internal light.
+  center_enable        bool   -- CENTER mode for the light target (default: false), below
+  center_camera_frame  str    -- camera frame, x along the optical axis (camera_front_link)
+  center_body_frame    str    -- rotary platform frame; its yaw in base_frame is the rotary
+                                 angle (default: body_link, broadcast from the encoder)
+  center_enter_deg     float  -- MAP -> CENTER when the light is this close to the camera
+                                 axis (default: 20)
+  center_exit_deg      float  -- CENTER -> MAP beyond this (default: 30; hysteresis)
+  center_deadband_deg  float  -- keep the CENTER target while the light is this close to
+                                 the camera axis (default: 3; above the rotary PID deadzone)
+  center_gain          float  -- fraction of the camera-axis error corrected (default: 1.0)
+
+Aim modes (light target only)
+-----------------------------
+  MAP     bearing to the light from base_frame (above).
+  CENTER  put the light on the camera axis: err = atan2(y, x) of the light in
+          center_camera_frame, target = rotary angle (yaw of center_body_frame in
+          base_frame) + center_gain * err.  The light's projected ROI ends up at the centre
+          of the frame; the camera mounting comes from TF, so front_cam_offset_rad is not
+          used.  Both transforms come from TF, so a rotary still slewing does not overshoot.
+          Without those frames (planning simulator) the node stays in MAP.
 """
 
 import math
@@ -136,6 +156,13 @@ class RotaryAimerNode(Node):
         self.declare_parameter('target_topic', '~/aim_target')
         self.declare_parameter('target_fresh_sec', 0.5)
         self.declare_parameter('target_light_topic', '/planning/road_crossing/target_light')
+        self.declare_parameter('center_enable', False)
+        self.declare_parameter('center_camera_frame', 'camera_front_link')
+        self.declare_parameter('center_body_frame', 'body_link')
+        self.declare_parameter('center_enter_deg', 20.0)
+        self.declare_parameter('center_exit_deg', 30.0)
+        self.declare_parameter('center_deadband_deg', 3.0)
+        self.declare_parameter('center_gain', 1.0)
 
         self._map_path = str(self.get_parameter('map_path').value)
         self._base_frame = str(self.get_parameter('base_frame').value)
@@ -158,6 +185,16 @@ class RotaryAimerNode(Node):
         self._target_topic = str(self.get_parameter('target_topic').value)
         self._target_fresh_sec = float(
             self.get_parameter('target_fresh_sec').value)
+        self._center_enable = bool(self.get_parameter('center_enable').value)
+        self._center_camera_frame = str(self.get_parameter('center_camera_frame').value)
+        self._center_body_frame = str(self.get_parameter('center_body_frame').value)
+        self._center_enter_rad = math.radians(
+            float(self.get_parameter('center_enter_deg').value))
+        self._center_exit_rad = math.radians(
+            float(self.get_parameter('center_exit_deg').value))
+        self._center_deadband_rad = math.radians(
+            float(self.get_parameter('center_deadband_deg').value))
+        self._center_gain = float(self.get_parameter('center_gain').value)
 
         # ------------------------------------------------------------------ state
         self._enabled = False
@@ -168,9 +205,13 @@ class RotaryAimerNode(Node):
         self._latest_feedback_angle = None  # latest /gama/feedback/rotary value (rad)
         self._feedback_received = False     # True once at least one feedback msg arrived
 
-        # External aim target from FSM (road_crossing approach phase)
+        # External aim target (target_topic; the road_crossing FSM no longer publishes one)
         self._ext_target_point = None   # (x, y, z) in map frame, or None
         self._ext_target_time = None    # rclpy.time.Time when the msg was received
+
+        # Aim mode for the light target: 'MAP' or 'CENTER' (see module docstring).
+        self._aim_mode = 'MAP'
+        self._center_target = None  # CENTER: rotary target [rad, physical], None = recompute
 
         # Light(s) paired with the FSM's active crossing; None until the FSM publishes,
         # in which case every tf_pedestrian light is a candidate (original behavior).
@@ -313,6 +354,7 @@ class RotaryAimerNode(Node):
                 'seeding slew from 0.0 rad (fallback)')
 
         self._enabled = True
+        self._set_aim_mode('MAP', 'enabled')
         if self._aim_timer is None:
             period = 1.0 / max(self._rate_hz, 0.1)
             self._aim_timer = self.create_timer(period, self._aim_tick)
@@ -320,6 +362,7 @@ class RotaryAimerNode(Node):
     def _stop_aiming(self):
         """Stop the aim loop; if zero_on_disable, slew-ramp back to 0.0."""
         self._enabled = False
+        self._set_aim_mode('MAP', 'disabled')
 
         # Destroy the aim timer
         if self._aim_timer is not None:
@@ -475,7 +518,7 @@ class RotaryAimerNode(Node):
                     use_external = True
 
             if use_external:
-                # --- EXTERNAL target (road_crossing approach centroid) ---
+                # --- EXTERNAL target (any PointStamped on target_topic; MAP mode only) ---
                 ex, ey, ez = self._ext_target_point
                 p_map = np.array([ex, ey, ez], dtype=float)
                 p_base = R @ p_map + t_vec
@@ -541,10 +584,12 @@ class RotaryAimerNode(Node):
                 desired = _wrap_pi(desired)
                 if self._invert_sign:
                     desired = -desired
+                desired = self._center_desired(light.midpoint, desired)
 
                 dist_m = math.sqrt(best_dist_sq)
                 self.get_logger().info(
                     f'[rotary_aimer] aim target: light way_id={light.way_id} '
+                    f'mode={self._aim_mode} '
                     f'dist={dist_m:.2f}m '
                     f'base_xy=({light_x:.2f},{light_y:.2f}) '
                     f'bearing={math.degrees(bearing):.1f}deg '
@@ -590,6 +635,73 @@ class RotaryAimerNode(Node):
                 f'_aim_tick unhandled exception: {exc}',
                 throttle_duration_sec=2.0,
             )
+
+    # ---------------------------------------------------------------------- CENTER mode
+
+    def _set_aim_mode(self, mode: str, reason: str):
+        if mode != self._aim_mode:
+            self.get_logger().info(f'aim mode {self._aim_mode} -> {mode} ({reason})')
+        self._aim_mode = mode
+        self._center_target = None
+
+    def _center_desired(self, p_map, map_desired: float) -> float:
+        """Rotary command for the light at p_map (map frame): CENTER when active, else map_desired.
+
+        map_desired is the MAP-mode command (output sign convention).
+        """
+        if not self._center_enable:
+            self._set_aim_mode('MAP', 'center_enable=false')
+            return map_desired
+
+        import numpy as np
+        try:
+            tf_cam = self._tf_buffer.lookup_transform(
+                self._center_camera_frame, self._map_frame, RclpyTime())
+            tf_body = self._tf_buffer.lookup_transform(
+                self._base_frame, self._center_body_frame, RclpyTime())
+        except Exception as exc:
+            if self._aim_mode != 'MAP':
+                self._set_aim_mode('MAP', f'TF unavailable: {exc}')
+            self.get_logger().warn(
+                f'CENTER: TF {self._center_camera_frame}/{self._center_body_frame} '
+                f'unavailable, staying in MAP: {exc}',
+                throttle_duration_sec=10.0,
+            )
+            return map_desired
+
+        ro = tf_cam.transform.rotation
+        tr = tf_cam.transform.translation
+        p_cam = (_quat_to_matrix(ro.x, ro.y, ro.z, ro.w) @ np.array(p_map, dtype=float)
+                 + np.array([tr.x, tr.y, tr.z], dtype=float))
+        # Bearing of the light from the camera axis (x forward, y left; behind -> |err| > 90 deg).
+        err = math.atan2(p_cam[1], p_cam[0])
+
+        qb = tf_body.transform.rotation
+        rotary = math.atan2(2.0 * (qb.w * qb.z + qb.x * qb.y),
+                            1.0 - 2.0 * (qb.y * qb.y + qb.z * qb.z))
+
+        if self._aim_mode != 'CENTER':
+            if abs(err) >= self._center_enter_rad:
+                return map_desired
+            self._set_aim_mode(
+                'CENTER', f'light {math.degrees(err):+.1f}deg off the camera axis')
+        elif abs(err) > self._center_exit_rad:
+            self._set_aim_mode(
+                'MAP', f'light {math.degrees(err):+.1f}deg off the camera axis')
+            return map_desired
+
+        if self._center_target is None or abs(err) > self._center_deadband_rad:
+            self._center_target = _wrap_pi(rotary + self._center_gain * err)
+        out = -self._center_target if self._invert_sign else self._center_target
+
+        self.get_logger().info(
+            f'[rotary_aimer] CENTER: err={math.degrees(err):+.2f}deg '
+            f'rotary={math.degrees(rotary):.2f}deg '
+            f'target={math.degrees(self._center_target):.2f}deg '
+            f'(map would be {math.degrees(map_desired):.2f}deg)',
+            throttle_duration_sec=1.0,
+        )
+        return out
 
     # ---------------------------------------------------------------------- helpers
 
@@ -640,7 +752,8 @@ class RotaryAimerNode(Node):
 
         Live params (take effect immediately without restart):
           max_angle_rate_rad_s, zero_rate_rad_s, front_cam_offset_rad,
-          invert_sign, zero_on_disable.
+          invert_sign, zero_on_disable, center_enable, center_enter_deg,
+          center_exit_deg, center_deadband_deg, center_gain.
 
         rate_hz is intentionally excluded — changing it would require
         recreating the timer; accepted silently with a warning.
@@ -689,6 +802,26 @@ class RotaryAimerNode(Node):
                 self._zero_on_disable = val
                 self.get_logger().info(
                     f'param zero_on_disable updated -> {val}')
+
+            elif name == 'center_enable':
+                self._center_enable = bool(param.value)
+                self.get_logger().info(
+                    f'param center_enable updated -> {self._center_enable}')
+
+            elif name in ('center_enter_deg', 'center_exit_deg', 'center_deadband_deg'):
+                val = float(param.value)
+                if val <= 0.0:
+                    return SetParametersResult(successful=False, reason=f'{name} must be > 0')
+                setattr(self, '_' + name.replace('_deg', '_rad'), math.radians(val))
+                self.get_logger().info(f'param {name} updated -> {val}')
+
+            elif name == 'center_gain':
+                val = float(param.value)
+                if not 0.0 < val <= 1.5:
+                    return SetParametersResult(
+                        successful=False, reason='center_gain must be in (0, 1.5]')
+                self._center_gain = val
+                self.get_logger().info(f'param center_gain updated -> {val}')
 
             elif name == 'rate_hz':
                 # Changing rate_hz requires recreating the timer — not live.

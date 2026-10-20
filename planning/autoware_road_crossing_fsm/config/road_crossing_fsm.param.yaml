@@ -6,7 +6,7 @@
     update_rate_hz: 10.0                # [Hz] FSM tick frequency
 
     # -------------------------------------------------------------------
-    # IDLE → ARMED_CROSSWALK trigger
+    # IDLE → APPROACH_PRE trigger
     # -------------------------------------------------------------------
     # Episode mulai hanya saat base_link di lanelet tepat sebelum road_crossing (pre) dan berakhir/reset
     # begitu robot tidak di pre/crossing aktif (arm_hops_max dihapus).
@@ -73,11 +73,11 @@
     srv_rotary_aimer:            "/rotary_aimer/enable"
 
     # -------------------------------------------------------------------
-    # Rotary aimer spam-enable (skema baru)
-    # Kirim enable berulang ke rotary_aimer setiap aim_enable_retry_sec selama robot
-    # berada di pre lanelet (waiting state) dan aimer belum publishing (cmd stale).
-    # "at_pre" ditentukan dari topologi lanelet: current lanelet harus pre_road_crossing
-    # DAN next lanelet dalam route harus road_crossing — deterministic, bukan heuristik kecepatan.
+    # Rotary aimer spam-enable
+    # Kirim enable berulang ke rotary_aimer setiap aim_enable_retry_sec selama FSM menunggu
+    # (APPROACH_PRE .. WAIT_GREEN), crossing punya lampu, dan ego di pre (base_link ATAU
+    # bumper depan) atau dalam aim_approach_dist_m dari pre entry -- selama aimer belum
+    # publishing (cmd stale).  Aimer selalu membidik lampu target (target_light).
     # Berhenti spam setelah aimer publish pesan (cmd fresh → running confirmed).
     # -------------------------------------------------------------------
     topic_rotary_angle_cmd:  "/control/rotary_angle_cmd"
@@ -88,20 +88,8 @@
     aim_enable_retry_sec:    0.3        # [s] interval minimum antar kiriman enable ke rotary_aimer.
                                         # Cukup sering agar enable tidak missed, tidak terlalu padat.
 
-    # -------------------------------------------------------------------
-    # Rotary aimer APPROACH phase (baru)
-    # Sebelum robot tiba di pre, FSM sudah mengaktifkan aimer dan mengirim centroid
-    # road_crossing sebagai target eksternal ke /rotary_aimer/aim_target agar kamera
-    # langsung menghadap crosswalk (YOLO always-on bisa mendeteksi sejak jauh).
-    # Begitu robot masuk pre (at_pre), pengiriman target berhenti → aimer fallback ke
-    # tf_pedestrian_light (perilaku lama tidak berubah).
-    # -------------------------------------------------------------------
-    aim_approach_dist_m:  10.0          # [m] jarak dari pre entry di mana FSM mulai aim centroid
-                                        # road_crossing (fase APPROACH). Aimer diaktifkan dan
-                                        # centroid crosswalk dikirim ke topic_aim_target.
-                                        # Di pre: kirim target berhenti → aimer aim lampu.
-    topic_aim_target:  "/rotary_aimer/aim_target"
-                                        # Topik PointStamped (map frame) target eksternal aimer.
+    aim_approach_dist_m:  10.0          # [m] jarak dari pre entry di mana aimer mulai diaktifkan
+                                        # dan membidik lampu (sebelum robot tiba di pre).
     topic_target_light:  "/planning/road_crossing/target_light"
                                         # PedestrianLightTarget: lampu pasangan crossing aktif,
                                         # dari tag forward_pedestrian_tf (reverse_pedestrian_tf
@@ -116,7 +104,7 @@
                                         #     berada di rentang [0, pre_arrive_dist_m].
                                         #     Harus >= pre_stop_dist_m (≈2.0 m) agar gate aktif
                                         #     saat robot sudah berhenti di pre-stop.
-                                        #     Gate ARMED_CROSSWALK: tahan sampai at_pre = true.
+                                        #     Gate APPROACH_PRE: tahan sampai at_pre = true.
     crossing_arrive_dist_m:  3.0        # [m] ego dianggap "sudah di crossing" jika
                                         #     distanceToCrossingEntry() berada di [0, crossing_arrive_dist_m].
                                         #     Gate WAIT_GREEN: tahan sampai at_crossing = true.

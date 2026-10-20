@@ -31,7 +31,7 @@
 #include <autoware_road_crossing_msgs/msg/pedestrian_light_state.hpp>
 #include <autoware_road_crossing_msgs/msg/pedestrian_light_target.hpp>
 #include <autoware_road_crossing_msgs/msg/road_crossing_gate.hpp>
-#include <geometry_msgs/msg/point_stamped.hpp>
+#include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -59,8 +59,8 @@ namespace autoware::road_crossing_fsm
 // Values are stable — do NOT renumber existing states.
 //
 //   IDLE             = 0
-//   ARMED_CROSSWALK  = 1   robot approaching crossing; holding until ego is at the pre
-//   CROSSWALK_OK     = 2   ego at the pre; one-tick intermediate
+//   APPROACH_PRE     = 1   robot approaching crossing; holding until ego is at the pre
+//   AT_PRE           = 2   ego at the pre; one-tick intermediate
 //   REROUTING_TO_ALT = 3   Phase A: send robot to alternate crossing
 //   ARMED_LIGHT      = 4   at road_crossing; waiting for pedestrian light
 //   WAIT_GREEN       = 5   pedestrian light seen; waiting for GREEN
@@ -71,8 +71,8 @@ namespace autoware::road_crossing_fsm
 enum class FsmState : int32_t
 {
   IDLE             = 0,
-  ARMED_CROSSWALK  = 1,
-  CROSSWALK_OK     = 2,
+  APPROACH_PRE     = 1,
+  AT_PRE           = 2,
   REROUTING_TO_ALT = 3,
   ARMED_LIGHT      = 4,
   WAIT_GREEN       = 5,
@@ -133,14 +133,8 @@ private:
     // Interval minimum (detik) antar kiriman enable ke rotary_aimer selama spam-loop.
     double aim_enable_retry_sec{0.3};
 
-    // --- Rotary aimer APPROACH phase ---
-    // Jarak (m) dari pre entry di bawahnya FSM masuk fase APPROACH:
-    //   aimer diaktifkan + centroid road_crossing dikirim ke /rotary_aimer/aim_target
-    //   agar kamera nadap crosswalk SEBELUM robot tiba di pre.
-    // Begitu robot tiba di pre (at_pre), kirim target berhenti → aimer fallback ke lampu.
+    // Jarak (m) dari pre entry di bawahnya aimer diaktifkan dan membidik lampu.
     double aim_approach_dist_m{10.0};
-    // Topik PointStamped (map frame) untuk mengirim target eksternal ke rotary_aimer.
-    std::string topic_aim_target{"/rotary_aimer/aim_target"};
     // PedestrianLightTarget: the light(s) paired with the active crossing.
     std::string topic_target_light{"/planning/road_crossing/target_light"};
 
@@ -196,9 +190,6 @@ private:
   rclcpp::Publisher<autoware_internal_debug_msgs::msg::Int32Stamped>::SharedPtr pub_light_status_;
   // AdAPI goal publisher (transient_local, reliable, depth 1 — matching auto_cycle_goals.py)
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_goal_;
-  // APPROACH phase: publish road_crossing centroid (map PointStamped) ke rotary_aimer
-  // sebagai target eksternal agar kamera menghadap crosswalk sebelum robot tiba di pre.
-  rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr pub_aim_target_;
   // The light(s) paired with the active crossing — detector, aimer and simulator follow it.
   rclcpp::Publisher<autoware_road_crossing_msgs::msg::PedestrianLightTarget>::SharedPtr
     pub_target_light_;
@@ -503,17 +494,11 @@ private:
   //   2. getNextLanelets(ego) → ITERATE 1 LEVEL ONLY (direct branches; no BFS).
   //   3. For each branch: if tagged "alternate_road_crossing"=="true"
   //      AND NOT in reroute_blocklist_ → return it.
-  //   4. If no such branch → nullopt (caller holds at pre, waits for crosswalk).
+  //   4. If no such branch → nullopt (caller holds at pre).
   std::optional<lanelet::ConstLanelet> findAlternateInNextBranches() const;
 
   // Compute pose at centerline midpoint of a lanelet (heading from centerline direction).
   geometry_msgs::msg::Pose poseAtCenterlineMid(const lanelet::ConstLanelet & llt) const;
-
-  // Compute centroid of the road_crossing lanelet that follows the current active_pre_id_
-  // in route_lanelets_.  Centroid = average of all leftBound + rightBound 3-D points.
-  // Returns nullopt when: map not ready, no active_pre_id_, road_crossing not found in route,
-  // or the lanelet has no boundary points.
-  std::optional<geometry_msgs::msg::Point> getRoadCrossingCentroid() const;
 
   // Call SetBool service non-blocking (fire-and-forget).
   void setDetectorEnabled(

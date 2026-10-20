@@ -51,10 +51,24 @@
     # Contoh: dari 0.8 rad ke 0 butuh ~20 detik — ini disengaja agar transisi halus.
     zero_rate_rad_s: 0.04
 
-    # Topik external target dari FSM saat approach ke crosswalk (geometry_msgs/PointStamped,
-    # frame map).  FSM mempublish centroid lanelet road_crossing ke sini supaya kamera
-    # diarahkan ke titik lintasan sebelum mulai baca lampu.
-    # Kalau ga ada target fresh (timeout), node fallback ke lampu tf_pedestrian dari OSM.
+    # ---- Mode CENTER (khusus target lampu) ----
+    # MAP   : bidik bearing lampu dari base_link (perilaku lama).
+    # CENTER: taruh lampu tepat di sumbu kamera (= ROI peta di tengah frame):
+    #         err = atan2(y, x) lampu di center_camera_frame,
+    #         target = yaw center_body_frame di base_link (sudut rotary dari encoder) + gain*err.
+    #         Pemasangan kamera ikut dari TF, jadi front_cam_offset_rad tidak dipakai di mode ini.
+    # Tanpa TF kamera/body (planning simulator) node tetap di MAP.
+    center_enable: false
+    center_camera_frame: "camera_front_link"
+    center_body_frame: "body_link"
+    center_enter_deg: 20.0     # MAP -> CENTER kalau lampu sudah sedekat ini ke sumbu kamera
+    center_exit_deg: 30.0      # CENTER -> MAP kalau lebih jauh dari ini (histeresis)
+    center_deadband_deg: 3.0   # di bawah ini target ditahan (> deadzone PID rotary 0.04 rad = 2.3 deg)
+    center_gain: 1.0           # bagian error sumbu kamera yang dikoreksi
+
+    # Topik external target (geometry_msgs/PointStamped, frame map).  FSM road_crossing tidak
+    # lagi mempublish ke sini (dulu centroid crossing saat approach); tetap tersedia untuk uji
+    # manual.  Kalau ga ada target fresh (timeout), node membidik lampu tf_pedestrian dari OSM.
     target_topic: "~/aim_target"
 
     # Durasi maksimum [detik] sebuah external target dianggap masih fresh.

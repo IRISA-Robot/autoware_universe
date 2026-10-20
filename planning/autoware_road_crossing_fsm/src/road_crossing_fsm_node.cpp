@@ -88,12 +88,9 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
   // Interval minimum antar pengiriman enable ke rotary_aimer (detik).
   param_.aim_enable_retry_sec = declare_parameter<double>("aim_enable_retry_sec", 0.3);
 
-  // --- Parameter APPROACH phase aimer ---
-  // Jarak (m) dari pre entry — robot dalam mode APPROACH jika jarak <= nilai ini.
+  // --- Parameter aimer ---
+  // Jarak (m) dari pre entry di bawahnya aimer diaktifkan dan membidik lampu.
   param_.aim_approach_dist_m = declare_parameter<double>("aim_approach_dist_m", 10.0);
-  // Topik PointStamped target eksternal untuk rotary_aimer (map frame).
-  param_.topic_aim_target = declare_parameter<std::string>(
-    "topic_aim_target", "/rotary_aimer/aim_target");
   param_.topic_target_light = declare_parameter<std::string>(
     "topic_target_light", "/planning/road_crossing/target_light");
 
@@ -191,10 +188,6 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
       "/planning/mission_planning/goal", qos);
   }
 
-  // APPROACH phase: target eksternal rotary_aimer (best-effort depth 1, no latching).
-  // Rotary_aimer subscriptions ke topik ini dan mengarah ke point tersebut selama fresh.
-  pub_aim_target_ = create_publisher<geometry_msgs::msg::PointStamped>(
-    param_.topic_aim_target, rclcpp::QoS(1));
   pub_target_light_ = create_publisher<autoware_road_crossing_msgs::msg::PedestrianLightTarget>(
     param_.topic_target_light, rclcpp::QoS(1));
 
@@ -532,117 +525,40 @@ void RoadCrossingFsmNode::onTimer()
   }
 
   // ---------------------------------------------------------------------------
-  // Rotary aimer control block — dua fase:
-  //
-  // APPROACH (baru):
-  //   Kondisi: FSM dalam waiting state, BELUM at_pre, distanceToPreEntry() valid dan
-  //            <= aim_approach_dist_m, DAN route punya road_crossing ke depan.
-  //   Aksi: aktifkan aimer + publish centroid road_crossing sebagai PointStamped ke
-  //         /rotary_aimer/aim_target agar kamera menghadap crosswalk.
-  //
-  // AT PRE (bestehend, tidak berubah):
-  //   Kondisi: ego's current lanelet IS pre_road_crossing DAN next route lanelet IS
-  //            road_crossing (topologi-exact, bukan heuristik).
-  //   Aksi: spam-enable aimer jika belum running — TIDAK publish target sehingga
-  //         target approach yang sudah dikirim menjadi stale dan aimer fallback ke
-  //         tf_pedestrian_light (current behavior).
+  // Rotary aimer: aktif selama FSM menunggu (APPROACH_PRE .. WAIT_GREEN) untuk crossing yang
+  // punya lampu, begitu ego dalam aim_approach_dist_m dari pre entry atau sudah di pre
+  // (base_link ATAU bumper depan, sama seperti arming).  Aimer selalu membidik lampu target
+  // (target_light); tidak ada target eksternal lagi.  Crossing tanpa lampu: aimer tidak
+  // diaktifkan -- dia tidak punya target dan tidak akan publish, jadi enable akan di-spam.
   //
   // Disable (re-zero) tetap dilakukan di setiap situs transisi keluar (CROSSING entry,
-  // REROUTING_TO_ALT, resetEpisode) — tidak diubah di sini.
+  // REROUTING_TO_ALT, resetEpisode).
   // ---------------------------------------------------------------------------
   {
     const bool waiting =
-      (state_ == FsmState::ARMED_CROSSWALK || state_ == FsmState::CROSSWALK_OK ||
-       state_ == FsmState::ARMED_LIGHT    || state_ == FsmState::WAIT_GREEN);
+      (state_ == FsmState::APPROACH_PRE || state_ == FsmState::AT_PRE ||
+       state_ == FsmState::ARMED_LIGHT  || state_ == FsmState::WAIT_GREEN);
 
-    // at_pre: ego's current lanelet IS a pre_road_crossing AND the NEXT lanelet in the
-    // route sequence IS a road_crossing.  Uses route_lanelets_ (ordered mission-planner
-    // sequence) so the check is topology-exact, not a velocity/distance heuristic.
-    bool at_pre = false;
-    lanelet::ConstLanelet cur;
-    if (last_odom_ && egoRouteLanelet(&cur)) {
-      bool cur_is_pre = (cur.attributeOr("pre_road_crossing", std::string("false")) == "true");
-      if (cur_is_pre) {
-        for (size_t i = 0; i + 1 < route_lanelets_.size(); ++i) {
-          if (route_lanelets_[i] == cur.id()) {
-            try {
-              const auto nxt =
-                route_handler_.getLaneletMapPtr()->laneletLayer.get(route_lanelets_[i + 1]);
-              if (nxt.attributeOr("road_crossing", std::string("false")) == "true") {
-                at_pre = true;
-              }
-            } catch (const lanelet::NoSuchPrimitiveError &) {}
-            break;
-          }
-        }
-      }
-    }
-    // Guard: only activate when in a waiting state.
-    at_pre = at_pre && waiting;
-
-    // APPROACH: robot mendekati pre tapi belum masuk (waiting state, bukan at_pre,
-    // jarak ke pre entry <= aim_approach_dist_m, dan ada road_crossing di route).
     const double pre_dist = distanceToPreEntry();
-    const bool approaching =
-      waiting &&
-      !at_pre &&
-      (pre_dist >= 0.0) &&
-      (pre_dist <= param_.aim_approach_dist_m) &&
-      active_crossing_id_.has_value();  // ada episode aktif dengan road_crossing
+    const bool on_pre = active_pre_id_ && egoOnPre(*active_pre_id_);
+    const bool want_aim =
+      waiting && !active_light_ids_.empty() &&
+      (on_pre || (pre_dist >= 0.0 && pre_dist <= param_.aim_approach_dist_m));
 
     // Aimer dianggap running jika ada pesan aim_cmd yang fresh.
     const double aim_age = (now - last_aim_cmd_time_).seconds();
     const bool aim_running = (aim_age < param_.aim_cmd_fresh_sec);
 
-    if (approaching) {
-      // Aktifkan aimer jika belum running.
-      if (!aim_running) {
-        const double since_last_send = (now - last_aim_enable_send_).seconds();
-        if (since_last_send > param_.aim_enable_retry_sec) {
-          setDetectorEnabled(cli_rotary_aimer_, true, "rotary_aimer");
-          last_aim_enable_send_ = now;
-          RCLCPP_INFO_THROTTLE(
-            get_logger(), *get_clock(), 500,
-            "onTimer APPROACH: spam-enable rotary_aimer (state=%d, pre_dist=%.2f m) — "
-            "menunggu aimer running",
-            static_cast<int>(state_), pre_dist);
-        }
-      }
-      // Publish centroid road_crossing sebagai target eksternal setiap tick.
-      // Rotary_aimer menganggap target "fresh" selama pesan terus datang;
-      // begitu kita berhenti publish (masuk at_pre), target menjadi stale → fallback ke lampu.
-      const auto centroid_opt = getRoadCrossingCentroid();
-      if (centroid_opt) {
-        geometry_msgs::msg::PointStamped target_msg;
-        target_msg.header.stamp = now;
-        target_msg.header.frame_id = "map";
-        target_msg.point = *centroid_opt;
-        pub_aim_target_->publish(target_msg);
-        RCLCPP_INFO_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "onTimer APPROACH: publish aim_target centroid (%.2f, %.2f) pre_dist=%.2f m",
-          centroid_opt->x, centroid_opt->y, pre_dist);
-      } else {
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 5000,
-          "onTimer APPROACH: getRoadCrossingCentroid() returned nullopt — "
-          "aimer enabled but no target published (pre_dist=%.2f m)",
-          pre_dist);
-      }
-    } else if (at_pre && !aim_running) {
-      // AT PRE: spam-enable aimer; TIDAK publish target → target approach menjadi stale
-      // → aimer fallback ke tf_pedestrian_light (current behavior tidak berubah).
+    if (want_aim && !aim_running) {
       const double since_last_send = (now - last_aim_enable_send_).seconds();
       if (since_last_send > param_.aim_enable_retry_sec) {
         setDetectorEnabled(cli_rotary_aimer_, true, "rotary_aimer");
         last_aim_enable_send_ = now;
         RCLCPP_INFO_THROTTLE(
           get_logger(), *get_clock(), 500,
-          "onTimer AT PRE: spam-enable rotary_aimer (state=%d, cur_llt=%ld, aim_age=%.2f s) — "
-          "menunggu aimer running",
-          static_cast<int>(state_),
-          last_odom_ ? cur.id() : -1L,
-          aim_age);
+          "aimer: spam-enable rotary_aimer (state=%d, on_pre=%d, pre_dist=%.2f m, "
+          "aim_age=%.2f s) — menunggu aimer running",
+          static_cast<int>(state_), on_pre ? 1 : 0, pre_dist, aim_age);
       }
     }
   }
@@ -652,7 +568,7 @@ void RoadCrossingFsmNode::onTimer()
   // stale (= HOLD) — and arm again from wherever ego is.  Leaving while CROSSING is simply the
   // end of the crossing.
   const bool episode_active =
-    state_ == FsmState::ARMED_CROSSWALK || state_ == FsmState::CROSSWALK_OK ||
+    state_ == FsmState::APPROACH_PRE || state_ == FsmState::AT_PRE ||
     state_ == FsmState::ARMED_LIGHT || state_ == FsmState::WAIT_GREEN ||
     state_ == FsmState::CROSSING;
   if (episode_active && active_crossing_id_) {
@@ -683,7 +599,7 @@ void RoadCrossingFsmNode::onTimer()
     // -------------------------------------------------------------------
     case FsmState::IDLE: {
       if (checkArmCondition()) {
-        transitionTo(FsmState::ARMED_CROSSWALK);
+        transitionTo(FsmState::APPROACH_PRE);
         // Lock the paired light(s) for this episode.  Arming only happens while driving
         // forward (see checkArmCondition()), so today this is always the forward tag.
         active_light_direction_ =
@@ -706,14 +622,14 @@ void RoadCrossingFsmNode::onTimer()
     }
 
     // --------------------------------------------------------------------
-    // ARMED_CROSSWALK
+    // APPROACH_PRE
     //
     // Robot is approaching the pre_road_crossing stop.
     // Gate(pre) = HOLD until ego is at the pre, then release pre gate and
-    // transition CROSSWALK_OK → ARMED_LIGHT.  There is no crosswalk detection
-    // interlock: the crossing is trusted from the map tags alone.
+    // transition AT_PRE → ARMED_LIGHT.  The crossing is trusted from the map tags alone
+    // (no crosswalk detection).
     // -------------------------------------------------------------------
-    case FsmState::ARMED_CROSSWALK: {
+    case FsmState::APPROACH_PRE: {
       // PRE gate = HOLD (robot waits at pre stop).
       // ROAD gate = HOLD (don't release road crossing yet).
       publishGatePre(autoware_road_crossing_msgs::msg::RoadCrossingGate::HOLD);
@@ -721,10 +637,10 @@ void RoadCrossingFsmNode::onTimer()
 
       // -----------------------------------------------------------------------
       // Position gate: robot harus sudah tiba di pre (atau crossing jika tanpa pre)
-      // sebelum FSM boleh maju ke CROSSWALK_OK/ARMED_LIGHT.
+      // sebelum FSM boleh maju ke AT_PRE/ARMED_LIGHT.
       //   at_pre = true  jika distanceToPreEntry() ∈ [0, pre_arrive_dist_m]
       //   at_pre = true  (fallback tanpa pre) jika dist-crossing ∈ [0, crossing_arrive_dist_m]
-      // Selama belum at_pre: tahan di ARMED_CROSSWALK, gate tetap HOLD.
+      // Selama belum at_pre: tahan di APPROACH_PRE, gate tetap HOLD.
       // -----------------------------------------------------------------------
       const bool at_pre = [&]() -> bool {
         if (active_pre_id_) {
@@ -741,7 +657,7 @@ void RoadCrossingFsmNode::onTimer()
         // Robot belum tiba — tetap tahan, log sekali per 2 detik.
         RCLCPP_INFO_THROTTLE(
           get_logger(), *get_clock(), 2000,
-          "ARMED_CROSSWALK: robot belum tiba (pre_dist=%.2f m, gate=pre_arrive_dist_m=%.1f m) "
+          "APPROACH_PRE: robot belum tiba (pre_dist=%.2f m, gate=pre_arrive_dist_m=%.1f m) "
           "— tetap HOLD, menunggu robot mendekati pre/crossing",
           active_pre_id_ ? distanceToPreEntry() : distanceToCrossingEntry(),
           active_pre_id_ ? param_.pre_arrive_dist_m : param_.crossing_arrive_dist_m);
@@ -750,26 +666,26 @@ void RoadCrossingFsmNode::onTimer()
 
       // Robot is at the pre stop: release it to the road_crossing and go wait for the light.
       publishGatePre(autoware_road_crossing_msgs::msg::RoadCrossingGate::GO);
-      // ONE transition per tick: go to CROSSWALK_OK. On the NEXT tick, CROSSWALK_OK
+      // ONE transition per tick: go to AT_PRE. On the NEXT tick, AT_PRE
       // handler will transition to ARMED_LIGHT. Entry actions for ARMED_LIGHT
       // (ped_light enable + light_timeout_start_) run in the ARMED_LIGHT handler.
-      transitionTo(FsmState::CROSSWALK_OK);
+      transitionTo(FsmState::AT_PRE);
       break;
     }
 
     // -------------------------------------------------------------------
-    // CROSSWALK_OK
+    // AT_PRE
     //
     // Ego has arrived at the pre stop.
-    // PRE gate is already GO (set before transitionTo(CROSSWALK_OK) upstream).
+    // PRE gate is already GO (set before transitionTo(AT_PRE) upstream).
     // This state runs for exactly one tick, then transitions to ARMED_LIGHT.
     // Entry actions for ARMED_LIGHT (ped_light enable + light_timeout_start_)
     // are deferred to the ARMED_LIGHT handler — strictly one transition per tick.
     // -------------------------------------------------------------------
-    case FsmState::CROSSWALK_OK: {
+    case FsmState::AT_PRE: {
       publishGatePre(autoware_road_crossing_msgs::msg::RoadCrossingGate::GO);
       publishGate(autoware_road_crossing_msgs::msg::RoadCrossingGate::HOLD);
-      // ONE transition per tick: CROSSWALK_OK → ARMED_LIGHT.
+      // ONE transition per tick: AT_PRE → ARMED_LIGHT.
       transitionTo(FsmState::ARMED_LIGHT);
       break;
     }
@@ -831,14 +747,14 @@ void RoadCrossingFsmNode::onTimer()
         const auto alt_opt = findAlternateInNextBranches();
         if (!alt_opt) {
           // Alternate lost mid-process — do NOT release gate or cross.
-          // Return to ARMED_CROSSWALK and hold at pre.
+          // Return to APPROACH_PRE and hold at pre.
           RCLCPP_WARN(
             get_logger(),
             "REROUTING_TO_ALT step0: no alternate_road_crossing found (lost mid-process) — "
-            "returning to ARMED_CROSSWALK, gate pre=HOLD");
+            "returning to APPROACH_PRE, gate pre=HOLD");
           publishGatePre(autoware_road_crossing_msgs::msg::RoadCrossingGate::HOLD);
           publishGate(autoware_road_crossing_msgs::msg::RoadCrossingGate::HOLD);
-          transitionTo(FsmState::ARMED_CROSSWALK);
+          transitionTo(FsmState::APPROACH_PRE);
           break;
         }
 
@@ -1185,7 +1101,7 @@ void RoadCrossingFsmNode::onTimer()
     // -------------------------------------------------------------------
     // ARMED_LIGHT
     //
-    // Crosswalk verified; PRE gate stays GO.  Road gate = HOLD until green.
+    // Ego at the pre; PRE gate stays GO.  Road gate = HOLD until green.
     //
     // Entry actions (first tick only, guarded by !light_timeout_start_):
     //   • Enable ped_light_detector — unless the crossing has no light or is tagged
@@ -1545,7 +1461,7 @@ bool RoadCrossingFsmNode::crossingHasTag(const std::string & key) const
 
 // ---------------------------------------------------------------------------
 // Arrival-gate distance: durable fix for the geometry mismatch that wedged
-// fsm_state=1 (ARMED_CROSSWALK) indefinitely (see param-bump commits
+// fsm_state=1 (APPROACH_PRE) indefinitely (see param-bump commits
 // 97ffe21b6 / f8cb84d for the stopgap this supersedes).
 //
 // Root cause: this function used to return the plain 2D EUCLIDEAN distance
@@ -1775,10 +1691,10 @@ std::optional<lanelet::ConstLanelet> RoadCrossingFsmNode::findAlternateInNextBra
   // Bidirectional-driving guard (Phase 3c): same reasoning as checkArmCondition() —
   // the fork-parent resolution below assumes route_lanelets_ index order == travel
   // order (parent = pre_idx - 1). While ego is reversing that assumption doesn't
-  // hold, and picking the wrong fork parent could route the ARM_CROSSWALK reroute
+  // hold, and picking the wrong fork parent could route the APPROACH_PRE reroute
   // decision onto a wrong branch. Per the audit's simpler/safer option, reroute
   // branch-finding is disabled entirely while ego is reversing — the FSM will hold
-  // at the pre stop and keep waiting for crosswalk detection instead.
+  // at the pre stop instead.
   if (!is_driving_forward_) return std::nullopt;
 
   lanelet::ConstLanelets parents;
@@ -1912,84 +1828,6 @@ geometry_msgs::msg::Pose RoadCrossingFsmNode::poseAtCenterlineMid(
   pose.orientation.z = std::sin(yaw * 0.5);
 
   return pose;
-}
-
-std::optional<geometry_msgs::msg::Point> RoadCrossingFsmNode::getRoadCrossingCentroid() const
-{
-  // -----------------------------------------------------------------------
-  // Cari road_crossing lanelet yang mengikuti active_pre_id_ dalam route_lanelets_.
-  // Mirrors the at_pre route-walk logic in the onTimer aimer block:
-  //   find active_pre_id_ in route_lanelets_, then scan forward for the first
-  //   lanelet tagged road_crossing=="true".
-  // Jika active_crossing_id_ sudah diset (checkArmCondition() telah jalan), pakai
-  // langsung tanpa scan ulang — lebih cepat dan konsisten.
-  //
-  // Centroid = rata-rata semua titik leftBound + rightBound (x, y, z).
-  // -----------------------------------------------------------------------
-  if (!map_initialized_) return std::nullopt;
-
-  // Prefer active_crossing_id_ if already set by checkArmCondition().
-  lanelet::Id crossing_id;
-  if (active_crossing_id_) {
-    crossing_id = *active_crossing_id_;
-  } else {
-    // Fallback: scan route_lanelets_ from active_pre_id_ forward.
-    if (!active_pre_id_) return std::nullopt;
-    int pre_idx = -1;
-    for (int i = 0; i < static_cast<int>(route_lanelets_.size()); ++i) {
-      if (route_lanelets_[i] == *active_pre_id_) {
-        pre_idx = i;
-        break;
-      }
-    }
-    if (pre_idx < 0) return std::nullopt;
-
-    bool found = false;
-    for (int j = pre_idx + 1; j < static_cast<int>(route_lanelets_.size()); ++j) {
-      try {
-        const auto cand =
-          route_handler_.getLaneletMapPtr()->laneletLayer.get(route_lanelets_[j]);
-        if (cand.attributeOr("road_crossing", std::string("false")) == "true") {
-          crossing_id = route_lanelets_[j];
-          found = true;
-          break;
-        }
-      } catch (const lanelet::NoSuchPrimitiveError &) {
-        continue;
-      }
-    }
-    if (!found) return std::nullopt;
-  }
-
-  try {
-    const auto llt = route_handler_.getLaneletMapPtr()->laneletLayer.get(crossing_id);
-
-    double sum_x = 0.0, sum_y = 0.0, sum_z = 0.0;
-    int count = 0;
-
-    for (const auto & pt : llt.leftBound()) {
-      sum_x += pt.x();
-      sum_y += pt.y();
-      sum_z += pt.z();
-      ++count;
-    }
-    for (const auto & pt : llt.rightBound()) {
-      sum_x += pt.x();
-      sum_y += pt.y();
-      sum_z += pt.z();
-      ++count;
-    }
-
-    if (count == 0) return std::nullopt;
-
-    geometry_msgs::msg::Point centroid;
-    centroid.x = sum_x / count;
-    centroid.y = sum_y / count;
-    centroid.z = sum_z / count;
-    return centroid;
-  } catch (const lanelet::NoSuchPrimitiveError &) {
-    return std::nullopt;
-  }
 }
 
 void RoadCrossingFsmNode::setDetectorEnabled(
@@ -2220,8 +2058,8 @@ void RoadCrossingFsmNode::transitionTo(FsmState new_state)
   static const auto state_name = [](FsmState s) -> const char * {
     switch (s) {
       case FsmState::IDLE:              return "IDLE";
-      case FsmState::ARMED_CROSSWALK:   return "ARMED_CROSSWALK";
-      case FsmState::CROSSWALK_OK:      return "CROSSWALK_OK";
+      case FsmState::APPROACH_PRE:   return "APPROACH_PRE";
+      case FsmState::AT_PRE:         return "AT_PRE";
       case FsmState::REROUTING_TO_ALT:  return "REROUTING_TO_ALT";
       case FsmState::ARMED_LIGHT:       return "ARMED_LIGHT";
       case FsmState::WAIT_GREEN:        return "WAIT_GREEN";

@@ -653,6 +653,41 @@ bool RoadCrossingModule::modifyPathVelocity(
     }
   }
 
+  // Invariant: the robot has not reached the crossing (its front is still before the entry,
+  // base_link not on it) and the FSM gate is HOLD -> this module holds it, whatever state it
+  // is in.  The state is history; the robot can be driven back onto the pre, relocalized, or
+  // the route re-set without clearing (same module instance), which used to leave it DONE --
+  // and DONE only re-armed once the stop point was ahead of ego, which a stop zone never is for
+  // a robot already standing in it (hold_in_zone: stop point = ego), so it drove on red.
+  // Gate GO / GO_GREEN is untouched: a robot setting off on green is still before the entry.
+  if (kind_ == CrossingKind::ROAD && planner_param_.require_fsm_gate && entry_s &&
+      *entry_s > ego_s + debug_data_.base_link2front &&
+      state_ != State::STOPPING && state_ != State::CHECKING) {
+    uint8_t gate = autoware_road_crossing_msgs::msg::RoadCrossingGate::HOLD;
+    {
+      std::lock_guard<std::mutex> lk(gate_mutex_);
+      gate = gate_command_;
+    }
+    const auto & ego_pos = planner_data.current_odometry->pose.position;
+    const bool ego_inside = boost::geometry::covered_by(
+      lanelet::BasicPoint2d{ego_pos.x, ego_pos.y}, crossing.polygon2d().basicPolygon());
+    if (gate == autoware_road_crossing_msgs::msg::RoadCrossingGate::HOLD && !ego_inside &&
+        state_ != State::APPROACHING) {
+      RCLCPP_WARN(
+        logger_,
+        "RoadCrossing %ld [ROAD]: gate HOLD and the crossing entry is %.2f m ahead of the "
+        "front, but state=%s → APPROACHING (hold again)",
+        getModuleId(), *entry_s - ego_s - debug_data_.base_link2front,
+        state_ == State::DONE ? "DONE" : "CROSSING");
+      state_ = State::APPROACHING;
+      stopped_at_.reset();
+      clear_since_.reset();
+      green_blocked_since_.reset();
+      go_blocked_since_.reset();
+      was_inside_polygon_ = false;
+    }
+  }
+
   // Obstacle scan (only relevant in CHECKING state but we compute for transition logic).
   // PRE mode never scans vehicles — its CHECKING only waits for the FSM crosswalk gate.
   bool blocked = false;
