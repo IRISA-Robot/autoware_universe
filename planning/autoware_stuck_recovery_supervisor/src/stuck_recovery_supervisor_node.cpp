@@ -132,6 +132,7 @@ void StuckRecoverySupervisorNode::load_parameters()
 
   p.update_rate_hz = declare_parameter<double>("update_rate_hz", 10.0);
   p.mode = declare_parameter<std::string>("mode", "detect_only");
+  p.honor_disable_recovery_tag = declare_parameter<bool>("honor_disable_recovery_tag", true);
 
   p.th_stopped_velocity_mps = declare_parameter<double>("th_stopped_velocity_mps", 0.05);
   p.unstuck_progress_m = declare_parameter<double>("unstuck_progress_m", 0.5);
@@ -1019,6 +1020,7 @@ void StuckRecoverySupervisorNode::step_suspect()
     return;
   }
   if (progress_since_entry_m_ > param_.unstuck_progress_m) {
+    preset_escalation_ = 0;
     transition(State::NOMINAL, "ego made progress");
     return;
   }
@@ -1132,7 +1134,10 @@ void StuckRecoverySupervisorNode::step_suspect()
   // SUSPECT -- it is stuck, and saying so -- but neither PROBE nor RECOVERY is entered, not even
   // when an operator forces it.  The episode watchdog still cycles it through COOLDOWN, and
   // once the robot is somewhere untagged the next episode recovers as usual.
-  if (const auto tagged = recovery_disabled_lanelet()) {
+  // honor_disable_recovery_tag=false ignores the tag (walkot: the lane-driving path cannot pass
+  // the two objects in lanelet 19, and the map tags every lanelet there).
+  if (const auto tagged = param_.honor_disable_recovery_tag ? recovery_disabled_lanelet()
+                                                            : std::nullopt) {
     if (force_requested_) {
       force_requested_ = false;
       RCLCPP_WARN(
@@ -1211,6 +1216,7 @@ void StuckRecoverySupervisorNode::step_probe()
     return;
   }
   if (progress_since_entry_m_ > param_.unstuck_progress_m) {
+    preset_escalation_ = 0;
     transition(State::NOMINAL, "ego made progress");
     return;
   }
@@ -1801,6 +1807,7 @@ std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_
   // stops at the first footprint that leaves the grid); the mission goal still bounds it.
   double search_limit =
     top_large_fit ? std::numeric_limits<double>::max() : param_.max_goal_search_distance_m;
+  bool mission_goal_ahead_in_window = false;
   if (route_) {
     // The clamp only applies when the mission goal actually lies in this window.
     // find_nearest_index() snaps by straight-line distance alone, so on a route that
@@ -1822,6 +1829,7 @@ std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_
       goal_idx &&
       distance2d(reference_path_[*goal_idx], route_->goal_pose) <= goal_in_window_tolerance_m) {
       if (*goal_idx > ego_index) {
+        mission_goal_ahead_in_window = true;
         double to_goal = 0.0;
         for (size_t k = ego_index + 1; k <= *goal_idx; ++k) {
           to_goal += distance2d(reference_path_[k - 1], reference_path_[k]);
@@ -1921,6 +1929,24 @@ std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_
         "needs; falling back to the %zu point(s) with at least the robot's own length "
         "(%.1f m) behind them",
         episode_id_, param_.goal_min_clear_length_m, relaxed.size(), relaxed_min_clear_m);
+    }
+  }
+
+  // Last resort: the mission goal itself.  [2026-10-20] walkot, reversing back to the start: the
+  // goal sits 0.8 m past the second of two objects, so the search window (blockage + offset,
+  // capped at the goal) held no point with even the robot's length of clear path behind it --
+  // "0 escape-goal candidates ... 1 rejected as too tight" -- and the episode held still for
+  // 60 s.  The mission goal needs no clear run behind it: it is where the robot has to come to
+  // rest anyway, and it is already in body-heading convention, so it is not mirrored.
+  if (
+    candidates.empty() && mission_goal_ahead_in_window && footprint_is_free(route_->goal_pose)) {
+    candidates.push_back(route_->goal_pose);
+    if (verbose) {
+      RCLCPP_WARN(
+        get_logger(),
+        "[episode %u] no escape goal past the blockage fits before the mission goal; using the "
+        "mission goal itself at (%.2f, %.2f)",
+        episode_id_, route_->goal_pose.position.x, route_->goal_pose.position.y);
     }
   }
 
@@ -2474,6 +2500,7 @@ void StuckRecoverySupervisorNode::step_transit()
     "[episode %u] lined up: heading %.1f deg, %.2f m off the path -- handing back to lane driving",
     episode_id_, *yaw_error * 180.0 / M_PI, offset);
   cooldown_until_ = now + rclcpp::Duration::from_seconds(param_.cooldown_sec);
+  preset_escalation_ = 0;
   transition(State::COOLDOWN, "lined up with the path");
 }
 
@@ -2535,6 +2562,19 @@ void StuckRecoverySupervisorNode::abort_episode(const std::string & why)
   RCLCPP_WARN(
     get_logger(), "[episode %u] giving up (%s); starting over after a %.1f s cooldown",
     episode_id_, why.c_str(), param_.cooldown_sec);
+  // [2026-10-20] walkot: the "normal" preset's 0.1 m shape margin finds no plan through the
+  // 1.16 m gap between the two objects in lanelet 19, while "narrow" does.  The lanelet carries
+  // no recovery_used tag (and the map is not ours to edit), so the next episode escalates.
+  if (active_preset_ + 1 < presets_.size() && episode_untagged_lanelet_) {
+    auto & remembered = escalated_preset_by_lanelet_[*episode_untagged_lanelet_];
+    remembered = std::max(remembered, active_preset_ + 1);
+  }
+  if (active_preset_ + 1 < presets_.size() && preset_escalation_ <= active_preset_) {
+    preset_escalation_ = active_preset_ + 1;
+    RCLCPP_WARN(
+      get_logger(), "[episode %u] next episode on an untagged lanelet escalates to preset \"%s\"",
+      episode_id_, presets_[preset_escalation_].name.c_str());
+  }
   transition(State::COOLDOWN, "gave up: " + why);
 }
 
@@ -3908,7 +3948,10 @@ void StuckRecoverySupervisorNode::build_recovery_presets()
 
 void StuckRecoverySupervisorNode::select_preset_for_episode()
 {
-  active_preset_ = 0;  // the fallback, and what an untagged lanelet gets
+  // The fallback, and what an untagged lanelet gets: preset 0 unless earlier episodes at this
+  // blockage gave up and escalated.
+  active_preset_ = std::min(preset_escalation_, presets_.empty() ? 0 : presets_.size() - 1);
+  episode_untagged_lanelet_.reset();
   if (presets_.size() < 2 || !odom_ || !map_ready_) {
     return;
   }
@@ -3918,14 +3961,20 @@ void StuckRecoverySupervisorNode::select_preset_for_episode()
   if (!find_ego_route_lanelet(&ego_lanelet)) {
     RCLCPP_INFO(
       get_logger(), "[episode %u] no lanelet under ego; recovery preset \"%s\"", episode_id_,
-      presets_.front().name.c_str());
+      presets_[active_preset_].name.c_str());
     return;
   }
   const std::string wanted = ego_lanelet.attributeOr(kTag, std::string());
   if (wanted.empty()) {
+    episode_untagged_lanelet_ = ego_lanelet.id();
+    const auto remembered = escalated_preset_by_lanelet_.find(ego_lanelet.id());
+    if (remembered != escalated_preset_by_lanelet_.end()) {
+      active_preset_ = std::max(active_preset_, std::min(remembered->second, presets_.size() - 1));
+    }
     RCLCPP_INFO(
-      get_logger(), "[episode %u] lanelet %ld has no %s; recovery preset \"%s\"", episode_id_,
-      ego_lanelet.id(), kTag, presets_.front().name.c_str());
+      get_logger(), "[episode %u] lanelet %ld has no %s; recovery preset \"%s\"%s", episode_id_,
+      ego_lanelet.id(), kTag, presets_[active_preset_].name.c_str(),
+      active_preset_ > 0 ? " (escalated after a give-up)" : "");
     return;
   }
   for (size_t i = 0; i < presets_.size(); ++i) {
@@ -3991,6 +4040,7 @@ void StuckRecoverySupervisorNode::reset_for_new_mission(const std::string & why)
   // cross-episode bookkeeping below, which is exactly the state that would otherwise
   // leak into the new mission.
   transition(State::NOMINAL, why);
+  preset_escalation_ = 0;
   episode_stop_source_ = StuckDiagnosis::SOURCE_NONE;
   corridor_clear_ = false;
   last_sweep_ = CorridorResult{};

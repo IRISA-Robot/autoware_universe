@@ -13,6 +13,7 @@
   <!-- Overrides planning_algorithm in the freespace param file, so the two can be compared
        from the command line without editing it. -->
   <arg name="recovery_freespace_algorithm" default="astar" description="freespace algorithm for the stuck recovery: astar | rrtstar"/>
+  <arg name="stuck_recovery_honor_disable_tag" default="true" description="false: recover even in lanelets tagged disable_recovery=true"/>
   <arg name="vehicle_param_file"/>
   <arg name="container_type" default="component_container_mt"/>
 
@@ -35,6 +36,7 @@
       <param from="$(var stuck_recovery_supervisor_param_path)"/>
       <param from="$(var vehicle_param_file)"/>
       <param name="mode" value="$(var stuck_recovery_mode)"/>
+      <param name="honor_disable_recovery_tag" value="$(var stuck_recovery_honor_disable_tag)"/>
     </node>
   </group>
 

@@ -11,6 +11,10 @@
     #                 lateral corridor, and logs the decision it *would* have made.
     #   recovery    : full behaviour -- hands over to the freespace planner.
     mode: "detect_only"
+    # true: a lanelet tagged `disable_recovery=true` holds the robot in SUSPECT instead of
+    # recovering.  false ignores the tag everywhere.  Overridden by the launch arg
+    # stuck_recovery_honor_disable_tag.
+    honor_disable_recovery_tag: true
 
     # --- stuck detection ---------------------------------------------------
     th_stopped_velocity_mps: 0.05

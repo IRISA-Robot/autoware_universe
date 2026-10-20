@@ -376,6 +376,8 @@ private:
     /// [UNKNOWN-STOP 2026-09-16] How long the corridor must read clear, while SUSPECT is
     /// holding an unexplained stop, before the watchdog releases back to lane driving.
     double unknown_stop_clear_hold_sec{3.0};
+    /// false: recover even inside lanelets tagged `disable_recovery=true`.
+    bool honor_disable_recovery_tag{true};
     /// How many times in a row SUSPECT may release an unexplained-but-clear stop before it
     /// stops re-arming and holds.  The budget resets the moment the robot is seen moving,
     /// so it only ever bounds a robot that is getting nowhere.
@@ -768,6 +770,17 @@ private:
   std::vector<RecoveryPreset> presets_{};
   /// Index into presets_, latched for the whole episode.  0 is always the fallback.
   size_t active_preset_{0};
+  /// Preset an untagged lanelet starts from.  An episode that gives up raises it by one, so the
+  /// next attempt at the same blockage tries the next (tighter) preset; progress, a successful
+  /// hand-back or a new mission puts it back to 0.
+  size_t preset_escalation_{0};
+  /// Preset an untagged lanelet needed the last time recovery gave up in it, kept for the life
+  /// of the node: after "normal" failed once in a lanelet, every later episode there starts
+  /// from the escalated preset instead of failing "normal" again first (walkot: one wasted
+  /// attempt, and one more stop, on every point-to-point leg).
+  std::map<lanelet::Id, size_t> escalated_preset_by_lanelet_{};
+  /// Untagged lanelet the current episode was started in, if any.
+  std::optional<lanelet::Id> episode_untagged_lanelet_{};
   /// Build presets_ from parameters.  With no preset list configured this makes a single
   /// preset from the legacy topic_out_* parameters, i.e. exactly the previous behaviour.
   void build_recovery_presets();
