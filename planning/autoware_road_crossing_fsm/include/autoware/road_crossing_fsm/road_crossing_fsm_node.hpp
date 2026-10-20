@@ -27,6 +27,7 @@
 #include <autoware_map_msgs/msg/lanelet_map_bin.hpp>
 #include <autoware_active_route_window_msgs/msg/active_route_window.hpp>
 #include <autoware_planning_msgs/msg/lanelet_route.hpp>
+#include <autoware_planning_msgs/msg/trajectory.hpp>
 #include <autoware_road_crossing_msgs/msg/pedestrian_light_state.hpp>
 #include <autoware_road_crossing_msgs/msg/pedestrian_light_target.hpp>
 #include <autoware_road_crossing_msgs/msg/road_crossing_gate.hpp>
@@ -179,6 +180,7 @@ private:
   autoware_active_route_window_msgs::msg::ActiveRouteWindow::ConstSharedPtr active_route_window_;
   rclcpp::Subscription<autoware_map_msgs::msg::LaneletMapBin>::SharedPtr sub_map_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
+  rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr sub_trajectory_;
   // Subscriber output rotary aimer — untuk deteksi aimer sudah running (spam-enable).
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr sub_aim_cmd_;
 
@@ -222,6 +224,7 @@ private:
 
   // Latest sensor / map messages (guarded against nullptr)
   nav_msgs::msg::Odometry::SharedPtr last_odom_;
+  autoware_planning_msgs::msg::Trajectory::ConstSharedPtr last_trajectory_;
   // Ego position at the previous tick, to detect relocalization jumps.
   std::optional<geometry_msgs::msg::Point> prev_tick_position_;
   autoware_map_msgs::msg::LaneletMapBin::SharedPtr last_map_msg_;
@@ -288,6 +291,9 @@ private:
   // (this node has no Trajectory/Path subscription, only the route). Returns
   // nullopt if it cannot be determined (e.g. ego not resolvable on route).
   std::optional<bool> deriveDrivingDirectionFromRoute() const;
+  // Direction of the planned trajectory at ego (forward = its orientation agrees with the
+  // way it runs).  Right for lanelets the route traverses against their drawing direction.
+  std::optional<bool> deriveDrivingDirectionFromTrajectory() const;
 
   // The route lanelet ego is on: the active route window's, when a fresh valid one exists for
   // this route, else the closest route lanelet (the previous behaviour).
@@ -564,6 +570,11 @@ private:
   void updateLightInterlock(const char * where);
   // True when ego's base_link is inside lanelet `id`.
   bool egoOnLanelet(lanelet::Id id) const;
+  // On the pre: base_link OR the front bumper on it.  A robot standing at the seam into the pre
+  // (front in, base_link not yet) is at the pre -- the road_crossing stop zone holds it there
+  // rather than creeping it the last decimetres.  The crossing itself stays base_link only.
+  bool egoOnPre(lanelet::Id id) const;
+  double base_link_to_front_m_{0.0};
   // True when ego is before lanelet `id` (on the travel-direction side) by more than margin.
   bool egoUpstreamOf(lanelet::Id id, double margin) const;
   // The route lanelet right after the active crossing, if it is a pre_road_crossing.

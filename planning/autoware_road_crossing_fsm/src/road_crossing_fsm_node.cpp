@@ -145,6 +145,18 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
     param_.topic_ego_pose, rclcpp::QoS(1),
     std::bind(&RoadCrossingFsmNode::onOdom, this, std::placeholders::_1));
 
+  // base_link -> front bumper, from the vehicle parameters every node is launched with.
+  base_link_to_front_m_ = declare_parameter<double>("wheel_base", 0.0) +
+                          declare_parameter<double>("front_overhang", 0.0);
+
+  // Planned trajectory: driving direction while standing still (see updateDrivingDirection()).
+  sub_trajectory_ = create_subscription<autoware_planning_msgs::msg::Trajectory>(
+    declare_parameter<std::string>("topic_trajectory", "/planning/scenario_planning/trajectory"),
+    rclcpp::QoS(1),
+    [this](const autoware_planning_msgs::msg::Trajectory::ConstSharedPtr msg) {
+      last_trajectory_ = msg;
+    });
+
   // Subscriber output rotary aimer — catat waktu pesan untuk deteksi running (spam-enable).
   sub_aim_cmd_ = create_subscription<std_msgs::msg::Float32>(
     param_.topic_rotary_angle_cmd, rclcpp::QoS(1),
@@ -349,10 +361,14 @@ void RoadCrossingFsmNode::updateDrivingDirection()
     const double near_stationary_elapsed = (now - *near_stationary_since_).seconds();
     if (near_stationary_elapsed >= kNearStationaryFallbackSec) {
       // Genuinely stopped for a while — twist will never recover on its own.
-      // Fall back to the route's own geometric heading at ego's position
-      // instead of leaving is_driving_forward_ latched at a stale value
-      // (which would otherwise deadlock checkArmCondition() forever).
-      const auto route_forward = deriveDrivingDirectionFromRoute();
+      // Take the direction from the planned trajectory (oriented the way the route really runs,
+      // also on a lanelet traversed against its drawing direction), else from the route's own
+      // geometric heading at ego's position, instead of leaving is_driving_forward_ latched at
+      // a stale value (which would otherwise deadlock checkArmCondition() forever).
+      auto route_forward = deriveDrivingDirectionFromTrajectory();
+      if (!route_forward) {
+        route_forward = deriveDrivingDirectionFromRoute();
+      }
       if (route_forward) {
         is_driving_forward_ = *route_forward;
       }
@@ -440,6 +456,38 @@ std::optional<bool> RoadCrossingFsmNode::deriveDrivingDirectionFromRoute() const
   const bool forward_along_centerline =
     autoware_utils_geometry::is_driving_forward(last_odom_->pose.pose, dst_point);
   return ahead_is_after ? forward_along_centerline : !forward_along_centerline;
+}
+
+std::optional<bool> RoadCrossingFsmNode::deriveDrivingDirectionFromTrajectory() const
+{
+  constexpr double max_trajectory_age_s = 1.0;
+  if (!last_odom_ || !last_trajectory_ || last_trajectory_->points.size() < 2) {
+    return std::nullopt;
+  }
+  if ((now() - rclcpp::Time(last_trajectory_->header.stamp)).seconds() > max_trajectory_age_s) {
+    return std::nullopt;
+  }
+  const auto & pts = last_trajectory_->points;
+  const auto & ego = last_odom_->pose.pose.position;
+  size_t nearest = 0;
+  double nearest_d2 = std::numeric_limits<double>::max();
+  for (size_t i = 0; i < pts.size(); ++i) {
+    const double dx = pts[i].pose.position.x - ego.x;
+    const double dy = pts[i].pose.position.y - ego.y;
+    if (dx * dx + dy * dy < nearest_d2) {
+      nearest_d2 = dx * dx + dy * dy;
+      nearest = i;
+    }
+  }
+  // Same test as motion_utils::isDrivingForward(): is the next point ahead of the pose?
+  for (size_t j = nearest + 1; j < pts.size(); ++j) {
+    const double dx = pts[j].pose.position.x - pts[nearest].pose.position.x;
+    const double dy = pts[j].pose.position.y - pts[nearest].pose.position.y;
+    if (dx * dx + dy * dy > 1e-6) {
+      return autoware_utils_geometry::is_driving_forward(pts[nearest].pose, pts[j].pose.position);
+    }
+  }
+  return std::nullopt;
 }
 
 void RoadCrossingFsmNode::onTimer()
@@ -608,7 +656,7 @@ void RoadCrossingFsmNode::onTimer()
     state_ == FsmState::ARMED_LIGHT || state_ == FsmState::WAIT_GREEN ||
     state_ == FsmState::CROSSING;
   if (episode_active && active_crossing_id_) {
-    const bool on_pre = active_pre_id_ && egoOnLanelet(*active_pre_id_);
+    const bool on_pre = active_pre_id_ && egoOnPre(*active_pre_id_);
     const bool on_crossing = egoOnLanelet(*active_crossing_id_);
     if (!on_pre && !on_crossing) {
       if (state_ == FsmState::CROSSING) {
@@ -1266,7 +1314,7 @@ void RoadCrossingFsmNode::onTimer()
       // is no way back: ego keeps going whatever the light does.
       if (
         road_cross_is_green_ && !interlock_.allows_crossing && active_pre_id_ &&
-        active_crossing_id_ && egoOnLanelet(*active_pre_id_) &&
+        active_crossing_id_ && egoOnPre(*active_pre_id_) &&
         !egoOnLanelet(*active_crossing_id_)) {
         RCLCPP_WARN(
           get_logger(),
@@ -1373,29 +1421,76 @@ bool RoadCrossingFsmNode::checkArmCondition()
   if (!map_initialized_ || !route_initialized_ || !last_odom_) return false;
   if (route_lanelets_.size() < 2) return false;
 
+  const auto is_crossing = [this](const lanelet::Id id) {
+    try {
+      return route_handler_.getLaneletMapPtr()->laneletLayer.get(id).attributeOr(
+               "road_crossing", std::string("false")) == "true";
+    } catch (const lanelet::NoSuchPrimitiveError &) {
+      return false;
+    }
+  };
+  // Why IDLE does not arm, logged only while the route has a crossing at all (a robot held
+  // still at the pre otherwise waits for a green it can never get, with nothing in the log).
+  const auto not_armed = [&](const char * reason, const lanelet::Id cur_id) {
+    if (std::any_of(route_lanelets_.begin(), route_lanelets_.end(), is_crossing)) {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 5000, "IDLE: not arming -- %s (route lanelet %ld)", reason,
+        static_cast<long>(cur_id));
+    }
+    return false;
+  };
+
   // Bidirectional-driving guard: route order == travel order only while driving forward.
   if (!is_driving_forward_) {
-    return false;
+    return not_armed("not driving forward", -1);
   }
 
   lanelet::ConstLanelet cur;
   if (!egoRouteLanelet(&cur)) {
-    return false;
+    return not_armed("ego not resolved on the route", -1);
   }
   for (size_t i = 0; i + 1 < route_lanelets_.size(); ++i) {
     if (route_lanelets_[i] != cur.id()) continue;
-    try {
-      const auto next = route_handler_.getLaneletMapPtr()->laneletLayer.get(route_lanelets_[i + 1]);
-      if (next.attributeOr("road_crossing", std::string("false")) != "true") return false;
-    } catch (const lanelet::NoSuchPrimitiveError &) {
-      return false;
+    if (is_crossing(route_lanelets_[i + 1])) {
+      if (!egoOnPre(cur.id())) {
+        return not_armed("base_link not on the pre lanelet", cur.id());
+      }
+      active_pre_id_ = cur.id();
+      active_crossing_id_ = route_lanelets_[i + 1];
+      return true;
     }
-    if (!egoOnLanelet(cur.id())) return false;  // nearest is not enough: must be on it
-    active_pre_id_ = cur.id();
-    active_crossing_id_ = route_lanelets_[i + 1];
-    return true;
+    // The route window still has ego on the lanelet before the pre while base_link is already
+    // on the pre: a robot started (or held by the road_crossing stop zone) just past their
+    // seam never advances the window by itself, so arm on the pre it physically stands on.
+    if (
+      i + 2 < route_lanelets_.size() && is_crossing(route_lanelets_[i + 2]) &&
+      egoOnPre(route_lanelets_[i + 1])) {
+      active_pre_id_ = route_lanelets_[i + 1];
+      active_crossing_id_ = route_lanelets_[i + 2];
+      return true;
+    }
+    return not_armed("next route lanelet is not a crossing", cur.id());
   }
-  return false;
+  return not_armed("ego lanelet not in the route", cur.id());
+}
+
+bool RoadCrossingFsmNode::egoOnPre(const lanelet::Id id) const
+{
+  if (egoOnLanelet(id)) return true;
+  if (!last_odom_ || !map_initialized_ || base_link_to_front_m_ <= 0.0) return false;
+  try {
+    const auto & pose = last_odom_->pose.pose;
+    const auto & q = pose.orientation;
+    const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    const lanelet::BasicPoint2d front{
+      pose.position.x + base_link_to_front_m_ * std::cos(yaw),
+      pose.position.y + base_link_to_front_m_ * std::sin(yaw)};
+    const auto polygon =
+      route_handler_.getLaneletMapPtr()->laneletLayer.get(id).polygon2d().basicPolygon();
+    return boost::geometry::covered_by(front, polygon);
+  } catch (const lanelet::NoSuchPrimitiveError &) {
+    return false;
+  }
 }
 
 bool RoadCrossingFsmNode::egoOnLanelet(const lanelet::Id id) const
