@@ -8,6 +8,8 @@
 
 #include "scene.hpp"
 
+#include "stop_zone.hpp"
+
 #include <autoware/behavior_velocity_planner_common/utilization/util.hpp>
 #include <autoware/motion_utils/marker/virtual_wall_marker_creator.hpp>
 #include <autoware/trajectory/utils/closest.hpp>
@@ -28,6 +30,7 @@
 #include <lanelet2_core/primitives/BoundingBox.h>
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <utility>
@@ -176,8 +179,12 @@ std::pair<double, std::optional<double>> RoadCrossingModule::findEgoAndStopPoint
   const Trajectory & path,
   [[maybe_unused]] const std::vector<geometry_msgs::msg::Point> & left_bound,
   [[maybe_unused]] const std::vector<geometry_msgs::msg::Point> & right_bound,
-  const lanelet::ConstLanelet & crossing, const PlannerData & planner_data) const
+  const lanelet::ConstLanelet & crossing, const PlannerData & planner_data,
+  std::optional<double> * entry_s_out) const
 {
+  if (entry_s_out) {
+    entry_s_out->reset();
+  }
   const double ego_s = autoware::experimental::trajectory::closest(
     path, planner_data.current_odometry->pose);
 
@@ -220,6 +227,9 @@ std::pair<double, std::optional<double>> RoadCrossingModule::findEgoAndStopPoint
     prev_knot_s = s;
   }
 
+  if (entry_s_out) {
+    *entry_s_out = raw_entry_s;
+  }
   if (!raw_entry_s) {
     // No future entry into the crossing polygon on this path. Either ego is
     // already inside it, or already past, or path doesn't reach yet (still
@@ -540,6 +550,47 @@ void RoadCrossingModule::updateState(
   }
 }
 
+namespace
+{
+// Arc length on the path where it enters the pre lanelet: the lanelet the path runs on right
+// before the crossing entry (what road_crossing_fsm calls the pre, tagged or not).  Found from
+// the path geometry alone: route membership is unreliable here (a lanelet the route traverses
+// against its drawing direction is kept inverted, and the planner's route handler may be
+// windowed).  Overlapping candidates: the one the path runs on longest wins.
+std::optional<double> findPreEntryS(
+  const Trajectory & path, const double entry_s, const lanelet::ConstLanelet & crossing,
+  const PlannerData & planner_data, std::string * why)
+{
+  if (!planner_data.route_handler_ || !planner_data.route_handler_->getLaneletMapPtr()) {
+    *why = "no map";
+    return std::nullopt;
+  }
+  const auto map = planner_data.route_handler_->getLaneletMapPtr();
+
+  constexpr double kStep = 0.05;  // [m]
+  const double probe_s = std::max(0.0, entry_s - kStep);
+  const auto point_at = [&path](const double s) {
+    const auto & p = path.compute(s).point.pose.position;
+    return lanelet::BasicPoint2d{p.x, p.y};
+  };
+  const auto qp = point_at(probe_s);
+
+  std::optional<double> best;
+  for (const auto & llt : map->laneletLayer.search(lanelet::BoundingBox2d(qp, qp))) {
+    if (llt.id() == crossing.id()) continue;
+    const auto polygon = llt.polygon2d().basicPolygon();
+    if (!boost::geometry::covered_by(qp, polygon)) continue;
+    double s = probe_s;
+    while (s - kStep >= 0.0 && boost::geometry::covered_by(point_at(s - kStep), polygon)) {
+      s -= kStep;
+    }
+    if (!best || s < *best) best = s;
+  }
+  if (!best) *why = "no lanelet under the path right before the crossing entry";
+  return best;
+}
+}  // namespace
+
 bool RoadCrossingModule::modifyPathVelocity(
   Trajectory & path, const std::vector<geometry_msgs::msg::Point> & left_bound,
   const std::vector<geometry_msgs::msg::Point> & right_bound, const PlannerData & planner_data)
@@ -562,7 +613,45 @@ bool RoadCrossingModule::modifyPathVelocity(
   const auto & crossing = *crossing_opt;
 
   // Geometry: ego s + stop point s on path.
-  auto [ego_s, stop_s] = findEgoAndStopPoint(path, left_bound, right_bound, crossing, planner_data);
+  std::optional<double> entry_s;
+  auto [ego_s, stop_s] =
+    findEgoAndStopPoint(path, left_bound, right_bound, crossing, planner_data, &entry_s);
+
+  // ROAD: stop ZONE instead of a stop LINE (stop_zone.hpp).  The state machine below then sees
+  // the barrier while the robot is outside the zone and its own position once it is inside, so
+  // a robot standing in the zone is "arrived" and is never asked to creep.
+  std::string stop_detail = "road_crossing";
+  if (kind_ == CrossingKind::ROAD && planner_param_.stop_zone_enable && entry_s) {
+    road_crossing::StopZoneParam zp;
+    zp.leading_edge_offset = debug_data_.base_link2front;
+    zp.zone_length = planner_param_.stop_zone_length;
+    zp.stop_margin = planner_param_.stop_margin;
+    zp.hold_tolerance = planner_param_.stop_zone_hold_tolerance;
+    zp.decel = planner_param_.stop_zone_decel;
+    zp.pre_margin = planner_param_.stop_zone_pre_margin;
+    zp.min_departure_dist = planner_param_.stop_zone_min_departure_dist;
+    const double ego_speed = planner_data.current_velocity
+      ? std::abs(planner_data.current_velocity->twist.linear.x) : 0.0;
+    std::string pre_why;
+    const auto pre_entry_s = findPreEntryS(path, *entry_s, crossing, planner_data, &pre_why);
+    // "Stopped" for the zone: slower than stop_state_speed -- the controller often leaves the
+    // robot crawling at 1..2 cm/s, which isVehicleStopped() does not count as stopped.
+    const bool slow = ego_speed < planner_param_.stop_state_speed;
+    const auto zone = road_crossing::computeStopZone(
+      ego_s, *entry_s, pre_entry_s, ego_speed, slow, zp);
+    stop_s = zone.stop_s;
+    stop_detail = zone.mode == road_crossing::StopZoneMode::HOLD_IN_ZONE
+      ? "TRAFFIC_LIGHT_STOP: hold_in_zone" : "TRAFFIC_LIGHT_STOP: barrier";
+    if (state_ == State::STOPPING || state_ == State::CHECKING) {
+      RCLCPP_INFO_THROTTLE(
+        logger_, *clock_, 5000,
+        "RoadCrossing %ld stop zone: %s ego_s=%.2f entry_s=%.2f pre_entry_s=%s stop_s=%.2f "
+        "(%.2f m ahead)%s%s",
+        getModuleId(), stop_detail.c_str(), ego_s, *entry_s,
+        pre_entry_s ? std::to_string(*pre_entry_s).c_str() : "none", zone.stop_s,
+        zone.stop_s - ego_s, pre_why.empty() ? "" : " -- pre: ", pre_why.c_str());
+    }
+  }
 
   // Obstacle scan (only relevant in CHECKING state but we compute for transition logic).
   // PRE mode never scans vehicles — its CHECKING only waits for the FSM crosswalk gate.
@@ -685,7 +774,8 @@ bool RoadCrossingModule::modifyPathVelocity(
 
   // Insert stop velocity if in STOPPING or CHECKING state.
   const bool should_stop = (state_ == State::STOPPING || state_ == State::CHECKING);
-  if (should_stop && stop_s && *stop_s > 0.0 && *stop_s < path.length()) {
+  // >= 0: a hold-in-zone stop sits at ego, which can be the very start of the path.
+  if (should_stop && stop_s && *stop_s >= 0.0 && *stop_s < path.length()) {
     path.longitudinal_velocity_mps().range(*stop_s, path.length()).set(0.0);
 
     planning_factor_interface_->add(
@@ -693,7 +783,7 @@ bool RoadCrossingModule::modifyPathVelocity(
       path.compute(*stop_s).point.pose,
       autoware_internal_planning_msgs::msg::PlanningFactor::STOP,
       autoware_internal_planning_msgs::msg::SafetyFactorArray{}, planner_data.is_driving_forward,
-      0.0, 0.0 /*shift distance*/, "road_crossing");
+      0.0, 0.0 /*shift distance*/, stop_detail);
 
     debug_data_.stop_pose = path.compute(*stop_s).point.pose;
   }

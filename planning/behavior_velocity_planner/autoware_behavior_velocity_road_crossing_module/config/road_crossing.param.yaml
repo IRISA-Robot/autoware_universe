@@ -28,6 +28,24 @@
       stop_margin: 0.5        # [m] jarak stop sebelum stop_line untuk instance ROAD — wiring field PlannerParam::stop_margin
       # TIDAK DIPAKAI LAGI: stop sebelum pre_road_crossing dihapus (dulu untuk deteksi crosswalk).
       pre_stop_dist_m: 2.0    # [tuned] 1.0→2.0: robot stop 2m sebelum pre (buffer lebih besar dari residual gerak/localization jitter; tetap di parent/fork buat reroute alternate). [m] jarak fisik bagian depan robot ke entry polygon pre_road_crossing. Robot berhenti di parent lanelet (titik fork) supaya reroute ke alternate masih bisa dilakukan. (Hanya berlaku untuk instance PRE; instance ROAD tetap pakai stop_margin.)
+      # Stop ZONE (ROAD): saat gate belum GO, robot berhenti seperti di depan obstacle, bukan di
+      # satu garis.  barrier = mulut crossing - (bumper depan + stop_zone_length).  Bumper sudah
+      # lewat barrier (atau robot diam dengan barrier <= stop_zone_hold_tolerance di depan) ->
+      # robot ditahan DI TEMPAT (planning factor detail "TRAFFIC_LIGHT_STOP: hold_in_zone");
+      # di luar zona -> berhenti di barrier ("TRAFFIC_LIGHT_STOP: barrier").  Tanpa zona, robot
+      # diam yang garis stop-nya 0.5..1.5 m di depan merayap jalan-stop (dead band PID).
+      # Zona selalu di lanelet pre (lanelet rute tepat sebelum crossing): FSM hanya ARMED dan
+      # menjaga episodenya selama base_link di atas pre.  Pre lebih pendek dari zona -> barrier
+      # dimundurkan ke base_link stop_zone_pre_margin di dalam pre; robot diam di luar pre tetap
+      # diarahkan masuk ke pre (toleransi hanya berlaku di atas pre).
+      stop_zone_enable: true
+      stop_zone_length: 2.0           # [m] bumper depan ke mulut crossing di barrier (>= stop_margin)
+      stop_zone_hold_tolerance: 1.5   # [m] robot diam sedekat ini sebelum barrier = sudah di zona
+      stop_zone_decel: 1.0            # [m/s^2] pengereman robot yang masuk zona sambil jalan
+      stop_zone_pre_margin: 0.5       # [m] barrier minimal sejauh ini (base_link) di dalam lanelet pre
+      stop_zone_min_departure_dist: 1.5  # [m] robot diam di LUAR pre digerakkan minimal sejauh ini
+                                         #     (controller tidak bisa berangkat bersih < ~1.5 m),
+                                         #     tidak melewati garis; begitu di atas pre -> ditahan
 
       # FSM gate integration
       # require_fsm_gate: false → original behaviour (backward compatible).

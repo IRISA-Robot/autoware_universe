@@ -56,6 +56,14 @@ RoadCrossingModuleManager::RoadCrossingModuleManager(rclcpp::Node & node)
   p.block_on_unknown = get_or_declare_parameter<bool>(node, ns + ".block_on_unknown");
   p.stop_margin = get_or_declare_parameter<double>(node, ns + ".stop_margin");
   p.pre_stop_dist_m = get_or_declare_parameter<double>(node, ns + ".pre_stop_dist_m");
+  p.stop_zone_enable = get_or_declare_parameter<bool>(node, ns + ".stop_zone_enable");
+  p.stop_zone_length = get_or_declare_parameter<double>(node, ns + ".stop_zone_length");
+  p.stop_zone_hold_tolerance =
+    get_or_declare_parameter<double>(node, ns + ".stop_zone_hold_tolerance");
+  p.stop_zone_decel = get_or_declare_parameter<double>(node, ns + ".stop_zone_decel");
+  p.stop_zone_pre_margin = get_or_declare_parameter<double>(node, ns + ".stop_zone_pre_margin");
+  p.stop_zone_min_departure_dist =
+    get_or_declare_parameter<double>(node, ns + ".stop_zone_min_departure_dist");
 
   // FSM gate integration (default false = backward compatible).
   p.require_fsm_gate = get_or_declare_parameter<bool>(node, ns + ".require_fsm_gate");

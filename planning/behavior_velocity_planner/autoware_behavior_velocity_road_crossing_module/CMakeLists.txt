@@ -12,4 +12,10 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/experimental/scene.cpp
 )
 
+if(BUILD_TESTING)
+  ament_add_ros_isolated_gtest(test_${PROJECT_NAME}_stop_zone
+    test/test_stop_zone.cpp
+  )
+endif()
+
 ament_auto_package(INSTALL_TO_SHARE config)

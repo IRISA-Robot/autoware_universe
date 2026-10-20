@@ -78,6 +78,17 @@ public:
     // (fork point) so a reroute to the alternate branch is still possible.
     double pre_stop_dist_m{1.0};
 
+    // Stop ZONE instead of a stop line for ROAD instances (see stop_zone.hpp).  Inside the zone
+    // -- or standing still with its barrier at most stop_zone_hold_tolerance ahead -- the robot
+    // is held where it is instead of being asked to creep onto a line the longitudinal
+    // controller cannot reach from rest in less than ~1.5 m.
+    bool stop_zone_enable{true};
+    double stop_zone_length{2.0};          // front bumper to crossing entry at the barrier [m]
+    double stop_zone_hold_tolerance{1.5};  // [m]
+    double stop_zone_decel{1.0};           // [m/s^2]
+    double stop_zone_pre_margin{0.5};      // barrier at least this far into the pre lanelet [m]
+    double stop_zone_min_departure_dist{1.5};  // standing off the pre: move at least this far [m]
+
     // FSM gate integration
     // When true: CHECKING → CROSSING only if FSM gate == GO for this module_id.
     // When false (default): original behaviour, backward compatible.
@@ -185,7 +196,8 @@ private:
   std::pair<double, std::optional<double>> findEgoAndStopPoint(
     const Trajectory & path, const std::vector<geometry_msgs::msg::Point> & left_bound,
     const std::vector<geometry_msgs::msg::Point> & right_bound,
-    const lanelet::ConstLanelet & crossing, const PlannerData & planner_data) const;
+    const lanelet::ConstLanelet & crossing, const PlannerData & planner_data,
+    std::optional<double> * entry_s_out = nullptr) const;
 
   /** Update state machine based on current geometry + obstacle scan. */
   void updateState(
