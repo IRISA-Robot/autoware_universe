@@ -1435,8 +1435,14 @@ std::optional<double> getAvoidMargin(
   }
 
   // Step2. check if it should expand road shoulder margin.
+  // [EDGE-CLAMP 2026-10-26] Step1 only asks for kRelaxedHardMarginFloor of room, so the upstream
+  // `return min_avoid_margin` here could hand back a margin up to lateral_hard_margin wider than
+  // the road actually has -- the shift then pushed ego past the drivable bound (e.g. ~0.28 m out
+  // for a pedestrian with hard_margin 0.36 in a narrow lane), after which the robot could not be
+  // put back into auto. In a tight spot give up object-side margin instead of the edge: never
+  // exceed hard_lateral_distance_limit, which Step1 already guaranteed is >= the relaxed floor.
   if (soft_lateral_distance_limit < min_avoid_margin) {
-    return min_avoid_margin;
+    return std::min(min_avoid_margin, hard_lateral_distance_limit);
   }
 
   // Step3. nominal case. avoid margin is limited by soft constraint.

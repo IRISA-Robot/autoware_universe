@@ -453,7 +453,9 @@ TEST(TestUtils, getAvoidMargin)
   // 2.5 - 0.1(hard_drivable_bound_margin) - 1.0(0.5*vehicle_width) = 1.4, which is now >= 1.03
   // (0.03 + 1.0), so it no longer trips the Step1 gate. Falls through to Step2 (soft_distance_limit
   // 1.0 < the *unrelaxed* min_avoid_margin 1.7, since Step2's sizing math was intentionally left
-  // untouched), which returns min_avoid_margin (1.7) as before.
+  // untouched). [EDGE-CLAMP 2026-10-26] Step2 used to return min_avoid_margin (1.7) here, 0.3 m
+  // more than hard_lateral_distance_limit (1.4) -- i.e. ego was shifted past the drivable bound.
+  // It is now clamped to hard_lateral_distance_limit.
   {
     ObjectData object_data;
     object_data.is_parked = true;
@@ -466,7 +468,7 @@ TEST(TestUtils, getAvoidMargin)
 
     const auto output = filtering_utils::getAvoidMargin(object_data, planner_data, parameters);
     ASSERT_TRUE(output.has_value());
-    EXPECT_DOUBLE_EQ(output.value(), 1.7);
+    EXPECT_DOUBLE_EQ(output.value(), 1.4);
   }
 
   // [ALWAYS-AVOID-DIRECTIVE 2026-09-03] The Step1 gate still rejects when there is truly no

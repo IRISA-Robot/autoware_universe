@@ -1636,6 +1636,39 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
     data.target_objects.begin(), data.target_objects.end(),
     [](const auto & o) { return !o.is_avoidable && o.longitudinal > 0.0; });
 
+  // [SAME-SIDE-HOLD 2026-10-26] Both holds below keep the current shift because "an object is
+  // still ahead". That is only right when the held shift keeps ego AWAY from that object. When
+  // the nearest such object sits on the side ego is shifted towards (a right-side object was
+  // passed with a left shift, the next one is on the left), holding drives ego into it, while
+  // the return-to-centre moves ego the way that object needs anyway. Seen in the field: a 0.90 m
+  // left shift held for ~8 s towards a left-side object until it became unavoidable and ego
+  // stopped in front of it. Shift lengths are positive to the left of the true lane centreline.
+  const double held_shift = last_.has_value() ? last_.value().end_shift_length : base_offset_;
+  const auto hold_drives_into_nearest = [&](const bool only_unavoidable) {
+    const ObjectData * nearest = nullptr;
+    for (const auto & o : data.target_objects) {
+      if (o.longitudinal <= 0.0 || (only_unavoidable && o.is_avoidable)) {
+        continue;
+      }
+      if (nearest == nullptr || o.longitudinal < nearest->longitudinal) {
+        nearest = &o;
+      }
+    }
+    if (nearest == nullptr || std::abs(held_shift) < RETURN_SHIFT_THRESHOLD) {
+      return false;
+    }
+    const bool towards_object = held_shift > 0.0 ? !nearest->is_on_right_of_true_lane
+                                                 : nearest->is_on_right_of_true_lane;
+    if (towards_object) {
+      RCLCPP_WARN_THROTTLE(
+        generatorLogger(), generatorClock(), 2000,
+        "[SAME-SIDE-HOLD] not holding the %.2f m shift: the nearest object ahead (%.2f m) is on "
+        "the %s, the side ego is shifted towards -- returning to centreline instead.",
+        held_shift, nearest->longitudinal, nearest->is_on_right_of_true_lane ? "right" : "left");
+    }
+    return towards_object;
+  };
+
   // [STATIONARY-BOUND 2026-09-14] Same shape, same failure mode, as the multi-obj-hold gate
   // below -- and until now it returned completely silently, so a path frozen by THIS gate was
   // indistinguishable from one frozen by any other. An unavoidable object ahead is in fact the
@@ -1648,7 +1681,7 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
   const bool ego_inside_zone =
     data.avoidance_disabled_zone && data.avoidance_disabled_zone->first <= 0.0;
 
-  if (exist_unavoidable_object && !zone_forces_return) {
+  if (exist_unavoidable_object && !zone_forces_return && !hold_drives_into_nearest(true)) {
     if (!isEgoStuckStationary()) {
       RCLCPP_WARN_THROTTLE(
         generatorLogger(), generatorClock(), 2000,
@@ -1700,7 +1733,7 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
   // frozen path is driving into, in which case holding the shift for its sake is backwards.
   //
   // Bound it by ego's progress rather than removing it: while ego moves, behaviour is unchanged.
-  if (exist_object_still_ahead && !zone_forces_return) {
+  if (exist_object_still_ahead && !zone_forces_return && !hold_drives_into_nearest(false)) {
     if (!isEgoStuckStationary()) {
       RCLCPP_WARN_THROTTLE(
         generatorLogger(), generatorClock(), 500,

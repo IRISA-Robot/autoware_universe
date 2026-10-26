@@ -693,6 +693,22 @@ void StaticObstacleAvoidanceModule::fillShiftLine(
    * check that there is a certain amount of margin in the lateral and longitudinal direction.
    */
   data.comfortable = helper_->isComfortable(data.new_shift_line);
+  // [COMFORT-DIAG 2026-10-26] comfortable=0 alone does not say which line failed or why; in the
+  // field even a plain 0.9 m return-to-centre line with no target ahead was refused this way.
+  if (!data.comfortable) {
+    for (const auto & line : data.new_shift_line) {
+      RCLCPP_WARN_THROTTLE(
+        getLogger(), *clock_, 1000,
+        "[COMFORT-DIAG] new line: idx %zu->%zu shift %.3f->%.3f (lat %.3f m over lon %.3f m) "
+        "jerk %.2f vs limit %.2f at %.2f m/s",
+        line.start_idx, line.end_idx, line.start_shift_length, line.end_shift_length,
+        line.getRelativeLength(), line.getRelativeLongitudinal(),
+        autoware::motion_utils::calc_jerk_from_lat_lon_distance(
+          line.getRelativeLength(), line.getRelativeLongitudinal(),
+          helper_->getAvoidanceEgoSpeed()),
+        helper_->getLateralMaxJerkLimit(), helper_->getAvoidanceEgoSpeed());
+    }
+  }
   data.safe = isSafePath(data.candidate_path, debug);
   const auto avoidance_ready = helper_->isReady(data.target_objects);
   data.ready = helper_->isReady(data.new_shift_line, path_shifter_.getLastShiftLength()) &&
