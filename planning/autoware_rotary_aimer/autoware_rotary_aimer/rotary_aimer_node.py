@@ -371,6 +371,12 @@ class RotaryAimerNode(Node):
             self._aim_timer = None
 
         if self._zero_on_disable:
+            # The FSM disables more than once per episode (CROSSING entry, DONE -> IDLE, reset).
+            # Drop the previous ramp timer first: left alive it is orphaned, and on the next
+            # enable it sets _zero_done, which turns the following ramp into a no-op -- the
+            # last aim command then stays latched downstream.  The new ramp continues from
+            # _last_published_angle, so a disable in the middle of a ramp does not restart it.
+            self._cancel_zero_timer()
             # Ensure _last_published_angle is seeded so _zero_tick ramps from
             # the real current position (not from a stale None).
             if self._last_published_angle is None:
