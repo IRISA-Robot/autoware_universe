@@ -85,6 +85,16 @@ Parameters
   center_deadband_deg  float  -- keep the CENTER target while the light is this close to
                                  the camera axis (default: 3; above the rotary PID deadzone)
   center_gain          float  -- fraction of the camera-axis error corrected (default: 1.0)
+  rotate_body_while_driving bool -- false: the platform only turns (aiming AND the re-zero
+                                 ramp) while ego stands still; while it moves the command is
+                                 held.  The road_crossing FSM, same switch, keeps the road
+                                 gate HOLD on green until the body faces the front again.
+                                 (default: true)
+  odom_topic           str    -- ego odometry for the stand-still check
+                                 (default: /localization/kinematic_state)
+  stopped_speed_mps    float  -- |v| below this counts as standing still (default: 0.05)
+  stopped_hold_sec     float  -- ... for at least this long (default: 0.5)
+  odom_timeout_sec     float  -- odometry older than this = not standing still (default: 1.0)
 
 Aim modes (light target only)
 -----------------------------
@@ -105,6 +115,7 @@ from rclpy.time import Time as RclpyTime
 
 from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import PointStamped
+from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32
 from std_srvs.srv import SetBool
 
@@ -163,6 +174,11 @@ class RotaryAimerNode(Node):
         self.declare_parameter('center_exit_deg', 30.0)
         self.declare_parameter('center_deadband_deg', 3.0)
         self.declare_parameter('center_gain', 1.0)
+        self.declare_parameter('rotate_body_while_driving', True)
+        self.declare_parameter('odom_topic', '/localization/kinematic_state')
+        self.declare_parameter('stopped_speed_mps', 0.05)
+        self.declare_parameter('stopped_hold_sec', 0.5)
+        self.declare_parameter('odom_timeout_sec', 1.0)
 
         self._map_path = str(self.get_parameter('map_path').value)
         self._base_frame = str(self.get_parameter('base_frame').value)
@@ -195,6 +211,11 @@ class RotaryAimerNode(Node):
         self._center_deadband_rad = math.radians(
             float(self.get_parameter('center_deadband_deg').value))
         self._center_gain = float(self.get_parameter('center_gain').value)
+        self._rotate_while_driving = bool(
+            self.get_parameter('rotate_body_while_driving').value)
+        self._stopped_speed = float(self.get_parameter('stopped_speed_mps').value)
+        self._stopped_hold_sec = float(self.get_parameter('stopped_hold_sec').value)
+        self._odom_timeout_sec = float(self.get_parameter('odom_timeout_sec').value)
 
         # ------------------------------------------------------------------ state
         self._enabled = False
@@ -216,6 +237,11 @@ class RotaryAimerNode(Node):
         # Light(s) paired with the FSM's active crossing; None until the FSM publishes,
         # in which case every tf_pedestrian light is a candidate (original behavior).
         self._target_light_ids = None
+
+        # Stand-still tracking (rotate_body_while_driving=false).
+        self._last_odom_time = None   # rclpy Time of the latest odometry
+        self._stopped_since = None    # rclpy Time since |v| < stopped_speed_mps, None = moving
+        self._holding = False         # last tick held the command (for the transition log)
 
         # ------------------------------------------------------------------ tf2
         if _TF2_AVAILABLE:
@@ -256,6 +282,10 @@ class RotaryAimerNode(Node):
         )
         self.get_logger().info(
             f'Subscribed to rotary feedback: {self._feedback_topic}')
+
+        # ------------------------------------------------------------------ sub (odometry)
+        self._odom_sub = self.create_subscription(
+            Odometry, str(self.get_parameter('odom_topic').value), self._odom_cb, 10)
 
         # ------------------------------------------------------------------ sub (paired light)
         target_light_topic = str(self.get_parameter('target_light_topic').value)
@@ -347,6 +377,12 @@ class RotaryAimerNode(Node):
                 f'rotary_aimer ENABLE: seeding slew from feedback '
                 f'{math.degrees(self._latest_feedback_angle):.1f}deg '
                 f'({self._latest_feedback_angle:.4f}rad)')
+        elif self._last_published_angle is not None:
+            # A re-zero ramp was cut short: the last command is still where the platform is
+            # headed (and what the master keeps), so continue from it rather than jump to 0.
+            self.get_logger().info(
+                f'rotary_aimer ENABLE: no feedback, seeding slew from the last command '
+                f'{math.degrees(self._last_published_angle):.1f}deg')
         else:
             self._last_published_angle = 0.0
             self.get_logger().warn(
@@ -412,6 +448,12 @@ class RotaryAimerNode(Node):
         try:
             # Guard: if the ramp already completed (spurious re-fire), do nothing.
             if self._zero_done:
+                return
+
+            if not self._may_rotate():
+                # Ego is moving: keep the platform where it is, resume the ramp once it stops.
+                if self._last_published_angle is not None:
+                    self._publish_angle(self._last_published_angle)
                 return
 
             _EPS = 0.01  # rad — close enough to zero
@@ -608,6 +650,7 @@ class RotaryAimerNode(Node):
 
             # ------ slew-rate limit ------
             dt = 1.0 / max(self._rate_hz, 0.1)
+            hold = not self._may_rotate()
 
             # _last_published_angle is always seeded in _start_aiming before this
             # timer fires, so it should never be None here.  Guard defensively: if
@@ -622,6 +665,9 @@ class RotaryAimerNode(Node):
                     f'seeding from {math.degrees(seed):.1f}deg')
                 self._last_published_angle = seed
 
+            if hold:
+                # Ego is moving and rotate_body_while_driving=false: keep the last command.
+                desired = self._last_published_angle
             delta = _wrap_pi(desired - self._last_published_angle)
             max_step = self._max_angle_rate_rad_s * dt
             step = max(-max_step, min(max_step, delta))
@@ -632,7 +678,8 @@ class RotaryAimerNode(Node):
             # ------ end slew ------
 
             self.get_logger().info(
-                f'[rotary_aimer] cmd={math.degrees(out):.1f}deg ({out:.4f}rad)',
+                f'[rotary_aimer] cmd={math.degrees(out):.1f}deg ({out:.4f}rad)'
+                + (' HOLD (ego moving)' if hold else ''),
                 throttle_duration_sec=1.0,
             )
 
@@ -710,6 +757,32 @@ class RotaryAimerNode(Node):
         return out
 
     # ---------------------------------------------------------------------- helpers
+
+    def _odom_cb(self, msg: Odometry):
+        now = self.get_clock().now()
+        self._last_odom_time = now
+        if abs(msg.twist.twist.linear.x) < self._stopped_speed:
+            if self._stopped_since is None:
+                self._stopped_since = now
+        else:
+            self._stopped_since = None
+
+    def _may_rotate(self) -> bool:
+        """Whether the platform may turn now (always, unless rotate_body_while_driving=false)."""
+        if self._rotate_while_driving:
+            may = True
+        else:
+            now = self.get_clock().now()
+            fresh = (self._last_odom_time is not None and
+                     (now - self._last_odom_time).nanoseconds * 1e-9 <= self._odom_timeout_sec)
+            may = (fresh and self._stopped_since is not None and
+                   (now - self._stopped_since).nanoseconds * 1e-9 >= self._stopped_hold_sec)
+        if may == self._holding:
+            self._holding = not may
+            self.get_logger().info(
+                'ego moving -- holding the platform (rotate_body_while_driving=false)'
+                if self._holding else 'ego standing still -- platform may turn')
+        return may
 
     def _feedback_cb(self, msg: Float32):
         """Store latest rotary position feedback (rad, same convention as cmd)."""
@@ -820,6 +893,11 @@ class RotaryAimerNode(Node):
                     return SetParametersResult(successful=False, reason=f'{name} must be > 0')
                 setattr(self, '_' + name.replace('_deg', '_rad'), math.radians(val))
                 self.get_logger().info(f'param {name} updated -> {val}')
+
+            elif name == 'rotate_body_while_driving':
+                self._rotate_while_driving = bool(param.value)
+                self.get_logger().info(
+                    f'param rotate_body_while_driving updated -> {self._rotate_while_driving}')
 
             elif name == 'center_gain':
                 val = float(param.value)

@@ -49,6 +49,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
 from sensor_msgs.msg import Image, CameraInfo
+from std_msgs.msg import Float32
 from std_srvs.srv import SetBool
 
 from autoware_road_crossing_msgs.msg import PedestrianLightState, PedestrianLightTarget
@@ -429,6 +430,14 @@ class PedestrianLightDetectorNode(Node):
         self._pub = self.create_publisher(
             PedestrianLightState,
             '/perception/road_crossing/pedestrian_light',
+            10,
+        )
+        # Posisi horizontal pusat ROI lampu terhadap tengah gambar kamera terpilih:
+        # (cx - w/2) / (w/2), -1 = tepi kiri, 0 = tengah, +1 = tepi kanan.  Hanya dipublish
+        # saat ada ROI; FSM memutar body ke lampu kalau ROI terlalu ke pinggir.
+        self._roi_offset_pub = self.create_publisher(
+            Float32,
+            '/perception/road_crossing/pedestrian_light_roi_offset',
             10,
         )
 
@@ -1352,6 +1361,9 @@ class PedestrianLightDetectorNode(Node):
         raw_state, raw_conf = self._gated_classify(
             roi, sel_padded_bbox, sel_tight_bbox
         )
+        roi_box = sel_tight_bbox if sel_tight_bbox is not None else sel_padded_bbox
+        self._publish_roi_offset(
+            (roi_box[0] + roi_box[2]) / 2.0, self._last_frame.shape[1])
 
         self._update_committed(raw_state, raw_conf)
         self._publish_state(self._committed_state, self._committed_conf)
@@ -1430,6 +1442,7 @@ class PedestrianLightDetectorNode(Node):
         x, y, w, h = box
         self._final_rois_pub.publish(
             self._make_rois_msg((x, y, x + w, y + h), msg.header.stamp, frame_id))
+        self._publish_roi_offset(x + w / 2.0, img_wh[0])
         total = sum(self._ff_source_count.values())
         if total >= 100:
             self.get_logger().info(
@@ -1572,6 +1585,9 @@ class PedestrianLightDetectorNode(Node):
         else:
             self._clf_rois_pub.publish(
                 self._make_rois_msg((x1, y1, x2, y2), img_stamp, frame_id))
+        if self._roi_refiner != 'fullframe':
+            # fullframe: offset dari ROI final di _on_ff_objects
+            self._publish_roi_offset((x1 + x2) / 2.0, int(raw_img.width))
 
         # --- Ambil state dari cache (dengan staleness check) ---
         now_sec = self.get_clock().now().nanoseconds * 1e-9
@@ -1712,6 +1728,13 @@ class PedestrianLightDetectorNode(Node):
         msg.blocked = False
         msg.light_id = self._reported_light_id()
         self._pub.publish(msg)
+
+    def _publish_roi_offset(self, cx: float, img_w: int):
+        """Publish offset horizontal pusat ROI terhadap tengah gambar (-1..+1)."""
+        if img_w <= 0:
+            return
+        half = img_w / 2.0
+        self._roi_offset_pub.publish(Float32(data=float((cx - half) / half)))
 
     def _publish_state(self, state: int, confidence: float):
         """Publish state + confidence ke topic utama."""

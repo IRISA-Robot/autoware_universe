@@ -91,6 +91,22 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
   // --- Parameter aimer ---
   // Jarak (m) dari pre entry di bawahnya aimer diaktifkan dan membidik lampu.
   param_.aim_approach_dist_m = declare_parameter<double>("aim_approach_dist_m", 10.0);
+  param_.rotate_body_while_driving =
+    declare_parameter<bool>("rotate_body_while_driving", true);
+  param_.rezero_before_go_tol_deg = declare_parameter<double>("rezero_before_go_tol_deg", 1.0);
+  param_.rezero_before_go_settle_sec =
+    declare_parameter<double>("rezero_before_go_settle_sec", 0.5);
+  param_.rezero_before_go_timeout_sec =
+    declare_parameter<double>("rezero_before_go_timeout_sec", 60.0);
+  param_.green_latch_sec = declare_parameter<double>("green_latch_sec", 30.0);
+  param_.green_latch_blink_count = declare_parameter<int>("green_latch_blink_count", 2);
+  param_.aim_only_if_light_unseen = declare_parameter<bool>("aim_only_if_light_unseen", true);
+  param_.aim_unseen_grace_sec = declare_parameter<double>("aim_unseen_grace_sec", 2.0);
+  param_.aim_max_roi_offset = declare_parameter<double>("aim_max_roi_offset", 0.4);
+  param_.aim_roi_offset_timeout_sec =
+    declare_parameter<double>("aim_roi_offset_timeout_sec", 0.5);
+  param_.topic_light_roi_offset = declare_parameter<std::string>(
+    "topic_light_roi_offset", "/perception/road_crossing/pedestrian_light_roi_offset");
   param_.topic_target_light = declare_parameter<std::string>(
     "topic_target_light", "/planning/road_crossing/target_light");
 
@@ -158,6 +174,9 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
   sub_aim_cmd_ = create_subscription<std_msgs::msg::Float32>(
     param_.topic_rotary_angle_cmd, rclcpp::QoS(1),
     std::bind(&RoadCrossingFsmNode::onAimCmd, this, std::placeholders::_1));
+  sub_light_roi_offset_ = create_subscription<std_msgs::msg::Float32>(
+    param_.topic_light_roi_offset, rclcpp::QoS(10),
+    std::bind(&RoadCrossingFsmNode::onLightRoiOffset, this, std::placeholders::_1));
 
   // AdAPI state subscribers (transient_local to get latest cached state immediately)
   {
@@ -314,11 +333,18 @@ void RoadCrossingFsmNode::onOdom(const nav_msgs::msg::Odometry::SharedPtr msg)
   last_odom_ = msg;
 }
 
-void RoadCrossingFsmNode::onAimCmd(const std_msgs::msg::Float32::SharedPtr /*msg*/)
+void RoadCrossingFsmNode::onAimCmd(const std_msgs::msg::Float32::SharedPtr msg)
 {
   // Catat waktu pesan terakhir dari rotary aimer.
   // Dipakai di onTimer untuk menentukan apakah aimer sudah running (cmd "fresh").
   last_aim_cmd_time_ = this->now();
+  last_aim_cmd_value_ = msg->data;
+}
+
+void RoadCrossingFsmNode::onLightRoiOffset(const std_msgs::msg::Float32::SharedPtr msg)
+{
+  last_roi_offset_time_ = this->now();
+  last_roi_offset_ = msg->data;
 }
 
 void RoadCrossingFsmNode::onAdApiRouteState(
@@ -541,8 +567,12 @@ void RoadCrossingFsmNode::onTimer()
 
     const double pre_dist = distanceToPreEntry();
     const bool on_pre = active_pre_id_ && egoOnPre(*active_pre_id_);
+    // While the body is brought to the front before GO the aimer stays disabled -- once its
+    // ramp ends it stops publishing, and re-enabling it would aim at the light again.
+    // aim_only_if_light_unseen: the aimer only once the light went unseen (updateAimNeed()).
     const bool want_aim =
-      waiting && !active_light_ids_.empty() &&
+      waiting && !active_light_ids_.empty() && !rezero_before_go_since_ &&
+      (!param_.aim_only_if_light_unseen || aim_needed_) &&
       (on_pre || (pre_dist >= 0.0 && pre_dist <= param_.aim_approach_dist_m));
 
     // Aimer dianggap running jika ada pesan aim_cmd yang fresh.
@@ -1135,6 +1165,7 @@ void RoadCrossingFsmNode::onTimer()
         }
         light_timeout_start_ = now;
         interlock_ = LightInterlock{};
+        resetAimNeed();
       }
 
       // ONE transition per tick: proceed to WAIT_GREEN.
@@ -1152,6 +1183,8 @@ void RoadCrossingFsmNode::onTimer()
       // Interlock lampu hijau (interlock.plan.md) jalan tiap tick sejak masuk WAIT_GREEN,
       // termasuk saat robot masih mendekat — supaya transisi merah → hijau tidak terlewat.
       updateLightInterlock("WAIT_GREEN");
+      const bool green_latched = greenLatched(now);
+      updateAimNeed(now);
 
       // No position gate: ego is on this crossing's pre (the membership check guarantees it),
       // so GO as soon as the light allows — the planner module then crosses without stopping
@@ -1167,6 +1200,8 @@ void RoadCrossingFsmNode::onTimer()
         light_timeout_start_.reset();
         road_cross_is_green_ = false;
         crossing_timeout_start_ = now;
+        cancelRezeroBeforeGo();
+        resetAimNeed();
         transitionTo(FsmState::CROSSING);
         reZeroAimerDirectionAware();
         publishGate(autoware_road_crossing_msgs::msg::RoadCrossingGate::GO);
@@ -1187,6 +1222,8 @@ void RoadCrossingFsmNode::onTimer()
         light_timeout_start_.reset();
         road_cross_is_green_ = false;   // bypass: trust-light shortcut must NOT fire
         crossing_timeout_start_ = now;  // arm CROSSING safety-timeout watchdog
+        cancelRezeroBeforeGo();
+        resetAimNeed();
         transitionTo(FsmState::CROSSING);
         // Robot mulai menyeberang — re-zero aimer (direction-aware; see
         // reZeroAimerDirectionAware()).
@@ -1195,9 +1232,28 @@ void RoadCrossingFsmNode::onTimer()
         break;
       }
 
+      // Hijau terlihat → pasang latch: lampu yang hilang dari kamera (body menoleh ke depan)
+      // tidak membatalkan izin, sampai merah / hijau kedip terlihat atau latch habis.
+      if (interlock_.allows_crossing && !green_latch_since_) {
+        armGreenLatch(now);
+      }
+      const bool go_ok = interlock_.allows_crossing || green_latched;
+
       // Tidak ada timeout di sini: tanpa izin interlock robot HOLD, berapapun lamanya
-      // (merah bisa ~60 s; lampu yang tidak terlihat juga HOLD).
-      if (!interlock_.allows_crossing) {
+      // (merah bisa ~60 s; lampu yang tidak terlihat juga HOLD, kecuali latch hijau aktif).
+      if (!go_ok) {
+        if (rezero_before_go_since_) {
+          RCLCPP_WARN(
+            get_logger(),
+            "WAIT_GREEN: lampu %s tidak lagi mengizinkan (status=%s) saat body balik ke depan — "
+            "batal, bidik lampu lagi",
+            lightIdsText().c_str(), lightStatusName(interlock_.status_now));
+          cancelRezeroBeforeGo();
+          if (!param_.aim_only_if_light_unseen || aim_needed_) {
+            setDetectorEnabled(cli_rotary_aimer_, true, "rotary_aimer");
+            last_aim_enable_send_ = now;
+          }
+        }
         RCLCPP_INFO_THROTTLE(
           get_logger(), *get_clock(), 2000,
           "WAIT_GREEN: lampu %s status=%s — HOLD, menunggu hijau solid",
@@ -1205,12 +1261,23 @@ void RoadCrossingFsmNode::onTimer()
         break;
       }
 
+      // rotate_body_while_driving=false: the body must face the front before ego moves.
+      // Reversing keeps the aimer enabled (reZeroAimerDirectionAware), so there is nothing to
+      // wait for then.
+      if (!param_.rotate_body_while_driving && is_driving_forward_ && !bodyAtFrontBeforeGo(now)) {
+        break;  // road gate stays HOLD (published above)
+      }
+
       RCLCPP_INFO(
         get_logger(), "WAIT_GREEN: lampu %s hijau (%s) — GO_GREEN", lightIdsText().c_str(),
-        interlock_.red_to_green ? "merah -> hijau" : "hijau solid >= threshold");
+        !interlock_.allows_crossing ? "latch hijau, lampu tidak terlihat"
+        : interlock_.red_to_green  ? "merah -> hijau"
+                                   : "hijau solid >= threshold");
       light_timeout_start_.reset();
       road_cross_is_green_ = true;   // persist GO_GREEN through CROSSING state
       crossing_timeout_start_ = now;  // arm CROSSING safety-timeout watchdog
+      cancelRezeroBeforeGo();
+      resetAimNeed();
       transitionTo(FsmState::CROSSING);
       // Robot mulai menyeberang (lampu HIJAU) — re-zero aimer (direction-aware).
       reZeroAimerDirectionAware();
@@ -1222,6 +1289,7 @@ void RoadCrossingFsmNode::onTimer()
     case FsmState::CROSSING: {
       // Keep status_now following the light while crossing.
       updateLightInterlock("CROSSING");
+      const bool green_latched = greenLatched(now);
 
       // Released by the light but base_link is still on the pre: the release only stands while
       // the light still allows it.  Green flashing, red or nothing seen (status_now NONE) →
@@ -1229,7 +1297,7 @@ void RoadCrossingFsmNode::onTimer()
       // after the GO and the light has changed since.  Once base_link is on the crossing there
       // is no way back: ego keeps going whatever the light does.
       if (
-        road_cross_is_green_ && !interlock_.allows_crossing && active_pre_id_ &&
+        road_cross_is_green_ && !interlock_.allows_crossing && !green_latched && active_pre_id_ &&
         active_crossing_id_ && egoOnPre(*active_pre_id_) &&
         !egoOnLanelet(*active_crossing_id_)) {
         RCLCPP_WARN(
@@ -1873,6 +1941,155 @@ void RoadCrossingFsmNode::reZeroAimerDirectionAware()
     "leaving aimer enabled to keep tracking via TF/pose-based light search");
 }
 
+bool RoadCrossingFsmNode::bodyAtFrontBeforeGo(const rclcpp::Time & now)
+{
+  if (!rezero_before_go_since_) {
+    rezero_before_go_since_ = now;
+    rezero_at_zero_since_.reset();
+    // Disabling starts the aimer's ramp back to 0; ego stands still, so the aimer may turn.
+    setDetectorEnabled(cli_rotary_aimer_, false, "rotary_aimer");
+    RCLCPP_INFO(
+      get_logger(),
+      "WAIT_GREEN: lampu %s hijau — body balik ke depan dulu sebelum jalan "
+      "(rotate_body_while_driving=false, aim cmd=%s)",
+      lightIdsText().c_str(),
+      last_aim_cmd_value_ ? std::to_string(*last_aim_cmd_value_).c_str() : "none");
+  }
+
+  // No aim command ever (no aimer running) counts as at the front: nothing turned the body.
+  const bool at_zero =
+    !last_aim_cmd_value_ ||
+    std::abs(*last_aim_cmd_value_) <= param_.rezero_before_go_tol_deg * M_PI / 180.0;
+  if (at_zero) {
+    if (!rezero_at_zero_since_) rezero_at_zero_since_ = now;
+    if ((now - *rezero_at_zero_since_).seconds() >= param_.rezero_before_go_settle_sec) {
+      RCLCPP_INFO(
+        get_logger(), "WAIT_GREEN: body sudah menghadap depan (%.1f s) — boleh jalan",
+        (now - *rezero_before_go_since_).seconds());
+      return true;
+    }
+  } else {
+    rezero_at_zero_since_.reset();
+  }
+
+  const double waited = (now - *rezero_before_go_since_).seconds();
+  if (waited > param_.rezero_before_go_timeout_sec) {
+    RCLCPP_WARN(
+      get_logger(),
+      "WAIT_GREEN: body belum di depan setelah %.1f s (aim cmd=%s) — timeout, jalan saja",
+      waited, last_aim_cmd_value_ ? std::to_string(*last_aim_cmd_value_).c_str() : "none");
+    return true;
+  }
+  RCLCPP_INFO_THROTTLE(
+    get_logger(), *get_clock(), 2000,
+    "WAIT_GREEN: menunggu body balik ke depan (aim cmd=%s, %.1f s) — gate HOLD",
+    last_aim_cmd_value_ ? std::to_string(*last_aim_cmd_value_).c_str() : "none", waited);
+  return false;
+}
+
+void RoadCrossingFsmNode::cancelRezeroBeforeGo()
+{
+  rezero_before_go_since_.reset();
+  rezero_at_zero_since_.reset();
+}
+
+void RoadCrossingFsmNode::armGreenLatch(const rclcpp::Time & now)
+{
+  if (param_.green_latch_sec <= 0.0) return;
+  green_latch_since_ = now;
+  green_latch_prev_status_ = interlock_.status_now;
+  green_latch_reappear_ = 0;
+  RCLCPP_INFO(
+    get_logger(),
+    "latch hijau ON (%.0f s): lampu %s yang hilang dari kamera tetap dianggap hijau, "
+    "reset kalau merah / hijau kedip terlihat",
+    param_.green_latch_sec, lightIdsText().c_str());
+}
+
+bool RoadCrossingFsmNode::greenLatched(const rclcpp::Time & now)
+{
+  if (!green_latch_since_) return false;
+  const auto st = interlock_.status_now;
+  if (st == LightStatus::MERAH) {
+    RCLCPP_WARN(get_logger(), "latch hijau OFF: merah terlihat");
+    clearGreenLatch();
+    return false;
+  }
+  // Green back after a gap: the light is blinking (or was never solid).
+  if (st == LightStatus::HIJAU && green_latch_prev_status_ != LightStatus::HIJAU &&
+      ++green_latch_reappear_ >= param_.green_latch_blink_count) {
+    RCLCPP_WARN(
+      get_logger(), "latch hijau OFF: hijau kedip (hijau muncul lagi %d x setelah hilang)",
+      green_latch_reappear_);
+    clearGreenLatch();
+    return false;
+  }
+  green_latch_prev_status_ = st;
+  const double age = (now - *green_latch_since_).seconds();
+  if (age > param_.green_latch_sec) {
+    RCLCPP_INFO(get_logger(), "latch hijau OFF: habis (%.1f s)", age);
+    clearGreenLatch();
+    return false;
+  }
+  return true;
+}
+
+void RoadCrossingFsmNode::updateAimNeed(const rclcpp::Time & now)
+{
+  if (!param_.aim_only_if_light_unseen || aim_needed_) return;
+  const bool seen = interlock_.status_now != LightStatus::NONE;
+  // Seen near the image edge = poor detection there: treated like unseen.
+  const bool roi_offset_fresh =
+    last_roi_offset_time_ &&
+    (now - *last_roi_offset_time_).seconds() <= param_.aim_roi_offset_timeout_sec;
+  const bool off_center = seen && param_.aim_max_roi_offset > 0.0 && roi_offset_fresh &&
+                          std::abs(last_roi_offset_) > param_.aim_max_roi_offset;
+  if (seen && !off_center) {
+    if (light_unseen_since_) {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "aimer: lampu %s terlihat (%s, offset ROI %.2f) tanpa noleh — body tidak diputar",
+        lightIdsText().c_str(), lightStatusName(interlock_.status_now),
+        roi_offset_fresh ? last_roi_offset_ : 0.0);
+    }
+    light_unseen_since_.reset();
+    return;
+  }
+  if (!light_unseen_since_) {
+    light_unseen_since_ = now;
+    return;
+  }
+  const double unseen = (now - *light_unseen_since_).seconds();
+  if (unseen >= param_.aim_unseen_grace_sec) {
+    aim_needed_ = true;
+    if (off_center) {
+      RCLCPP_INFO(
+        get_logger(),
+        "aimer: lampu %s terlihat (%s) tapi ROI di pinggir (offset %.2f > %.2f) %.1f s — "
+        "noleh ke lampu",
+        lightIdsText().c_str(), lightStatusName(interlock_.status_now), last_roi_offset_,
+        param_.aim_max_roi_offset, unseen);
+    } else {
+      RCLCPP_INFO(
+        get_logger(), "aimer: lampu %s tidak terlihat %.1f s — noleh ke lampu",
+        lightIdsText().c_str(), unseen);
+    }
+  }
+}
+
+void RoadCrossingFsmNode::resetAimNeed()
+{
+  light_unseen_since_.reset();
+  aim_needed_ = false;
+}
+
+void RoadCrossingFsmNode::clearGreenLatch()
+{
+  green_latch_since_.reset();
+  green_latch_prev_status_ = LightStatus::NONE;
+  green_latch_reappear_ = 0;
+}
+
 // ---------------------------------------------------------------------------
 // AdAPI reroute helpers
 // ---------------------------------------------------------------------------
@@ -2190,6 +2407,9 @@ void RoadCrossingFsmNode::resetEpisode()
   interlock_ = LightInterlock{};  // penyeberangan baru: semua counter & status dari nol
   active_light_ids_.clear();
   road_cross_is_green_ = false;  // reset green-cross flag for next episode
+  cancelRezeroBeforeGo();
+  clearGreenLatch();
+  resetAimNeed();
   // Reset reroute sub-step state so the next episode starts fresh.
   resetRerouteSubstep();
   active_alt_id_.reset();

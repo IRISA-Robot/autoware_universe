@@ -58,4 +58,8 @@
       # Tidak ada watchdog yang memaksa CROSSING selama gate HOLD: lampu merah bisa ~60 s.
       # Gate lebih tua dari ini = HOLD. FSM publish gate crossing aktif tiap tick (10 Hz);
       # gate lama dari episode sebelumnya (atau FSM mati) tidak boleh melepas robot.
-      gate_stale_sec: 0.5
+      # 2026-10-28: 0.5 -> 2.0. Di robot (RAM hampir penuh / planner sibuk) callback gate di
+      # behavior_velocity_planner telat > 0.5 s padahal FSM tetap kirim GO_GREEN tiap tick ->
+      # modul baca HOLD, robot ga jalan saat hijau. HOLD dari FSM tetap langsung berlaku;
+      # batas ini hanya untuk gate yang berhenti dikirim (FSM mati / episode lama).
+      gate_stale_sec: 2.0

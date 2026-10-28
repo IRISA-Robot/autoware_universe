@@ -135,6 +135,32 @@ private:
 
     // Jarak (m) dari pre entry di bawahnya aimer diaktifkan dan membidik lampu.
     double aim_approach_dist_m{10.0};
+    // false = the body only turns while ego stands still (rotary_aimer, same switch) and, on
+    // green, the FSM keeps the road gate HOLD until the aimer has brought the body back to the
+    // front -- so it never turns while driving.  true = old behaviour (re-zero while crossing).
+    bool rotate_body_while_driving{true};
+    double rezero_before_go_tol_deg{1.0};      // aim cmd within this of 0 = body at the front
+    double rezero_before_go_settle_sec{0.5};   // cmd at 0 this long before GO (body catches up)
+    double rezero_before_go_timeout_sec{60.0};  // GO anyway (WARN) after this long
+    // Green latch: once the interlock allowed crossing, keep allowing for this long while the
+    // light is NOT seen (status NONE) -- the camera loses it when the body turns back to the
+    // front.  Cleared by a valid red, or by green blinking (green seen again after a gap
+    // green_latch_blink_count times).  0 = no latch.
+    double green_latch_sec{30.0};
+    int green_latch_blink_count{2};
+    // true: only turn the body to the light when it is NOT detected from where the body
+    // faces now (any camera) for aim_unseen_grace_sec in WAIT_GREEN; a light already seen
+    // (red or green) needs no turn -- saves rotary motor work.  Once turned, the aimer stays
+    // on until ego goes.  false: aim whenever waiting (old behaviour).
+    bool aim_only_if_light_unseen{true};
+    double aim_unseen_grace_sec{2.0};
+    // A light seen near the image edge counts as unseen too (detection there is poor): the
+    // classifier ROI centre, (cx - w/2) / (w/2) from the detector, beyond this |offset| for
+    // aim_unseen_grace_sec turns the body.  <= 0 = off.  An offset older than
+    // aim_roi_offset_timeout_sec is ignored (seen = no turn, as before).
+    double aim_max_roi_offset{0.4};
+    double aim_roi_offset_timeout_sec{0.5};
+    std::string topic_light_roi_offset{"/perception/road_crossing/pedestrian_light_roi_offset"};
     // PedestrianLightTarget: the light(s) paired with the active crossing.
     std::string topic_target_light{"/planning/road_crossing/target_light"};
 
@@ -177,6 +203,7 @@ private:
   rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr sub_trajectory_;
   // Subscriber output rotary aimer — untuk deteksi aimer sudah running (spam-enable).
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr sub_aim_cmd_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr sub_light_roi_offset_;
 
   // AdAPI state subscribers
   rclcpp::Subscription<autoware_adapi_v1_msgs::msg::RouteState>::SharedPtr sub_route_state_;
@@ -367,6 +394,19 @@ private:
     bool allows_crossing{false};  // Rule 1 || Rule 2
   } interlock_;
 
+  // Green latch state (see green_latch_sec).
+  std::optional<rclcpp::Time> green_latch_since_;
+  LightStatus green_latch_prev_status_{LightStatus::NONE};
+  int green_latch_reappear_{0};
+
+  // aim_only_if_light_unseen: since when the light has been unseen (status NONE) in
+  // WAIT_GREEN, and whether the aimer was needed (sticky until ego goes / the episode ends).
+  std::optional<rclcpp::Time> light_unseen_since_;
+  bool aim_needed_{false};
+  // Latest ROI offset from the detector (aim_max_roi_offset).
+  std::optional<rclcpp::Time> last_roi_offset_time_;
+  double last_roi_offset_{0.0};
+
   // Re-route state
   std::optional<rclcpp::Time> last_reroute_time_;
   std::set<lanelet::Id> reroute_blocklist_;  // alternate IDs already attempted
@@ -389,6 +429,11 @@ private:
   // Waktu terakhir mengirim enable ke rotary_aimer (inisialisasi 0/lama).
   // Dipakai untuk throttle pengiriman enable (setiap aim_enable_retry_sec detik).
   rclcpp::Time last_aim_enable_send_{0, 0, RCL_ROS_TIME};
+  // Last /control/rotary_angle_cmd value; unset until the aimer has published.
+  std::optional<double> last_aim_cmd_value_;
+  // rotate_body_while_driving=false: green seen, waiting for the body to face the front.
+  std::optional<rclcpp::Time> rezero_before_go_since_;
+  std::optional<rclcpp::Time> rezero_at_zero_since_;
 
   // ------------------------------------------------------------------
   // AdAPI reroute sub-step state machine
@@ -450,6 +495,7 @@ private:
   void onOdom(const nav_msgs::msg::Odometry::SharedPtr msg);
   // Callback output rotary aimer — catat waktu pesan terakhir untuk deteksi running.
   void onAimCmd(const std_msgs::msg::Float32::SharedPtr msg);
+  void onLightRoiOffset(const std_msgs::msg::Float32::SharedPtr msg);
   void onAdApiRouteState(const autoware_adapi_v1_msgs::msg::RouteState::SharedPtr msg);
   void onAdApiOpMode(const autoware_adapi_v1_msgs::msg::OperationModeState::SharedPtr msg);
 
@@ -528,6 +574,24 @@ private:
   // nearest light regardless of travel direction instead of snapping to a
   // wrong fixed angle.
   void reZeroAimerDirectionAware();
+
+  // rotate_body_while_driving=false, on green: disable the aimer (its ramp brings the body to the
+  // front while ego still stands) and return true once the aim command has been at 0 for
+  // rezero_before_go_settle_sec (or after rezero_before_go_timeout_sec).  False = keep HOLD.
+  bool bodyAtFrontBeforeGo(const rclcpp::Time & now);
+  void cancelRezeroBeforeGo();
+
+  // Green latch (see green_latch_sec).  armGreenLatch() when the interlock allows crossing;
+  // greenLatched() once per tick, after updateLightInterlock(): true while it holds, and it
+  // clears itself on a valid red, on green blinking, or when green_latch_sec has run out.
+  void armGreenLatch(const rclcpp::Time & now);
+  bool greenLatched(const rclcpp::Time & now);
+  void clearGreenLatch();
+
+  // aim_only_if_light_unseen: update aim_needed_ from the interlock (once per WAIT_GREEN tick,
+  // after updateLightInterlock()); resetAimNeed() starts over (new wait at the pre).
+  void updateAimNeed(const rclcpp::Time & now);
+  void resetAimNeed();
 
   // Publish gate command for active_crossing_id_ (ROAD lanelet).
   void publishGate(uint8_t command);

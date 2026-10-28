@@ -11,6 +11,7 @@
   -->
 
   <arg name="use_intra_process_comms" default="false"/>
+  <arg name="rotate_body_while_driving" default="true"/>
   <arg name="road_crossing_fsm_param_path"
        default="$(find-pkg-share autoware_road_crossing_fsm)/config/road_crossing_fsm.param.yaml"/>
 
@@ -20,5 +21,6 @@
         output="screen">
     <param name="use_intra_process_comms" value="$(var use_intra_process_comms)"/>
     <param from="$(var road_crossing_fsm_param_path)"/>
+    <param name="rotate_body_while_driving" value="$(var rotate_body_while_driving)"/>
   </node>
 </launch>

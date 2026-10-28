@@ -90,6 +90,29 @@
 
     aim_approach_dist_m:  10.0          # [m] jarak dari pre entry di mana aimer mulai diaktifkan
                                         # dan membidik lampu (sebelum robot tiba di pre).
+    rotate_body_while_driving: true     # false: saat hijau gate tetap HOLD sampai body (rotary)
+                                        # kembali menghadap depan, baru jalan -- body tidak pernah
+                                        # berputar saat robot jalan (rotary_aimer, switch sama).
+                                        # Di launch: arg road_crossing_rotate_body_while_driving.
+    rezero_before_go_tol_deg: 1.0       # [deg] aim cmd sedekat ini ke 0 = body di depan, boleh jalan
+    rezero_before_go_settle_sec: 0.12   # [s] cmd sudah 0 selama ini baru GO (body menyusul)
+    rezero_before_go_timeout_sec: 60.0  # [s] lewat ini tetap GO (WARN)
+    green_latch_sec: 30.0               # [s] latch hijau: setelah hijau mengizinkan, lampu yang
+                                        # TIDAK terlihat (NONE, mis. body menoleh ke depan) tetap
+                                        # dianggap hijau selama ini.  0 = tanpa latch.
+    green_latch_blink_count: 2          # latch reset kalau merah valid terlihat, atau hijau muncul
+                                        # lagi setelah hilang sebanyak ini (= hijau kedip).
+    aim_only_if_light_unseen: true      # true: body baru noleh ke lampu kalau lampu TIDAK terdeteksi
+                                        # (kamera mana pun) selama aim_unseen_grace_sec di WAIT_GREEN.
+                                        # Sudah terlihat (merah/hijau) = tidak noleh, hemat motor.
+                                        # Sekali noleh, aimer tetap aktif sampai robot jalan.
+    aim_unseen_grace_sec: 2.0           # [s] waktu tunggu detektor sebelum dianggap tidak terlihat
+    aim_max_roi_offset: 0.4             # lampu terlihat tapi pusat ROI-nya di pinggir gambar dianggap
+                                        # tidak terlihat (deteksi di pinggir jelek) -> noleh juga.
+                                        # Offset = (cx - w/2) / (w/2): 0 = tengah, 1 = tepi frame.
+                                        # 0.4 ~ 23 deg dari sumbu kamera depan. <= 0 = mati.
+    aim_roi_offset_timeout_sec: 0.5     # [s] offset ROI lebih tua dari ini diabaikan
+    topic_light_roi_offset: "/perception/road_crossing/pedestrian_light_roi_offset"
     topic_target_light:  "/planning/road_crossing/target_light"
                                         # PedestrianLightTarget: lampu pasangan crossing aktif,
                                         # dari tag forward_pedestrian_tf (reverse_pedestrian_tf

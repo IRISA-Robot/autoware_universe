@@ -19,6 +19,9 @@
   <!-- Sim time (true saat jalan di Isaac sim) -->
   <arg name="use_sim_time" default="false"/>
 
+  <!-- false: rotary only turns while ego stands still (same switch as the road_crossing FSM) -->
+  <arg name="rotate_body_while_driving" default="true"/>
+
   <!-- External aim target topic (FSM tidak lagi mempublish; untuk uji manual).
        Default kosong = pakai nilai dari param file (~/aim_target).
        Override kalau FSM publish ke namespace lain. -->
@@ -34,5 +37,6 @@
     <param name="start_enabled" value="$(var start_enabled)"/>
     <param name="use_sim_time"  value="$(var use_sim_time)"/>
     <param name="target_topic"  value="$(var target_topic)"/>
+    <param name="rotate_body_while_driving" value="$(var rotate_body_while_driving)"/>
   </node>
 </launch>

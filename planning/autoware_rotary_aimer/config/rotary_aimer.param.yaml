@@ -45,11 +45,11 @@
     # Laju ramp aim ke lampu [rad/s] — kecepatan sudut saat platform mengarah ke traffic light.
     # Naik = pergerakan cepat tapi kasar; turun = halus tapi lambat.
     # Nilai 0.1 rad/s (~5.7 deg/s) — 10x lebih lambat dari default lama (1.0).
-    max_angle_rate_rad_s: 0.3
+    max_angle_rate_rad_s: 0.9      # 3x (2026-10-27, was 0.3); Houle driver still saturates the motor speed
 
     # Laju ramp balik ke 0 pas selesai/disable [rad/s] — sengaja sangat lambat biar smooth.
     # Contoh: dari 0.8 rad ke 0 butuh ~20 detik — ini disengaja agar transisi halus.
-    zero_rate_rad_s: 0.04
+    zero_rate_rad_s: 0.12          # 3x (2026-10-27, was 0.04): 0.68 rad back to the front in ~6 s
 
     # ---- Mode CENTER (khusus target lampu) ----
     # MAP   : bidik bearing lampu dari base_link (perilaku lama).
@@ -65,6 +65,17 @@
     center_exit_deg: 30.0      # CENTER -> MAP kalau lebih jauh dari ini (histeresis)
     center_deadband_deg: 3.0   # di bawah ini target ditahan (> deadzone PID rotary 0.04 rad = 2.3 deg)
     center_gain: 1.0           # bagian error sumbu kamera yang dikoreksi
+
+    # ---- Putar body hanya saat berhenti ----
+    # rotate_body_while_driving: false = body hanya boleh berputar (bidik lampu DAN balik ke
+    # depan) saat robot diam (|v| < stopped_speed_mps selama stopped_hold_sec); saat jalan sudut
+    # ditahan.  FSM road_crossing (switch yang sama) menahan gate saat hijau sampai body kembali
+    # menghadap depan, baru jalan.  Di launch di-set lewat arg road_crossing_rotate_body_while_driving.
+    rotate_body_while_driving: true
+    odom_topic: "/localization/kinematic_state"
+    stopped_speed_mps: 0.05
+    stopped_hold_sec: 0.5
+    odom_timeout_sec: 1.0
 
     # Topik external target (geometry_msgs/PointStamped, frame map).  FSM road_crossing tidak
     # lagi mempublish ke sini (dulu centroid crossing saat approach); tetap tersedia untuk uji
