@@ -19,7 +19,9 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/tools/unknown_pose.cpp
   src/tools/delete_all_objects.cpp
   src/tools/delete_nearest_object.cpp
+  src/tools/relocate_teleop_object.cpp
   src/panels/dummy_object_scenario_panel.cpp
+  src/panels/teleop_dummy_object_panel.cpp
 )
 
 target_link_libraries(${PROJECT_NAME}

@@ -24,6 +24,7 @@
   <depend>autoware_map_msgs</depend>
   <depend>autoware_perception_msgs</depend>
   <depend>autoware_road_crossing_msgs</depend>
+  <depend>geometry_msgs</depend>
   <depend>tier4_simulation_msgs</depend>
   <depend>yaml_cpp_vendor</depend>
 

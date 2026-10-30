@@ -38,4 +38,14 @@
          base_class_type="rviz_common::Panel">
     <description>Save the placed dummy objects to a YAML scenario and load it back on later runs.</description>
   </class>
+  <class name="rviz_plugins/RelocateTeleopObjectTool"
+         type="rviz_plugins::RelocateTeleopObjectTool"
+         base_class_type="rviz_common::Tool">
+    <description>Click-drag to move the Teleop Dummy Object panel's pedestrian there, stopped.</description>
+  </class>
+  <class name="rviz_plugins/TeleopDummyObjectPanel"
+         type="rviz_plugins::TeleopDummyObjectPanel"
+         base_class_type="rviz_common::Panel">
+    <description>Drive one dummy pedestrian with the keyboard (hold W/S/A/D).</description>
+  </class>
 </library>
