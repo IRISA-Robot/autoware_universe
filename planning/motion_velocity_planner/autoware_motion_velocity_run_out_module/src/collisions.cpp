@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <iterator>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -334,6 +335,29 @@ void calculate_overlapping_collision(
       const auto time_margin =
         std::abs(ego.first_intersection.object_time - ego.first_intersection.ego_time);
       const auto near_zero_ego_vel = std::abs(ego.first_intersection.ego_vel) < 1e-3;
+      // [CATCHUP-FIX 2026-10-30] Object ahead on ego's path (it entered first): when ego enters,
+      // the object is time_margin * obj_vel further along, and ego closes that gap at vel_diff.
+      // The formula below (time_margin * vel_diff / ego_vel) shrinks to 0 as the speeds match,
+      // so a pedestrian walking 4 m ahead at ego's speed (vel_diff 0.008 m/s) was predicted to
+      // be hit 2 s later and ego stopped for it. With the gap formula that catch-up is ~350 s,
+      // past the overlap, and the collision is dropped by calculate_object_collisions().
+      const auto object_is_ahead =
+        ego.first_intersection.object_time <= ego.first_intersection.ego_time;
+      if (object_is_ahead && !near_zero_ego_vel) {
+        constexpr double min_vel_diff = 1e-3;  // [m/s] not closing in: no catch-up
+        const auto vel_diff = ego.first_intersection.vel_diff;
+        const auto obj_vel = std::max(0.0, ego.first_intersection.ego_vel - vel_diff);
+        const auto catchup_time = vel_diff > min_vel_diff
+                                    ? time_margin * obj_vel / vel_diff
+                                    : std::numeric_limits<double>::infinity();
+        c.ego_collision_time += catchup_time;
+        std::stringstream ss;
+        ss << std::setprecision(2) << "coll_t = ego_enter_time[" << ego.first_intersection.ego_time
+           << "]+enter_t_diff[" << time_margin << "]*obj_vel[" << obj_vel << "]/v_diff["
+           << vel_diff << "]";
+        c.explanation = ss.str();
+        return;
+      }
       const auto catchup_time =
         near_zero_ego_vel
           ? 0.0
