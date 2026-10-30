@@ -46,6 +46,7 @@ Light namedtuple:
                                None jika tag tidak ada (gunakan tight_box_height_scale)
 """
 
+import math
 import xml.etree.ElementTree as ET
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -435,9 +436,12 @@ def select(
     """
     Pilih kamera + light terbaik dari semua kombinasi yang terlihat.
 
-    Untuk setiap (kamera, light) yang menghasilkan bbox valid:
-    - Hitung kedalaman midpoint light ke kamera.
-    - Pilih yang memiliki kedalaman terkecil (paling dekat, paling relevan).
+    1. Light: yang paling dekat (jarak midpoint ke kamera terdekat yang melihatnya).
+    2. Kamera: dari kamera yang melihat light itu, yang paling TENGAH -- sudut horizontal
+       midpoint dari sumbu optik terkecil.  Sama dengan pilihan rotary_aimer (kamera dengan
+       error terkecil), jadi setelah body diam aimer dan detector memakai kamera yang sama.
+       (Dulu: kedalaman Z terkecil, yang untuk satu light justru kamera yang melihatnya
+       paling di pinggir, karena Z = jarak * cos(sudut off-axis).)
 
     Parameters
     ----------
@@ -455,7 +459,8 @@ def select(
     padded_bbox : bbox longgar untuk crop ROI (dipakai classifier).
     tight_bbox  : bbox ketat proyeksi lampu (dipakai geometric gate); bisa None.
     """
-    best = None          # (depth, cam_name, padded_bbox, tight_bbox, light)
+    # (range, off_axis, cam_name, padded_bbox, tight_bbox, light) per kombinasi yang terlihat
+    seen = []
 
     for cam in cameras_state:
         for light in lights:
@@ -468,27 +473,37 @@ def select(
             if padded_bbox is None:
                 continue
 
-            # Kedalaman midpoint untuk ranking
             mid_result = project_point(
                 light.midpoint, cam.K, cam.frame_id, tf_buffer, stamp=None
             )
             if mid_result is None:
-                # Midpoint tidak terproyeksikan, gunakan kedalaman besar sebagai
-                # fallback agar tidak diprioritaskan
-                depth = float('inf')
+                # Midpoint tidak terproyeksikan: paling tidak diprioritaskan
+                rng = float('inf')
+                off_axis = math.pi
             else:
-                _, _, depth = mid_result
+                u, v, depth = mid_result
+                if depth <= 0.0:
+                    continue
+                # Optical frame: x kanan, y bawah, z ke depan.
+                x = (u - cam.K[0, 2]) / cam.K[0, 0] * depth
+                y = (v - cam.K[1, 2]) / cam.K[1, 1] * depth
+                rng = math.sqrt(x * x + y * y + depth * depth)
+                off_axis = math.atan2(abs(x), depth)
 
-            if depth <= 0.0:
-                continue
+            seen.append((rng, off_axis, cam.name, padded_bbox, tight_bbox, light))
 
-            if best is None or depth < best[0]:
-                best = (depth, cam.name, padded_bbox, tight_bbox, light)
-
-    if best is None:
+    if not seen:
         return None
 
-    _, cam_name, padded_bbox, tight_bbox, light = best
+    # Light terdekat (jarak dari kamera mana pun yang melihatnya) ...
+    nearest = {}
+    for rng, _, _, _, _, light in seen:
+        key = id(light)
+        nearest[key] = min(nearest.get(key, float('inf')), rng)
+    best_light = min(seen, key=lambda e: nearest[id(e[5])])[5]
+    # ... lalu kamera yang melihatnya paling tengah.
+    _, _, cam_name, padded_bbox, tight_bbox, light = min(
+        (e for e in seen if e[5] is best_light), key=lambda e: e[1])
     return (cam_name, padded_bbox, tight_bbox, light)
 
 

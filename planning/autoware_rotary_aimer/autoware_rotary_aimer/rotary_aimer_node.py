@@ -14,7 +14,8 @@
 
 """
 rotary_aimer_node — rotate the sensor platform to face the nearest
-tf_pedestrian traffic light so the front camera sees it.
+tf_pedestrian traffic light so one of the platform's cameras sees it -- the camera
+whose axis is closest to the light (see "Camera choice").
 
 Angle convention
 ----------------
@@ -95,6 +96,26 @@ Parameters
   stopped_speed_mps    float  -- |v| below this counts as standing still (default: 0.05)
   stopped_hold_sec     float  -- ... for at least this long (default: 0.5)
   odom_timeout_sec     float  -- odometry older than this = not standing still (default: 1.0)
+
+Camera choice (light target, MAP mode)
+--------------------------------------
+  cameras              str[]  -- cameras on the platform that may face the light; keep it the
+                                 same as the pedestrian_light_detector's `cameras`
+                                 (default: [front] = old behaviour, front camera only)
+  camera_frame_template str   -- camera frame per name (default: camera_{}_link, x forward)
+  body_frame           str    -- rotary platform frame (default: body_link)
+  camera_switch_hysteresis_deg float -- keep the camera in use unless another one is closer to
+                                 the light by more than this (default: 15)
+
+  Camera k sits at yaw off_k on the platform.  It faces the light (bearing b in base_frame)
+  when the rotary is at target_k = wrap(b - off_k); its error now is
+  wrap(target_k - rotary now).  The camera with the smallest |error| is aimed, so with four
+  cameras at 90 deg the platform turns at most ~45 deg, e.g. light at -60 deg: front error
+  -60, right error +30 -> rotary +30 deg turns the right camera onto the light.
+
+  off_k comes from TF: yaw of camera k in body_frame minus that of the front camera, plus
+  front_cam_offset_rad -- so the front camera keeps exactly the old aim and the others
+  follow their calibration.  Without TF: front 0, left +90, rear 180, right -90 deg.
 
 Aim modes (light target only)
 -----------------------------
@@ -179,6 +200,10 @@ class RotaryAimerNode(Node):
         self.declare_parameter('stopped_speed_mps', 0.05)
         self.declare_parameter('stopped_hold_sec', 0.5)
         self.declare_parameter('odom_timeout_sec', 1.0)
+        self.declare_parameter('cameras', ['front'])
+        self.declare_parameter('camera_frame_template', 'camera_{}_link')
+        self.declare_parameter('body_frame', 'body_link')
+        self.declare_parameter('camera_switch_hysteresis_deg', 15.0)
 
         self._map_path = str(self.get_parameter('map_path').value)
         self._base_frame = str(self.get_parameter('base_frame').value)
@@ -216,6 +241,11 @@ class RotaryAimerNode(Node):
         self._stopped_speed = float(self.get_parameter('stopped_speed_mps').value)
         self._stopped_hold_sec = float(self.get_parameter('stopped_hold_sec').value)
         self._odom_timeout_sec = float(self.get_parameter('odom_timeout_sec').value)
+        self._cameras = [str(c) for c in self.get_parameter('cameras').value] or ['front']
+        self._camera_frame_template = str(self.get_parameter('camera_frame_template').value)
+        self._body_frame = str(self.get_parameter('body_frame').value)
+        self._camera_hysteresis_rad = math.radians(
+            float(self.get_parameter('camera_switch_hysteresis_deg').value))
 
         # ------------------------------------------------------------------ state
         self._enabled = False
@@ -237,6 +267,12 @@ class RotaryAimerNode(Node):
         # Light(s) paired with the FSM's active crossing; None until the FSM publishes,
         # in which case every tf_pedestrian light is a candidate (original behavior).
         self._target_light_ids = None
+
+        # Camera choice: the camera aimed now (None = choose afresh), and the cameras' yaw on
+        # the platform read from TF (static, so cached once found).
+        self._aim_camera = None
+        self._cam_yaw_tf = {}
+        self._cam_yaw_missing_logged = False
 
         # Stand-still tracking (rotate_body_while_driving=false).
         self._last_odom_time = None   # rclpy Time of the latest odometry
@@ -367,6 +403,7 @@ class RotaryAimerNode(Node):
         if self._enabled and self._aim_timer is not None:
             # Already aiming — repeated enable is a no-op.
             return
+        self._aim_camera = None
 
         # Seed the slew tracker from the ACTUAL current rotary position so that
         # the first _aim_tick ramps FROM here toward the desired angle rather than
@@ -628,8 +665,7 @@ class RotaryAimerNode(Node):
                 #   light LEFT  -> y > 0 -> angle > 0 -> platform CCW (left)  -> CORRECT
                 #   light RIGHT -> y < 0 -> angle < 0 -> platform CW  (right) -> CORRECT
                 bearing = math.atan2(light_y, light_x)
-                desired = bearing - self._front_cam_offset_rad
-                desired = _wrap_pi(desired)
+                desired, cam, cam_err = self._camera_desired(bearing)
                 if self._invert_sign:
                     desired = -desired
                 desired = self._center_desired(light.midpoint, desired)
@@ -637,7 +673,8 @@ class RotaryAimerNode(Node):
                 dist_m = math.sqrt(best_dist_sq)
                 self.get_logger().info(
                     f'[rotary_aimer] aim target: light way_id={light.way_id} '
-                    f'mode={self._aim_mode} '
+                    f'mode={self._aim_mode} camera={cam} '
+                    f'(error {math.degrees(cam_err):+.1f}deg) '
                     f'dist={dist_m:.2f}m '
                     f'base_xy=({light_x:.2f},{light_y:.2f}) '
                     f'bearing={math.degrees(bearing):.1f}deg '
@@ -688,6 +725,85 @@ class RotaryAimerNode(Node):
                 f'_aim_tick unhandled exception: {exc}',
                 throttle_duration_sec=2.0,
             )
+
+    # ---------------------------------------------------------------------- camera choice
+
+    _NOMINAL_CAMERA_YAW_DEG = {'front': 0.0, 'left': 90.0, 'rear': 180.0, 'right': -90.0}
+
+    def _camera_yaw_in_body(self, name: str):
+        """Yaw [rad] of camera `name` in body_frame from TF (cached), None if unavailable."""
+        if name in self._cam_yaw_tf:
+            return self._cam_yaw_tf[name]
+        if self._tf_buffer is None:
+            return None
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                self._body_frame, self._camera_frame_template.format(name), RclpyTime())
+        except Exception:
+            return None
+        q = tf.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self._cam_yaw_tf[name] = yaw
+        self.get_logger().info(
+            f'camera {name}: yaw {math.degrees(yaw):.1f}deg in {self._body_frame} (TF)')
+        return yaw
+
+    def _camera_offsets(self) -> dict:
+        """Yaw of each camera on the platform [rad, physical], front = front_cam_offset_rad.
+
+        From TF relative to the front camera when the front and the camera are both in TF,
+        else nominal (front 0, left +90, rear 180, right -90 deg).
+        """
+        front_tf = self._camera_yaw_in_body('front')
+        offsets = {}
+        missing = []
+        for name in self._cameras:
+            yaw = self._camera_yaw_in_body(name)
+            if front_tf is not None and yaw is not None:
+                rel = _wrap_pi(yaw - front_tf)
+            elif name in self._NOMINAL_CAMERA_YAW_DEG:
+                rel = math.radians(self._NOMINAL_CAMERA_YAW_DEG[name])
+                missing.append(name)
+            else:
+                missing.append(name)
+                continue
+            offsets[name] = _wrap_pi(rel + self._front_cam_offset_rad)
+        if missing and not self._cam_yaw_missing_logged:
+            self._cam_yaw_missing_logged = True
+            self.get_logger().warn(
+                f'camera yaw not in TF ({self._body_frame} -> '
+                f'{self._camera_frame_template}) for {missing}: using nominal yaw')
+        return offsets
+
+    def _camera_desired(self, bearing: float):
+        """Rotary target [rad, physical] that puts the chosen camera on the light.
+
+        Returns (target, camera name, its current error).  The camera with the smallest
+        |error| (light bearing vs. its axis at the current rotary angle) is chosen; the one in
+        use is kept unless another is closer by more than camera_switch_hysteresis_deg.
+        """
+        offsets = self._camera_offsets()
+        if not offsets:
+            offsets = {'front': self._front_cam_offset_rad}
+        current = self._last_published_angle
+        if current is None:
+            current = (self._latest_feedback_angle
+                       if self._feedback_received and self._latest_feedback_angle is not None
+                       else 0.0)
+        if self._invert_sign:
+            current = -current
+        targets = {n: _wrap_pi(bearing - off) for n, off in offsets.items()}
+        errors = {n: _wrap_pi(t - current) for n, t in targets.items()}
+        best = min(errors, key=lambda n: abs(errors[n]))
+        cur = self._aim_camera
+        if (cur not in errors or
+                abs(errors[best]) + self._camera_hysteresis_rad < abs(errors[cur])):
+            self.get_logger().info(
+                f'aim camera {cur} -> {best} (error {math.degrees(errors[best]):+.1f}deg; '
+                + ', '.join(f'{n} {math.degrees(e):+.1f}' for n, e in errors.items()) + ')')
+            self._aim_camera = best
+        cam = self._aim_camera
+        return targets[cam], cam, errors[cam]
 
     # ---------------------------------------------------------------------- CENTER mode
 
@@ -794,6 +910,7 @@ class RotaryAimerNode(Node):
         if ids != self._target_light_ids:
             self.get_logger().info(
                 f'Target light: crossing={msg.crossing_id} lights={ids or "none"}')
+            self._aim_camera = None
         self._target_light_ids = ids
 
     def _ext_target_cb(self, msg: PointStamped):

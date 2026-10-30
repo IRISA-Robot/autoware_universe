@@ -66,6 +66,17 @@
     center_deadband_deg: 3.0   # di bawah ini target ditahan (> deadzone PID rotary 0.04 rad = 2.3 deg)
     center_gain: 1.0           # bagian error sumbu kamera yang dikoreksi
 
+    # ---- Kamera yang dihadapkan ke lampu ----
+    # Body diputar supaya kamera dengan error terkecil ke lampu yang menghadap lampu (4 kamera
+    # tiap 90 deg -> body berputar maks ~45 deg).  Contoh lampu di -60 deg: kamera kanan,
+    # body +30 deg.  Samakan dengan `cameras` di pedestrian_light_detector.param.yaml.
+    # ["front"] = perilaku lama (selalu kamera depan).
+    cameras: ["front", "left", "rear", "right"]
+    camera_frame_template: "camera_{}_link"   # yaw kamera di body_frame dari TF (relatif ke front)
+    body_frame: "body_link"
+    camera_switch_hysteresis_deg: 15.0  # kamera yang dipakai baru diganti kalau kamera lain lebih
+                                        # dekat ke lampu lebih dari ini (anti bolak-balik di 45 deg)
+
     # ---- Putar body hanya saat berhenti ----
     # rotate_body_while_driving: false = body hanya boleh berputar (bidik lampu DAN balik ke
     # depan) saat robot diam (|v| < stopped_speed_mps selama stopped_hold_sec); saat jalan sudut

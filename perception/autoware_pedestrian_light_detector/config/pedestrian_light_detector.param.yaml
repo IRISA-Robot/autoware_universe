@@ -150,10 +150,12 @@
     #   /camera/<N>/image_raw    (semua kamera, tapi HANYA simpan raw msg — ringan)
     # Kamera dipilih berdasarkan lampu paling dekat yang masuk FOV-nya.
     # Kurangi list jika beberapa kamera tidak tersedia untuk hemat resource.
-    # 2026-10-28: sementara hanya kamera depan — kalibrasi left/right/rear masih placeholder
-    # dan deteksi di pinggir frame jelek; body yang menoleh ke lampu (FSM aim_max_roi_offset).
-    # Semua kamera: ["front", "left", "rear", "right"]
-    cameras: ["front"]
+    # 2026-10-28: sempat hanya kamera depan (kalibrasi left/right/rear placeholder).
+    # 2026-10-30: kembali 4 kamera.  Kamera terpilih = yang melihat lampu paling TENGAH; rotary
+    # aimer memutar body supaya kamera dengan error terkecil menghadap lampu -- samakan
+    # `cameras` di rotary_aimer.param.yaml dengan daftar ini.
+    # Hanya kamera depan: ["front"]
+    cameras: ["front", "left", "rear", "right"]
 
     # roi_margin_px: margin piksel yang ditambahkan ke setiap sisi bbox proyeksi
     # (padded bbox untuk crop ke classifier). Naikkan jika lampu terpotong.
