@@ -572,33 +572,23 @@ double getDistanceToCenterline(const ObjectData & object, const AvoidancePlannin
 }
 
 /**
- * @brief side of the object used for every avoid_margin / shift_length decision
- * (ObjectData::is_on_right_of_true_lane).
- * @details If the whole envelope lies on one side of data.reference_path, that side is
- * geometrically unambiguous and is returned as-is: ego can only pass such an object on the other
- * side. The lane-centerline test (getDistanceToCenterline) is only a tie-breaker for an object that
- * straddles the path. Field evidence (route-reversed driving, lanelet 322): objects lying entirely
- * right of the path were classified LEFT of the centerline (log_belok.log 883.9 s overhang -0.29 ->
- * shift -1.118; belog_lagi.log 492.3 s overhang -0.077 -> shift -0.905), i.e. a shift toward the
- * object. Forward driving showed no such contradiction for objects fully on one side.
- * @param object data (overhang_points must already be filled for the geometric test).
- * @param data planning data.
- * @return true if the object is to be treated as lying on the right.
+ * @brief the side ego would naturally pass the object on: the one needing the smaller shift.
+ * @details All in the frame of data.reference_path, the path the shift is applied to. An envelope
+ * wholly on one side of the path is unambiguous (lanelet 322, route-reversed: objects entirely
+ * right of the path must never be passed on their right). A straddling envelope goes by its
+ * midpoint, i.e. by which edge is nearer the path.
+ * @param object data (overhang_points must already be filled).
+ * @return true if the object is naturally treated as lying on the right (ego passes left).
  */
-bool isObjectOnRightForAvoidance(const ObjectData & object, const AvoidancePlanningData & data)
+bool isObjectOnRightOfPath(const ObjectData & object)
 {
-  if (!object.overhang_points.empty()) {
-    const auto [min_it, max_it] = std::minmax_element(
-      object.overhang_points.begin(), object.overhang_points.end(),
-      [](const auto & a, const auto & b) { return a.first < b.first; });
-    if (max_it->first < 0.0) {
-      return true;  // entire envelope right of the path
-    }
-    if (min_it->first > 0.0) {
-      return false;  // entire envelope left of the path
-    }
+  if (object.overhang_points.empty()) {
+    return object.direction == Direction::RIGHT;
   }
-  return getDistanceToCenterline(object, data) <= 0.0;
+  const auto [min_it, max_it] = std::minmax_element(
+    object.overhang_points.begin(), object.overhang_points.end(),
+    [](const auto & a, const auto & b) { return a.first < b.first; });
+  return min_it->first + max_it->first < 0.0;
 }
 
 std::optional<lanelet::ConstLineString3d> getNearestIntersectionRoadBorder(
@@ -1282,25 +1272,18 @@ bool isNoNeedAvoidanceBehavior(
     return false;
   }
 
-  // NOTE: object.avoid_margin is derived from getAvoidMargin()/getRoadShoulderDistance(), which
-  // are computed relative to the TRUE lane geometry (bias-independent -- see the
-  // getRoadShoulderDistance frame-mismatch fix). isOnRight(object)/object.direction, by contrast,
-  // are computed relative to the CURRENT reference path (scene.cpp's calc_lateral_deviation
-  // against data.reference_path), which can be laterally biased (e.g. prefer_lateral_ratio).
-  // object.overhang_points.front().first (overhang_dist) legitimately stays path-relative here:
-  // it is the real, current lateral distance from the path actually being shifted to the
-  // object's near edge, and shift_length is by definition relative to that same path. What must
-  // NOT be path-relative is the add-vs-subtract decision (which side of the object requires the
-  // margin), since that decision has to agree with the true-lane side getAvoidMargin() assumed
-  // when it picked the "far" road bound. So use object.is_on_right_of_true_lane here instead of
-  // isOnRight(object) to keep both terms of the shift_length formula in the same frame.
+  // NOTE: object.avoid_margin was measured toward the bound on the side ego passes on, chosen by
+  // selectAvoidanceSide(). isOnRight(object)/object.direction is only where the object's centre is
+  // relative to the path, and can be the other side for an object straddling the path. The
+  // add-vs-subtract decision (which side of the object requires the margin) has to be the side the
+  // margin was measured for, so use object.is_on_right_for_avoidance here, not isOnRight(object).
   // The edge must match the side used for the add-vs-subtract decision; front() is sorted by the
-  // path side and is the wrong edge whenever is_on_right_of_true_lane != isOnRight(object).
-  const auto overhang_dist = getOverhangDistance(object, object.is_on_right_of_true_lane);
+  // path side and is the wrong edge whenever is_on_right_for_avoidance != isOnRight(object).
+  const auto overhang_dist = getOverhangDistance(object, object.is_on_right_for_avoidance);
   const auto shift_length =
-    calcShiftLength(object.is_on_right_of_true_lane, overhang_dist, object.avoid_margin.value());
+    calcShiftLength(object.is_on_right_for_avoidance, overhang_dist, object.avoid_margin.value());
 
-  const auto enough_lateral_distance = !isShiftNecessary(object.is_on_right_of_true_lane, shift_length);
+  const auto enough_lateral_distance = !isShiftNecessary(object.is_on_right_for_avoidance, shift_length);
   const auto below_execution_threshold =
     !enough_lateral_distance && std::abs(shift_length) < parameters->lateral_execution_threshold;
 
@@ -1310,11 +1293,11 @@ bool isNoNeedAvoidanceBehavior(
   // logging, unlike the vehicle branch and isSatisfiedWithCommonCondition()'s REJECT logs.
   RCLCPP_WARN_THROTTLE(
     rclcpp::get_logger(logger_namespace), *avoid_debug_clock(), 500,
-    "[NO-NEED-AVOID-DEBUG] id=%s is_on_right_of_true_lane=%s overhang_dist=%.3f "
+    "[NO-NEED-AVOID-DEBUG] id=%s is_on_right_for_avoidance=%s overhang_dist=%.3f "
     "avoid_margin=%.3f shift_length=%.3f lateral_execution_threshold=%.3f "
     "to_road_shoulder_distance=%.3f result=%s",
     autoware_utils::to_hex_string(object.object.object_id).c_str(),
-    object.is_on_right_of_true_lane ? "true" : "false", overhang_dist,
+    object.is_on_right_for_avoidance ? "true" : "false", overhang_dist,
     object.avoid_margin.value(), shift_length, parameters->lateral_execution_threshold,
     object.to_road_shoulder_distance,
     enough_lateral_distance
@@ -1450,15 +1433,18 @@ std::optional<double> getAvoidMargin(
 }
 
 /**
- * @brief get avoidance lateral margin based on road width.
+ * @brief get the free lateral distance between the object and the drivable bound ego would pass
+ * through.
  * @param object data.
  * @param avoidance module data, which includes current reference path.
  * @param planner data, which includes ego vehicle footprint info.
- * @return if this function finds there is no enough space to avoid, return nullopt.
+ * @param is_object_on_right true measures toward the left bound (ego passes on the object's
+ * left), false toward the right bound.
+ * @return distance to the bound; 0.0 when it cannot be measured.
  */
 double getRoadShoulderDistance(
   ObjectData & object, const AvoidancePlanningData & data,
-  const std::shared_ptr<const PlannerData> & planner_data)
+  const std::shared_ptr<const PlannerData> & planner_data, const bool is_object_on_right)
 {
   using autoware_utils::Point2d;
   using lanelet::utils::to2D;
@@ -1494,14 +1480,9 @@ double getRoadShoulderDistance(
     object.overhang_lanelet,
     autoware::experimental::lanelet2_utils::from_ros(object.getPosition()));
   // TODO(Satoshi OTA): check if the basic point is on right or left of bound.
-  // Determine which side of the TRUE lane (not the possibly-biased reference path, e.g. under a
-  // prefer_lateral_ratio lanelet tag) the object actually sits on, reusing the same bias-independent
-  // arc-coordinate computation already used elsewhere for centerline-distance checks, so the correct
-  // real boundary is treated as the "far" side regardless of how far off-center the current path is.
-  // Same side as ObjectData::is_on_right_of_true_lane (see isObjectOnRightForAvoidance()), so the
-  // shoulder distance is always measured toward the bound ego will actually pass on.
-  const bool is_object_on_right_of_true_lane = isObjectOnRightForAvoidance(object, data);
-  const auto bound = is_object_on_right_of_true_lane ? data.left_bound : data.right_bound;
+  // The side is the caller's: selectAvoidanceSide() measures both and keeps the one ego passes on.
+  const bool is_object_on_right_for_avoidance = is_object_on_right;
+  const auto bound = is_object_on_right_for_avoidance ? data.left_bound : data.right_bound;
   const auto envelope_polygon_width = boost::geometry::area(object.envelope_poly) /
                                       std::max(object.length, 1e-3);  // prevent division by zero
 
@@ -1512,7 +1493,7 @@ double getRoadShoulderDistance(
     for (size_t i = 1; i < bound.size(); i++) {
       {
         const auto p2 =
-          calc_offset_pose(p_tmp, 0.0, (is_object_on_right_of_true_lane ? 100.0 : -100.0), 0.0)
+          calc_offset_pose(p_tmp, 0.0, (is_object_on_right_for_avoidance ? 100.0 : -100.0), 0.0)
             .position;
         const auto opt_intersect =
           autoware_utils::intersect(p1.second, p2, bound.at(i - 1), bound.at(i));
@@ -1526,7 +1507,7 @@ double getRoadShoulderDistance(
       {
         const auto p2 =
           calc_offset_pose(
-            p_tmp, 0.0, (is_object_on_right_of_true_lane ? -0.5 : 0.5) * envelope_polygon_width, 0.0)
+            p_tmp, 0.0, (is_object_on_right_for_avoidance ? -0.5 : 0.5) * envelope_polygon_width, 0.0)
             .position;
         const auto opt_intersect =
           autoware_utils::intersect(p1.second, p2, bound.at(i - 1), bound.at(i));
@@ -1553,6 +1534,90 @@ double getRoadShoulderDistance(
     std::make_pair(std::get<1>(intersects.front()), std::get<2>(intersects.front()));
 
   return std::get<0>(intersects.front());
+}
+
+/**
+ * @brief the side-choice rule of selectAvoidanceSide(), on its inputs alone.
+ * @param natural_on_right isObjectOnRightOfPath() -- the smaller shift.
+ * @param previous_on_right side chosen last cycle, if the object was a target then.
+ * @param locked_on_right side a shift already executed for the object commits to.
+ * @param margin_if_right avoid margin ego gets passing on the left (nullopt: does not fit).
+ * @param margin_if_left avoid margin ego gets passing on the right (nullopt: does not fit).
+ * @param hysteresis how much more margin the other side must give to take over.
+ * @return {is_on_right_for_avoidance, reason}.
+ */
+std::pair<bool, const char *> chooseAvoidanceSide(
+  const bool natural_on_right, const std::optional<bool> & previous_on_right,
+  const std::optional<bool> & locked_on_right, const std::optional<double> & margin_if_right,
+  const std::optional<double> & margin_if_left, const double hysteresis)
+{
+  if (locked_on_right.has_value()) {
+    return {locked_on_right.value(), "locked"};
+  }
+  const bool incumbent_on_right = previous_on_right.value_or(natural_on_right);
+  const auto & incumbent = incumbent_on_right ? margin_if_right : margin_if_left;
+  const auto & other = incumbent_on_right ? margin_if_left : margin_if_right;
+  if (other.has_value() && !incumbent.has_value()) {
+    return {!incumbent_on_right, "only_side_that_fits"};
+  }
+  if (other.has_value() && other.value() > incumbent.value() + hysteresis) {
+    return {!incumbent_on_right, "roomier"};
+  }
+  return {incumbent_on_right, previous_on_right.has_value() ? "kept" : "natural"};
+}
+
+/**
+ * @brief decide which side ego passes the object on; sets is_on_right_for_avoidance,
+ * to_road_shoulder_distance and narrowest_place for that side.
+ * @details Each side is measured in the frame of the path the shift is applied to: its free
+ * distance to the drivable bound (getRoadShoulderDistance), turned into the avoid margin that side
+ * can actually give (getAvoidMargin -- nullopt when ego does not fit). The incumbent side stays
+ * unless the other gives more than avoid_side_hysteresis_margin more margin, or the incumbent does
+ * not fit at all. The incumbent is, in order: the side a shift already being executed for this
+ * object commits to (locked -- never switched), the side chosen last cycle, or the natural side
+ * (isObjectOnRightOfPath, the smaller shift). With room on both sides both give the full nominal
+ * margin and the natural side stays; when the natural side is cramped -- an object between a
+ * biased path and the lane centre, lanelet 256 on 2026-10-30, where the centreline sign picked one
+ * side and the path the other and the shift was clamped to zero -- the roomier side takes over.
+ * Nothing here depends on the lanelet direction, so a route-reversed path behaves the same.
+ */
+void selectAvoidanceSide(
+  ObjectData & object, const AvoidancePlanningData & data,
+  const std::shared_ptr<const PlannerData> & planner_data,
+  const std::shared_ptr<AvoidanceParameters> & parameters,
+  const std::optional<bool> & previous_on_right, const std::optional<bool> & locked_on_right)
+{
+  // getRoadShoulderDistance() also records overhang_lanelet / narrowest_place, so measure on copies.
+  auto if_on_right = object;  // ego passes on the left
+  auto if_on_left = object;   // ego passes on the right
+  if_on_right.to_road_shoulder_distance =
+    getRoadShoulderDistance(if_on_right, data, planner_data, true);
+  if_on_left.to_road_shoulder_distance =
+    getRoadShoulderDistance(if_on_left, data, planner_data, false);
+  const auto margin_if_right = getAvoidMargin(if_on_right, planner_data, parameters);
+  const auto margin_if_left = getAvoidMargin(if_on_left, planner_data, parameters);
+
+  const bool natural_on_right = isObjectOnRightOfPath(object);
+  const auto [on_right, reason] = chooseAvoidanceSide(
+    natural_on_right, previous_on_right, locked_on_right, margin_if_right, margin_if_left,
+    parameters->avoid_side_hysteresis_margin);
+
+  const auto & picked = on_right ? if_on_right : if_on_left;
+  object.is_on_right_for_avoidance = on_right;
+  object.to_road_shoulder_distance = picked.to_road_shoulder_distance;
+  object.overhang_lanelet = picked.overhang_lanelet;
+  object.narrowest_place = picked.narrowest_place;
+
+  RCLCPP_WARN_THROTTLE(
+    rclcpp::get_logger(logger_namespace), *avoid_debug_clock(), 500,
+    "[AVOID-SIDE] id=%s pass=%s (%s) natural=%s | pass_left: shoulder=%.2f margin=%s | "
+    "pass_right: shoulder=%.2f margin=%s",
+    autoware_utils::to_hex_string(object.object.object_id).substr(0, 8).c_str(),
+    on_right ? "left" : "right", reason, natural_on_right ? "left" : "right",
+    if_on_right.to_road_shoulder_distance,
+    margin_if_right ? std::to_string(margin_if_right.value()).substr(0, 5).c_str() : "none",
+    if_on_left.to_road_shoulder_distance,
+    margin_if_left ? std::to_string(margin_if_left.value()).substr(0, 5).c_str() : "none");
 }
 
 /**
@@ -1595,7 +1660,7 @@ void applyJointLateralFeasibility(
       // Only a genuine simultaneous squeeze needs joint handling: opposite sides of the TRUE
       // lane, with longitudinally-overlapping footprints (so a single ego shift value has to
       // satisfy both at the same path index).
-      if (o_i.is_on_right_of_true_lane == o_j.is_on_right_of_true_lane) continue;
+      if (o_i.is_on_right_for_avoidance == o_j.is_on_right_for_avoidance) continue;
       if (!longitudinal_overlap(o_i, o_j)) continue;
 
       // Real physical gap between the two obstacles' footprints -- independent of, and
@@ -2587,8 +2652,12 @@ void updateRoadShoulderDistance(
   data.right_bound = tmp_path.right_bound;
 
   for (auto & o : data.target_objects) {
-    o.to_road_shoulder_distance = filtering_utils::getRoadShoulderDistance(o, data, planner_data);
-    o.is_on_right_of_true_lane = filtering_utils::isObjectOnRightForAvoidance(o, data);
+    // The bounds are clipped by the stopped objects now: measure again. This cycle's side is the
+    // incumbent, and a side a running shift commits to is not switched.
+    const auto locked_on_right =
+      o.avoid_side_locked ? std::make_optional(o.is_on_right_for_avoidance) : std::nullopt;
+    filtering_utils::selectAvoidanceSide(
+      o, data, planner_data, parameters, o.is_on_right_for_avoidance, locked_on_right);
   }
 
   filtering_utils::applyJointLateralFeasibility(data.target_objects, planner_data, parameters);
@@ -2618,9 +2687,9 @@ bool isAvoidanceOpportunityRunningOut(
     return false;
   }
 
-  // avoid_margin here is getAvoidMargin()'s output (true-lane-relative), so pair it with
-  // object.is_on_right_of_true_lane rather than isOnRight(object) -- see data_structs.hpp.
-  const auto is_object_on_right = object.is_on_right_of_true_lane;
+  // avoid_margin here was measured toward the side ego passes on, so pair it with
+  // object.is_on_right_for_avoidance rather than isOnRight(object) -- see data_structs.hpp.
+  const auto is_object_on_right = object.is_on_right_for_avoidance;
   const auto desire_shift_length =
     helper->getShiftLength(object, is_object_on_right, avoid_margin.value());
   const auto required_distance = helper->getNominalPrepareDistance() +
@@ -2701,12 +2770,28 @@ void filterTargetObjects(
       planner_data->parameters.vehicle_info.wheel_base_m +
         planner_data->parameters.vehicle_info.front_overhang_m,
       planner_data->parameters.vehicle_info.rear_overhang_m);
-    o.to_road_shoulder_distance = filtering_utils::getRoadShoulderDistance(o, data, planner_data);
-    // Bias-independent side classification -- see is_on_right_of_true_lane doc comment in
-    // data_structs.hpp. Must be computed here (rather than reusing isOnRight(o)) so that every
-    // downstream consumer that combines this side with avoid_margin (itself true-lane-relative)
-    // stays in the same reference frame, even when data.reference_path is laterally biased.
-    o.is_on_right_of_true_lane = filtering_utils::isObjectOnRightForAvoidance(o, data);
+    // The side ego passes on, and the shoulder distance toward it -- see selectAvoidanceSide().
+    // Last cycle's side is kept unless the other is clearly roomier; once the executed shift at
+    // the object already goes that way the side is locked.
+    {
+      std::optional<bool> previous_on_right;
+      std::optional<bool> locked_on_right;
+      const auto prev_it =
+        data.previous_avoid_side.find(autoware_utils::to_hex_string(o.object.object_id));
+      if (prev_it != data.previous_avoid_side.end()) {
+        previous_on_right = prev_it->second;
+        // A positive shift at the object passes it on the left, i.e. treats it as on the right.
+        const double shift_at_object = helper->getShift(o.getPosition());
+        if (
+          std::abs(shift_at_object) > parameters->lateral_execution_threshold &&
+          (shift_at_object > 0.0) == prev_it->second) {
+          locked_on_right = prev_it->second;
+        }
+      }
+      o.avoid_side_locked = locked_on_right.has_value();
+      filtering_utils::selectAvoidanceSide(
+        o, data, planner_data, parameters, previous_on_right, locked_on_right);
+    }
 
     if (filtering_utils::isUnknownTypeObject(o)) {
       const auto avoid_margin = filtering_utils::getAvoidMargin(o, planner_data, parameters);

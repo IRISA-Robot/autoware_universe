@@ -1181,6 +1181,12 @@
                   "description": "Keep distance to drivable bound.",
                   "default": 0.3
                 },
+                "avoid_side_hysteresis_margin": {
+                  "type": "number",
+                  "description": "An object keeps the side it is passed on unless the other side offers this much more lateral slack, or the kept side becomes infeasible.",
+                  "default": 0.2,
+                  "minimum": 0.0
+                },
                 "max_right_shift_length": {
                   "type": "number",
                   "description": "Maximum shift length for right direction",
@@ -1209,6 +1215,7 @@
                 "th_small_shift_length",
                 "soft_drivable_bound_margin",
                 "hard_drivable_bound_margin",
+                "avoid_side_hysteresis_margin",
                 "max_deviation_from_lane",
                 "ratio_for_return_shift_approval"
               ],

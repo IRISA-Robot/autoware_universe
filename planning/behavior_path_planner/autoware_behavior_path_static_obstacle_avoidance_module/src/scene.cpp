@@ -407,6 +407,7 @@ void StaticObstacleAvoidanceModule::fillFundamentalData(
   }
 
   // filter only for the latest detected objects.
+  data.previous_avoid_side = avoid_side_memory_;
   fillAvoidanceTargetObjects(data, debug);
 
   auto current_target_objects_snapshot = data.target_objects;
@@ -427,6 +428,12 @@ void StaticObstacleAvoidanceModule::fillFundamentalData(
 
   utils::static_obstacle_avoidance::updateStoredObjects(
     stored_objects_, current_target_objects_snapshot, clock_->now(), parameters_);
+
+  avoid_side_memory_.clear();
+  for (const auto & o : data.target_objects) {
+    avoid_side_memory_[autoware_utils::to_hex_string(o.object.object_id)] =
+      o.is_on_right_for_avoidance;
+  }
 
   // sort object order by longitudinal distance
   std::sort(data.target_objects.begin(), data.target_objects.end(), [](auto a, auto b) {
@@ -1000,7 +1007,7 @@ void StaticObstacleAvoidanceModule::fillDebugData(
                                 object_parameter.lateral_soft_margin + 0.5 * vehicle_width;
 
   const auto avoidance_distance = helper_->getSharpAvoidanceDistance(helper_->getShiftLength(
-    o_front, utils::static_obstacle_avoidance::isOnRight(o_front), max_avoid_margin));
+    o_front, o_front.is_on_right_for_avoidance, max_avoid_margin));
   const auto prepare_distance = helper_->getNominalPrepareDistance();
   const auto total_avoid_distance = prepare_distance + avoidance_distance + constant_distance;
 
@@ -2132,7 +2139,7 @@ double StaticObstacleAvoidanceModule::calcDistanceToStopLine(const ObjectData & 
   const auto avoid_margin = lateral_hard_margin * object.distance_factor +
                             object_parameter.lateral_soft_margin + 0.5 * vehicle_width;
   const auto avoidance_distance = helper_->getMinAvoidanceDistance(helper_->getShiftLength(
-    object, utils::static_obstacle_avoidance::isOnRight(object), avoid_margin));
+    object, object.is_on_right_for_avoidance, avoid_margin));
   const auto constant_distance = helper_->getFrontConstantDistance(object);
   const auto prepare_distance = helper_->getNominalPrepareDistance(0.0);
 
@@ -2439,7 +2446,7 @@ void StaticObstacleAvoidanceModule::insertPrepareVelocity(ShiftedPath & shifted_
   const auto avoid_margin = lateral_hard_margin * object.value().distance_factor +
                             object_parameter.lateral_soft_margin + 0.5 * vehicle_width;
   const auto shift_length = helper_->getShiftLength(
-    object.value(), utils::static_obstacle_avoidance::isOnRight(object.value()), avoid_margin);
+    object.value(), object.value().is_on_right_for_avoidance, avoid_margin);
 
   // check slow down feasibility
   const auto min_avoid_distance = helper_->getMinAvoidanceDistance(shift_length);

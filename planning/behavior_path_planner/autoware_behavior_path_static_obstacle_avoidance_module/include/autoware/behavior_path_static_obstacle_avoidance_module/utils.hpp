@@ -66,7 +66,7 @@ double calcShiftLength(
  * object is treated as lying on the given side: the left-most edge (max lateral) for an object on
  * the right, the right-most edge (min lateral) for an object on the left.
  * @details object.overhang_points.front() is sorted by isOnRight(object) (path side). Whenever the
- * side used for the shift (is_on_right_of_true_lane) can differ from the path side, the edge MUST be
+ * side used for the shift (is_on_right_for_avoidance) can differ from the path side, the edge MUST be
  * taken from this function instead of front(), or calcShiftLength() pairs the "pass this object on
  * its right" formula with the object's LEFT edge and plans a shift straight through the object.
  * @param object data (overhang_points must be filled).

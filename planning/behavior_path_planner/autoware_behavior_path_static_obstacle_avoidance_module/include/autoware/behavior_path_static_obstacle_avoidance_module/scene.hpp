@@ -546,6 +546,11 @@ private:
   // TODO(Satoshi OTA) create detected object manager.
   ObjectDataArray stored_objects_;
 
+  // Side each target object was passed on last cycle, by uuid (AvoidancePlanningData::
+  // previous_avoid_side). Replaced every cycle with the current targets; deliberately not reset in
+  // initVariables(), which runs every cycle the module is idle.
+  std::unordered_map<std::string, bool> avoid_side_memory_;
+
   // TODO(Satoshi OTA) remove this variable.
   mutable ObjectDataArray ego_stopped_objects_;
 

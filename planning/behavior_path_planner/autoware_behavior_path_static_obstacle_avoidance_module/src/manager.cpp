@@ -174,6 +174,8 @@ void StaticObstacleAvoidanceModuleManager::updateModuleParams(
       parameters, ns + "soft_drivable_bound_margin", p->soft_drivable_bound_margin);
     update_param<double>(
       parameters, ns + "hard_drivable_bound_margin", p->hard_drivable_bound_margin);
+    update_param<double>(
+      parameters, ns + "avoid_side_hysteresis_margin", p->avoid_side_hysteresis_margin);
     // [PARAM-TUNABLE 2026-09-14] This one was declared in parameter_helper.hpp but never wired
     // up here, so `ros2 param set` on it reported success while AvoidanceParameters kept the
     // launch-time value -- a parameter that looks tunable and silently is not. It gates

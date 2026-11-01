@@ -289,6 +289,8 @@ AvoidanceParameters getParameter(rclcpp::Node * node)
       get_or_declare_parameter<double>(*node, ns + "soft_drivable_bound_margin");
     p.hard_drivable_bound_margin =
       get_or_declare_parameter<double>(*node, ns + "hard_drivable_bound_margin");
+    p.avoid_side_hysteresis_margin =
+      get_or_declare_parameter<double>(*node, ns + "avoid_side_hysteresis_margin");
     p.lateral_execution_threshold =
       get_or_declare_parameter<double>(*node, ns + "th_avoid_execution");
     p.lateral_small_shift_threshold =

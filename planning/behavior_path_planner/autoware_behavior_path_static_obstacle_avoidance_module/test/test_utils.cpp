@@ -737,9 +737,9 @@ TEST(TestUtils, isAvoidanceOpportunityRunningOut)
         .probability(1.0));
     object_data.direction = Direction::RIGHT;
     // Unbiased scenario: true-lane-relative side agrees with the path-relative `direction` above.
-    // isAvoidanceOpportunityRunningOut() now uses is_on_right_of_true_lane (see the
+    // isAvoidanceOpportunityRunningOut() now uses is_on_right_for_avoidance (see the
     // calcShiftLength frame-mismatch fix) instead of isOnRight(object)/direction.
-    object_data.is_on_right_of_true_lane = true;
+    object_data.is_on_right_for_avoidance = true;
     object_data.overhang_points.emplace_back(0.5, Point{});
     object_data.longitudinal = longitudinal;
     return object_data;
@@ -750,7 +750,7 @@ TEST(TestUtils, isAvoidanceOpportunityRunningOut)
   // determine the distance required to still attempt a shift with the above setup, so the test
   // doesn't hardcode brittle numbers derived from the jerk-based distance formula.
   const auto probe_object = make_unknown_object(0.0);
-  const auto is_object_on_right = probe_object.is_on_right_of_true_lane;
+  const auto is_object_on_right = probe_object.is_on_right_for_avoidance;
   const auto desire_shift_length =
     helper->getShiftLength(probe_object, is_object_on_right, avoid_margin.value());
   const auto required_distance = helper->getNominalPrepareDistance() +
@@ -1136,7 +1136,7 @@ TEST(TestUtils, isShiftNecessary)
 // Root cause: isSameDirectionShift(is_right, shift) is, by construction, the exact logical
 // complement of isShiftNecessary(is_right, shift) for every (is_right, shift) pair except the
 // single degenerate case shift == 0.0 with is_right == false (both are true there). This means
-// is_same_direction_shift can ONLY be true for an object whose (is_on_right_of_true_lane,
+// is_same_direction_shift can ONLY be true for an object whose (is_on_right_for_avoidance,
 // overhang_dist, avoid_margin) triple would ALSO fail isNoNeedAvoidanceBehavior()'s
 // ENOUGH_LATERAL_DISTANCE check -- using the exact same inputs. Every object reaching
 // generateAvoidOutline() already passed that exact check once in filterTargetObjects().
@@ -1158,7 +1158,7 @@ TEST(TestUtils, sameDirectionShiftFalsePositiveAfterMarginNarrowing)
 {
   ObjectData object;
   object.direction = Direction::LEFT;  // path-frame side, unused directly here
-  const bool is_on_right_of_true_lane = false;  // object is on the LEFT of the true lane
+  const bool is_on_right_for_avoidance = false;  // object is on the LEFT of the true lane
   const double overhang_dist = 0.30;            // fixed: object measured 0.30 m left of the path
 
   // Cycle N: object first accepted into target_objects with a generous avoid_margin (e.g. no
@@ -1166,9 +1166,9 @@ TEST(TestUtils, sameDirectionShiftFalsePositiveAfterMarginNarrowing)
   // -> necessary (shift toward the right, away from the left-side object), NOT same-direction.
   {
     const double avoid_margin_original = 0.50;
-    const double shift = calcShiftLength(is_on_right_of_true_lane, overhang_dist, avoid_margin_original);
-    EXPECT_TRUE(isShiftNecessary(is_on_right_of_true_lane, shift));
-    EXPECT_FALSE(isSameDirectionShift(is_on_right_of_true_lane, shift));
+    const double shift = calcShiftLength(is_on_right_for_avoidance, overhang_dist, avoid_margin_original);
+    EXPECT_TRUE(isShiftNecessary(is_on_right_for_avoidance, shift));
+    EXPECT_FALSE(isSameDirectionShift(is_on_right_for_avoidance, shift));
   }
 
   // Cycle N+1: updateRoadShoulderDistance() re-derives avoid_margin (e.g. a second object now
@@ -1178,22 +1178,22 @@ TEST(TestUtils, sameDirectionShiftFalsePositiveAfterMarginNarrowing)
   // (smaller) required margin: genuinely no longer necessary to shift for this object.
   {
     const double avoid_margin_narrowed = 0.20;
-    const double shift = calcShiftLength(is_on_right_of_true_lane, overhang_dist, avoid_margin_narrowed);
+    const double shift = calcShiftLength(is_on_right_for_avoidance, overhang_dist, avoid_margin_narrowed);
 
     // Old (buggy) classification: isSameDirectionShift() alone says "same direction" (bad) even
     // though the object is genuinely, comfortably clear.
-    EXPECT_TRUE(isSameDirectionShift(is_on_right_of_true_lane, shift))
+    EXPECT_TRUE(isSameDirectionShift(is_on_right_for_avoidance, shift))
       << "demonstrates the exact false-positive raw signal generateAvoidOutline() used to trust "
          "unconditionally";
 
     // isShiftNecessary() -- the same check isNoNeedAvoidanceBehavior() uses -- correctly says this
     // is the harmless ENOUGH_LATERAL_DISTANCE condition, not a genuine same-direction hazard.
-    EXPECT_FALSE(isShiftNecessary(is_on_right_of_true_lane, shift));
+    EXPECT_FALSE(isShiftNecessary(is_on_right_for_avoidance, shift));
 
     // The fix's guard: is_same_direction_shift is only trusted when the shift is still necessary.
-    const bool is_shift_still_necessary = isShiftNecessary(is_on_right_of_true_lane, shift);
+    const bool is_shift_still_necessary = isShiftNecessary(is_on_right_for_avoidance, shift);
     const bool is_same_direction_shift =
-      is_shift_still_necessary && isSameDirectionShift(is_on_right_of_true_lane, shift);
+      is_shift_still_necessary && isSameDirectionShift(is_on_right_for_avoidance, shift);
     EXPECT_FALSE(is_shift_still_necessary);
     EXPECT_FALSE(is_same_direction_shift)
       << "after the fix, a stale/narrowed margin must degrade to a harmless "
@@ -2086,9 +2086,11 @@ TEST(TestUtils, getRoadShoulderDistanceTrueLaneRelativeClassification)
     EXPECT_LE(object_y, 0.0);                    // true-lane-relative: RIGHT (getDistanceToCenterline <= 0)
     (void)path_relative_deviation;
 
-    const auto distance = filtering_utils::getRoadShoulderDistance(object_data, data, planner_data);
+    // The side is the caller's now (selectAvoidanceSide()); passing on the left measures to the
+    // LEFT bound, giving ample space.
+    const auto distance =
+      filtering_utils::getRoadShoulderDistance(object_data, data, planner_data, true);
 
-    // Correct behavior: far bound is the LEFT bound (true-lane-relative), giving ample space.
     EXPECT_NEAR(distance, half_width - object_y, 1e-2);
     EXPECT_GT(distance, 1.5);  // ample real clearance, not a false near-zero/insufficient verdict.
   }
@@ -2119,7 +2121,7 @@ TEST(TestUtils, getRoadShoulderDistanceTrueLaneRelativeClassification)
       object_data.overhang_points.emplace_back(0.0, object_pose.position);
 
       const auto distance =
-        filtering_utils::getRoadShoulderDistance(object_data, data, planner_data);
+        filtering_utils::getRoadShoulderDistance(object_data, data, planner_data, true);
       EXPECT_NEAR(distance, half_width - object_y, 1e-2);
     }
 
@@ -2134,9 +2136,79 @@ TEST(TestUtils, getRoadShoulderDistanceTrueLaneRelativeClassification)
       object_data.overhang_points.emplace_back(0.0, object_pose.position);
 
       const auto distance =
-        filtering_utils::getRoadShoulderDistance(object_data, data, planner_data);
+        filtering_utils::getRoadShoulderDistance(object_data, data, planner_data, false);
       EXPECT_NEAR(distance, half_width + object_y, 1e-2);
     }
+  }
+}
+
+// selectAvoidanceSide() on real geometry: an object straddling a biased path, with its centre on
+// the path's right (natural: pass left) but much less room on the left. Same shape as lanelet 256
+// on 2026-10-30, where the side came out as "pass right" for the shift and "pass left" for the
+// clamp, and the shift was zeroed.
+TEST(TestUtils, selectAvoidanceSideStraddlingBiasedPath)
+{
+  constexpr double half_width = 4.5;
+  constexpr double path_bias = 1.2;
+  const auto planner_data = get_planner_data();
+  const auto parameters = get_parameters();
+  parameters->avoid_side_hysteresis_margin = 0.2;
+
+  auto [route_handler, lanelet_obj] = make_straight_lane_route_handler(half_width);
+  planner_data->route_handler = route_handler;
+
+  AvoidancePlanningData data;
+  data.reference_path = make_straight_reference_path(path_bias);
+  data.current_lanelets = {lanelet_obj};
+  for (double x = 0.0; x <= 100.0 + 1e-6; x += 10.0) {
+    data.left_bound.push_back(create_point(x, half_width, 0.0));
+    data.right_bound.push_back(create_point(x, -half_width, 0.0));
+  }
+
+  // Edges at y = 0.5 and 1.5: 3.0 m to the left bound, 5.0 m to the right one; relative to the
+  // path at 1.2 that is -0.7 .. +0.3, centre on the path's right.
+  const auto make_object = [&]() {
+    ObjectData o;
+    o.object.kinematics.initial_pose_with_covariance.pose =
+      autoware::test_utils::createPose(10.0, 1.0, 0.0, 0.0, 0.0, 0.0);
+    o.object.classification.emplace_back(
+      autoware_perception_msgs::build<ObjectClassification>()
+        .label(ObjectClassification::TRUCK)
+        .probability(1.0));
+    o.distance_factor = 1.0;
+    o.overhang_points.emplace_back(0.3, create_point(10.0, 1.5, 0.0));
+    o.overhang_points.emplace_back(-0.7, create_point(10.0, 0.5, 0.0));
+    return o;
+  };
+  ASSERT_TRUE(filtering_utils::isObjectOnRightOfPath(make_object()));
+
+  // New object: the left gives a margin clamped by the bound (1.5), the right the full one (1.9).
+  {
+    auto o = make_object();
+    filtering_utils::selectAvoidanceSide(o, data, planner_data, parameters, std::nullopt, std::nullopt);
+    EXPECT_FALSE(o.is_on_right_for_avoidance);  // ego passes on the right
+    EXPECT_NEAR(o.to_road_shoulder_distance, 5.0, 1e-2);
+    const auto margin = filtering_utils::getAvoidMargin(o, planner_data, parameters);
+    ASSERT_TRUE(margin.has_value());
+    // and the shift that follows goes right, clear of the object's right edge.
+    EXPECT_LT(calcShiftLength(false, getOverhangDistance(o, false), margin.value()), -0.7);
+  }
+
+  // A 0.4 m margin difference is inside a 0.5 m hysteresis: last cycle's "pass left" holds.
+  {
+    parameters->avoid_side_hysteresis_margin = 0.5;
+    auto o = make_object();
+    filtering_utils::selectAvoidanceSide(o, data, planner_data, parameters, true, std::nullopt);
+    EXPECT_TRUE(o.is_on_right_for_avoidance);
+    EXPECT_NEAR(o.to_road_shoulder_distance, 3.0, 1e-2);
+    parameters->avoid_side_hysteresis_margin = 0.2;
+  }
+
+  // Locked by a running shift to the left: held even though the right is roomier.
+  {
+    auto o = make_object();
+    filtering_utils::selectAvoidanceSide(o, data, planner_data, parameters, true, true);
+    EXPECT_TRUE(o.is_on_right_for_avoidance);
   }
 }
 
@@ -2656,9 +2728,9 @@ TEST(TestUtils, AlwaysAvoidFlagBypassesWaitAndSeeGate)
       .probability(1.0));
   object_data.direction = Direction::RIGHT;
   // Unbiased scenario: true-lane-relative side agrees with the path-relative one above. isReady()
-  // now uses is_on_right_of_true_lane (see the calcShiftLength frame-mismatch fix) instead of
+  // now uses is_on_right_for_avoidance (see the calcShiftLength frame-mismatch fix) instead of
   // isOnRight(object)/direction, so it must be set explicitly here to match.
-  object_data.is_on_right_of_true_lane = true;
+  object_data.is_on_right_for_avoidance = true;
   object_data.overhang_points.emplace_back(0.0, Point{});
   object_data.is_ambiguous = true;
   object_data.behavior = ObjectData::Behavior::MERGING;
@@ -2691,7 +2763,7 @@ TEST(TestUtils, AlwaysAvoidFlagBypassesWaitAndSeeGate)
 // avoid_margin with the path-relative side to decide whether to add or subtract the margin; when
 // the path bias makes the path-relative side disagree with the true-lane side, this produces a
 // wrong-signed (here: numerically-cancelled, near-zero) shift_length even for an object genuinely
-// blocking the TRUE driving line. Fixed by introducing object.is_on_right_of_true_lane (populated
+// blocking the TRUE driving line. Fixed by introducing object.is_on_right_for_avoidance (populated
 // once, bias-independent, alongside to_road_shoulder_distance/avoid_margin) and using it instead
 // of isOnRight(object)/direction wherever it is combined with avoid_margin.
 TEST(TestUtils, isNoNeedAvoidanceBehaviorTrueLaneRelativeShiftLength)
@@ -2714,7 +2786,7 @@ TEST(TestUtils, isNoNeedAvoidanceBehaviorTrueLaneRelativeShiftLength)
     // True-lane-relative: the object is actually on the RIGHT of the true lane centerline --
     // this is what getAvoidMargin() assumed when picking the road bound to measure margin
     // against, and disagrees with the path-relative classification above.
-    object_data.is_on_right_of_true_lane = true;
+    object_data.is_on_right_for_avoidance = true;
     // Path-relative near-edge overhang distance: numerically equal to avoid_margin, which is
     // exactly what causes the old (buggy) subtract-branch math to cancel to ~0.
     object_data.overhang_points.emplace_back(1.81, Point{});
@@ -2735,7 +2807,7 @@ TEST(TestUtils, isNoNeedAvoidanceBehaviorTrueLaneRelativeShiftLength)
     ObjectData object_data;
     object_data.avoid_margin = 1.81;
     object_data.direction = Direction::RIGHT;
-    object_data.is_on_right_of_true_lane = true;
+    object_data.is_on_right_for_avoidance = true;
     object_data.overhang_points.emplace_back(0.0, Point{});
 
     EXPECT_FALSE(filtering_utils::isNoNeedAvoidanceBehavior(object_data, parameters));
@@ -2748,7 +2820,7 @@ TEST(TestUtils, isNoNeedAvoidanceBehaviorTrueLaneRelativeShiftLength)
     ObjectData object_data;
     object_data.avoid_margin = 1.81;
     object_data.direction = Direction::RIGHT;
-    object_data.is_on_right_of_true_lane = true;
+    object_data.is_on_right_for_avoidance = true;
     object_data.overhang_points.emplace_back(-3.0, Point{});
 
     EXPECT_TRUE(filtering_utils::isNoNeedAvoidanceBehavior(object_data, parameters));
@@ -2779,7 +2851,7 @@ ObjectData make_joint_feasibility_object(
       .probability(1.0));
   object_data.is_parked = false;
   object_data.distance_factor = 1.0;
-  object_data.is_on_right_of_true_lane = is_on_right;
+  object_data.is_on_right_for_avoidance = is_on_right;
   object_data.longitudinal = longitudinal;
   object_data.length = length;
   object_data.to_road_shoulder_distance = original_to_road_shoulder_distance;
@@ -2876,7 +2948,7 @@ TEST(TestUtils, applyJointLateralFeasibilityNoOpForSameSideObjects)
   const auto planner_data = get_planner_data();
 
   constexpr double original_distance = 10.0;
-  // Same side (both is_on_right_of_true_lane == true), even though longitudinally overlapping and
+  // Same side (both is_on_right_for_avoidance == true), even though longitudinally overlapping and
   // laterally close -- must be left untouched, since a same-side pair isn't a simultaneous
   // opposite-side squeeze.
   ObjectDataArray objects{
@@ -3895,27 +3967,73 @@ TEST(TestUtils, getOverhangDistance)
   EXPECT_DOUBLE_EQ(getOverhangDistance(ObjectData{}, true), 0.0);
 }
 
-TEST(TestUtils, isObjectOnRightForAvoidance)
+TEST(TestUtils, isObjectOnRightOfPath)
 {
-  using filtering_utils::isObjectOnRightForAvoidance;
-  const AvoidancePlanningData data{};  // centerline tie-break is not reached in these cases
+  using filtering_utils::isObjectOnRightOfPath;
 
   // log_belok.log 883.9 s: envelope entirely 0.29 m+ right of the path -> must stay RIGHT
-  EXPECT_TRUE(isObjectOnRightForAvoidance(
-    objectWithOverhangs({-0.29, -0.6, -0.9}, Direction::RIGHT), data));
+  EXPECT_TRUE(isObjectOnRightOfPath(objectWithOverhangs({-0.29, -0.6, -0.9}, Direction::RIGHT)));
   // belog_lagi.log 492.3 s: envelope entirely 0.077 m+ right of the path -> RIGHT
-  EXPECT_TRUE(isObjectOnRightForAvoidance(
-    objectWithOverhangs({-0.077, -0.4, -0.7}, Direction::RIGHT), data));
+  EXPECT_TRUE(isObjectOnRightOfPath(objectWithOverhangs({-0.077, -0.4, -0.7}, Direction::RIGHT)));
   // log_belok.log 887.7 s: 2.55 m right of the path -> RIGHT
-  EXPECT_TRUE(isObjectOnRightForAvoidance(
-    objectWithOverhangs({-2.553, -3.0, -3.4}, Direction::RIGHT), data));
+  EXPECT_TRUE(isObjectOnRightOfPath(objectWithOverhangs({-2.553, -3.0, -3.4}, Direction::RIGHT)));
   // entirely left of the path -> LEFT
-  EXPECT_FALSE(isObjectOnRightForAvoidance(
-    objectWithOverhangs({0.3, 0.7, 1.1}, Direction::LEFT), data));
+  EXPECT_FALSE(isObjectOnRightOfPath(objectWithOverhangs({0.3, 0.7, 1.1}, Direction::LEFT)));
+  // straddling: by the midpoint of its edges. lanelet 256 pedestrian, edges -0.971 / +0.413
+  EXPECT_TRUE(isObjectOnRightOfPath(objectWithOverhangs({-0.971, 0.0, 0.413}, Direction::RIGHT)));
+  EXPECT_FALSE(isObjectOnRightOfPath(objectWithOverhangs({-0.3, 0.0, 0.9}, Direction::RIGHT)));
 
-  // shift for the 883.9 s object now points away from it (left, positive)
+  // shift for the 883.9 s object points away from it (left, positive)
   const auto o = objectWithOverhangs({-0.29, -0.6, -0.9}, Direction::RIGHT);
-  const bool right = isObjectOnRightForAvoidance(o, data);
+  const bool right = isObjectOnRightOfPath(o);
   EXPECT_GT(calcShiftLength(right, getOverhangDistance(o, right), 0.828), 0.0);
+}
+
+TEST(TestUtils, chooseAvoidanceSide)
+{
+  using filtering_utils::chooseAvoidanceSide;
+  constexpr double hysteresis = 0.2;
+  const std::optional<bool> none;
+
+  // Room on both sides, both give the nominal margin: the natural (smaller) shift stays.
+  EXPECT_TRUE(chooseAvoidanceSide(true, none, none, 0.85, 0.85, hysteresis).first);
+  EXPECT_FALSE(chooseAvoidanceSide(false, none, none, 0.85, 0.85, hysteresis).first);
+
+  // lanelet 256, 2026-10-30: the path is biased 0.5 m left of the centre, the pedestrian's centre
+  // is right of the path (natural: pass left) but the left side is cramped to a clamped margin.
+  // The right side gives the full margin, so ego passes on the right.
+  {
+    const auto [on_right, reason] = chooseAvoidanceSide(true, none, none, 0.59, 0.85, hysteresis);
+    EXPECT_FALSE(on_right);
+    EXPECT_STREQ(reason, "roomier");
+  }
+
+  // A difference inside the hysteresis does not move a new object off its natural side ...
+  EXPECT_TRUE(chooseAvoidanceSide(true, none, none, 0.70, 0.85, hysteresis).first);
+  // ... nor an object off last cycle's side, either way.
+  EXPECT_FALSE(chooseAvoidanceSide(true, false, none, 0.85, 0.70, hysteresis).first);
+  EXPECT_TRUE(chooseAvoidanceSide(false, true, none, 0.70, 0.85, hysteresis).first);
+  // Beyond it, last cycle's side gives way.
+  EXPECT_FALSE(chooseAvoidanceSide(true, true, none, 0.50, 0.85, hysteresis).first);
+
+  // A side ego does not fit on loses to one it does, whatever the history.
+  {
+    const auto [on_right, reason] = chooseAvoidanceSide(true, true, none, std::nullopt, 0.40, hysteresis);
+    EXPECT_FALSE(on_right);
+    EXPECT_STREQ(reason, "only_side_that_fits");
+  }
+  // Neither fits: keep the incumbent (the object is reported as having no room).
+  EXPECT_TRUE(chooseAvoidanceSide(true, none, none, std::nullopt, std::nullopt, hysteresis).first);
+
+  // A shift already executing for the object holds its side, even against a roomier other side.
+  {
+    const auto [on_right, reason] = chooseAvoidanceSide(true, true, true, 0.30, 0.85, hysteresis);
+    EXPECT_TRUE(on_right);
+    EXPECT_STREQ(reason, "locked");
+  }
+
+  // Route-reversed driving: the rule only sees path-frame sides and margins, so the mirrored
+  // lanelet 256 case gives the mirrored answer.
+  EXPECT_TRUE(chooseAvoidanceSide(false, none, none, 0.85, 0.59, hysteresis).first);
 }
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance

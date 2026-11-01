@@ -166,7 +166,8 @@ std::optional<std::pair<double, double>> ShiftLineGenerator::computeFeasibleShif
   // reinstatement of the original gate wants them back.
   const auto object_type = utils::getHighestProbLabel(object.object.classification);
   [[maybe_unused]] const auto object_parameter = parameters_->object_parameters.at(object_type);
-  const auto is_object_on_right = utils::static_obstacle_avoidance::isOnRight(object);
+  // The side the shift is built for -- not isOnRight(), see ObjectData::is_on_right_for_avoidance.
+  const auto is_object_on_right = object.is_on_right_for_avoidance;
 
   // use absolute dist for return-to-center, relative dist from current for avoiding.
   const auto avoiding_shift = desire_shift_length - current_ego_shift;
@@ -376,8 +377,8 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
   };
 
   const auto is_approved = [this](const auto & object) {
-    return (helper_->getShift(object.getPosition()) > 0.0 && isOnRight(object)) ||
-           (helper_->getShift(object.getPosition()) < 0.0 && !isOnRight(object));
+    return (helper_->getShift(object.getPosition()) > 0.0 && object.is_on_right_for_avoidance) ||
+           (helper_->getShift(object.getPosition()) < 0.0 && !object.is_on_right_for_avoidance);
   };
 
   ObjectDataArray unavoidable_objects;
@@ -401,20 +402,19 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
       }
     }
 
-    // Use the true-lane-relative side (o.is_on_right_of_true_lane) rather than isOnRight(o) here:
-    // o.avoid_margin is computed in the true-lane frame (getAvoidMargin()/
-    // getRoadShoulderDistance()), so the add-vs-subtract / same-direction sanity check must use
-    // the same frame to keep the resulting shift_length sign correct even when data.reference_path
-    // is laterally biased (e.g. prefer_lateral_ratio). See data_structs.hpp for details.
+    // Use the side ego passes on (o.is_on_right_for_avoidance) rather than isOnRight(o) here:
+    // o.avoid_margin was measured toward that side's bound by selectAvoidanceSide(), so the
+    // add-vs-subtract / same-direction sanity check must use the same side to keep the
+    // shift_length sign right. See data_structs.hpp for details.
     const auto desire_shift_length =
-      helper_->getShiftLength(o, o.is_on_right_of_true_lane, o.avoid_margin.value());
+      helper_->getShiftLength(o, o.is_on_right_for_avoidance, o.avoid_margin.value());
     // ROOT CAUSE (confirmed): isSameDirectionShift(is_right, shift) is, by construction, the exact
     // logical complement of isShiftNecessary(is_right, shift) -- i.e. is_same_direction_shift==true
-    // can ONLY happen for an object whose (is_on_right_of_true_lane, overhang_dist, avoid_margin)
+    // can ONLY happen for an object whose (is_on_right_for_avoidance, overhang_dist, avoid_margin)
     // triple would ALSO fail isNoNeedAvoidanceBehavior()'s ENOUGH_LATERAL_DISTANCE check, using the
     // SAME inputs. Every object here already passed that exact gate once in filterTargetObjects().
     // The only way to reach this point with is_same_direction_shift==true is for avoid_margin /
-    // is_on_right_of_true_lane to have been RE-DERIVED afterward against a STALE overhang_dist:
+    // is_on_right_for_avoidance to have been RE-DERIVED afterward against a STALE overhang_dist:
     //  - updateRoadShoulderDistance() (utils.cpp) re-derives both fields for every object already
     //    in data.target_objects, every cycle, without re-running isNoNeedAvoidanceBehavior() -- if
     //    avoid_margin narrows (e.g. another object now clips the drivable road-shoulder), the
@@ -429,27 +429,27 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
     // isShiftNecessary (the same check isNoNeedAvoidanceBehavior uses) right before trusting the
     // sign, so a stale/narrowed margin degrades to a harmless skip instead of a false "unavoidable".
     const auto is_shift_still_necessary = utils::static_obstacle_avoidance::isShiftNecessary(
-      o.is_on_right_of_true_lane, desire_shift_length);
+      o.is_on_right_for_avoidance, desire_shift_length);
     const auto is_same_direction_shift =
       is_shift_still_necessary && utils::static_obstacle_avoidance::isSameDirectionShift(
-                                     o.is_on_right_of_true_lane, desire_shift_length);
+                                     o.is_on_right_for_avoidance, desire_shift_length);
     {
       static auto logger = rclcpp::get_logger("static_obstacle_avoidance_shift_line_generator");
       static rclcpp::Clock steady_clock{RCL_ROS_TIME};
       RCLCPP_WARN_THROTTLE(
         logger, steady_clock, 500,
-        "[AVOID-DEBUG] generateAvoidOutline id=%s longitudinal=%.2f is_on_right_of_true_lane=%s "
+        "[AVOID-DEBUG] generateAvoidOutline id=%s longitudinal=%.2f is_on_right_for_avoidance=%s "
         "avoid_margin=%.3f desire_shift_length=%.3f is_shift_still_necessary=%s "
         "is_same_direction_shift=%s current_ego_shift=%.3f",
         autoware_utils::to_hex_string(o.object.object_id).c_str(), o.longitudinal,
-        (o.is_on_right_of_true_lane ? "true" : "false"), o.avoid_margin.value(),
+        (o.is_on_right_for_avoidance ? "true" : "false"), o.avoid_margin.value(),
         desire_shift_length, (is_shift_still_necessary ? "true" : "false"),
         (is_same_direction_shift ? "true" : "false"), current_ego_shift);
     }
     if (!is_shift_still_necessary) {
       // See the ROOT CAUSE comment above `is_shift_still_necessary`: reaching here with a
       // shift that is no longer necessary (per the SAME check isNoNeedAvoidanceBehavior uses)
-      // means avoid_margin/is_on_right_of_true_lane were re-derived (e.g. by
+      // means avoid_margin/is_on_right_for_avoidance were re-derived (e.g. by
       // updateRoadShoulderDistance()) against a stale overhang_dist after this object already
       // passed the filter once. Treat it exactly like isNoNeedAvoidanceBehavior would: harmless,
       // not "unavoidable" -- do not mark SAME_DIRECTION_SHIFT and do not break/limit downstream
@@ -500,10 +500,8 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
     // If there is an object that cannot be avoided, this module only avoids object on the same side
     // as unavoidable object.
     if (!unavoidable_objects.empty()) {
-      if (isOnRight(unavoidable_objects.front()) && !isOnRight(o)) {
-        break;
-      }
-      if (!isOnRight(unavoidable_objects.front()) && isOnRight(o)) {
+      const bool unavoidable_on_right = unavoidable_objects.front().is_on_right_for_avoidance;
+      if (unavoidable_on_right != o.is_on_right_for_avoidance) {
         break;
       }
     }
@@ -543,7 +541,11 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
       const auto end_idx = utils::static_obstacle_avoidance::findPathIndexFromArclength(
         data.arclength_from_ego, to_shift_end);
       const auto end = data.reference_path.points.at(end_idx).point.pose;
-      if (utils::static_obstacle_avoidance::isOnRight(o)) {
+      // Never less shift than ego already has at the end, in the direction of THIS shift. Taken
+      // from the shift's own sign: on 2026-10-30 (lanelet 256) the clamp went by the object's
+      // path side while the shift went the other way, max(-1.82, 0) zeroed it, and ego waited
+      // in front of the object for good.
+      if (feasible_shift_profile.value().first > 0.0) {
         al_avoid.end_shift_length =
           std::max(feasible_shift_profile.value().first, helper_->getLinearShift(end.position));
       } else {
@@ -651,7 +653,7 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
       // misc
       al_avoid.id = generate_uuid();
       al_avoid.object = o;
-      al_avoid.object_on_right = utils::static_obstacle_avoidance::isOnRight(o);
+      al_avoid.object_on_right = o.is_on_right_for_avoidance;
     }
 
     AvoidLine al_return;
@@ -677,7 +679,7 @@ AvoidOutlines ShiftLineGenerator::generateAvoidOutline(
       // misc
       al_return.id = generate_uuid();
       al_return.object = o;
-      al_return.object_on_right = utils::static_obstacle_avoidance::isOnRight(o);
+      al_return.object_on_right = o.is_on_right_for_avoidance;
     }
 
     // [TAG-ZONE 2026-10-15] No shift may run into a disable_static_avoidance lanelet.  Before
@@ -1657,14 +1659,14 @@ AvoidLineArray ShiftLineGenerator::addReturnShiftLine(
     if (nearest == nullptr || std::abs(held_shift) < RETURN_SHIFT_THRESHOLD) {
       return false;
     }
-    const bool towards_object = held_shift > 0.0 ? !nearest->is_on_right_of_true_lane
-                                                 : nearest->is_on_right_of_true_lane;
+    const bool towards_object = held_shift > 0.0 ? !nearest->is_on_right_for_avoidance
+                                                 : nearest->is_on_right_for_avoidance;
     if (towards_object) {
       RCLCPP_WARN_THROTTLE(
         generatorLogger(), generatorClock(), 2000,
         "[SAME-SIDE-HOLD] not holding the %.2f m shift: the nearest object ahead (%.2f m) is on "
         "the %s, the side ego is shifted towards -- returning to centreline instead.",
-        held_shift, nearest->longitudinal, nearest->is_on_right_of_true_lane ? "right" : "left");
+        held_shift, nearest->longitudinal, nearest->is_on_right_for_avoidance ? "right" : "left");
     }
     return towards_object;
   };

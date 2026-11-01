@@ -485,11 +485,10 @@ public:
       return std::make_pair(true, false);
     }
 
-    // Use the true-lane-relative side here (not isOnRight(object)/object.direction, which is
-    // relative to the possibly-biased current reference path) since it is combined with
-    // object.avoid_margin -- itself computed in the true-lane frame by getAvoidMargin() /
-    // getRoadShoulderDistance(). See is_on_right_of_true_lane doc comment in data_structs.hpp.
-    const auto is_object_on_right = object.is_on_right_of_true_lane;
+    // Use the side ego passes on (not isOnRight(object)/object.direction, which is only where the
+    // object's centre is) since it is combined with object.avoid_margin, measured toward that
+    // side's bound. See is_on_right_for_avoidance doc comment in data_structs.hpp.
+    const auto is_object_on_right = object.is_on_right_for_avoidance;
     const auto desire_shift_length =
       getShiftLength(object, is_object_on_right, object.avoid_margin.value());
 

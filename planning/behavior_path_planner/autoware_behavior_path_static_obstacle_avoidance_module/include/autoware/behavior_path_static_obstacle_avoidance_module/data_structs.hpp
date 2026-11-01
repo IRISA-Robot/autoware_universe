@@ -308,6 +308,11 @@ struct AvoidanceParameters
   // road shoulder.
   double hard_drivable_bound_margin{1.0};
 
+  // An object keeps the side it is passed on unless the other side offers this much more lateral
+  // slack (or the kept side stops being feasible), so an object near the middle of the free space
+  // does not flip sides every cycle on tracking noise. See selectAvoidanceSide() in utils.cpp.
+  double avoid_side_hysteresis_margin{0.2};
+
   // Even if the obstacle is very large, it will not avoid more than this length for right direction
   double max_right_shift_length{0.0};
 
@@ -601,18 +606,17 @@ struct ObjectData  // avoidance target
   // object direction.
   Direction direction{Direction::NONE};
 
-  // Whether the object sits on the right side of the TRUE lane centerline, i.e. bias-independent
-  // -- computed via filtering_utils::getDistanceToCenterline() (arc-coordinate distance against
-  // object.overhang_lanelet), NOT relative to the possibly prefer_lateral_ratio-biased
-  // data.reference_path the way `direction`/isOnRight() above are. avoid_margin (see below) is
-  // derived from getAvoidMargin()/getRoadShoulderDistance(), which are themselves computed in
-  // this same true-lane-relative frame (fixed in the getRoadShoulderDistance frame-mismatch
-  // patch). Combining avoid_margin with the path-relative `direction`/isOnRight() in the same
-  // shift_length arithmetic mixes two different reference frames and produces a wrong-signed
-  // shift_length whenever the reference path is laterally biased -- so anywhere avoid_margin is
-  // combined with a left/right decision, use this field instead of isOnRight(*this). Populated
-  // alongside to_road_shoulder_distance in identifyTargetObjects()/updateRoadShoulderDistance().
-  bool is_on_right_of_true_lane{false};
+  // Whether ego treats the object as lying on the right, i.e. passes it on the LEFT. This is THE
+  // side for every left/right decision that is combined with a shift length or avoid_margin
+  // (shift sign, clamps, same-direction checks, dead lines); `direction`/isOnRight() above is only
+  // where the object's centre is relative to the path. Chosen by selectAvoidanceSide() (utils.cpp)
+  // from the room each side actually offers, in the frame of the path the shift is applied to, so
+  // it does not depend on the lane centreline or on the lanelet direction (route-reversed paths).
+  bool is_on_right_for_avoidance{false};
+
+  // The side above is held by a shift that is already being executed for this object, and must
+  // not be switched.
+  bool avoid_side_locked{false};
 
   // overhang points (sort by distance)
   std::vector<std::pair<double, Point>> overhang_points{};
@@ -726,6 +730,10 @@ struct AvoidancePlanningData
 
   // current driving lanelet
   lanelet::ConstLanelets current_lanelets;
+
+  // Side each target object (by uuid) was passed on last cycle -- is_on_right_for_avoidance -- so
+  // selectAvoidanceSide() can hold it. Filled by the module before the objects are filtered.
+  std::unordered_map<std::string, bool> previous_avoid_side;
   lanelet::ConstLanelets extend_lanelets;
 
   // output path
