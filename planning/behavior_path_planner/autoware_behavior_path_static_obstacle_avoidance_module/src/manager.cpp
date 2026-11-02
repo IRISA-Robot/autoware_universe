@@ -111,6 +111,12 @@ void StaticObstacleAvoidanceModuleManager::updateModuleParams(
   }
 
   {
+    const std::string ns = "avoidance.target_filtering.obstacle_clustering.";
+    update_param<bool>(
+      parameters, ns + "enable_dynamic_object_clustering", p->enable_dynamic_object_clustering);
+  }
+
+  {
     const std::string ns = "avoidance.target_filtering.parked_vehicle.";
     update_param<double>(
       parameters, ns + "th_offset_from_centerline", p->threshold_distance_object_is_on_center);

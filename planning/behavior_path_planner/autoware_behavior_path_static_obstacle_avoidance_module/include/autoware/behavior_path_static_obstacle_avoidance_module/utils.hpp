@@ -708,6 +708,23 @@ std::vector<PredictedObject> clusterNearbyObjects(
   const Point & ego_position, const std::shared_ptr<AvoidanceParameters> & parameters,
   ObjectClusterEdgeStateMap & edge_states);
 
+/**
+ * @brief split objects into the ones that may be clustered and the moving ones, judged per object
+ * with its own uuid and type exactly like the per-object moving filter (th_moving_speed held for
+ * longer than th_moving_time, see fillObjectMovingTime()/isMovingObject()).
+ * @details A merged cluster is always static, so a moving object clustered with a static one would
+ * be avoided as if it stood still -- a pedestrian walking past an unknown object at the road edge
+ * had the robot's shift chase it. Moving objects are kept out of the clustering and go through the
+ * per-object filters on their own.
+ * @param objects candidates for clustering.
+ * @param stopped_objects per-uuid stopped/moving history (the module's stopped_objects_), updated.
+ * @param parameters per-type moving thresholds.
+ * @return {objects to cluster, moving objects}, each in input order.
+ */
+std::pair<std::vector<PredictedObject>, std::vector<PredictedObject>> separateMovingObjects(
+  const std::vector<PredictedObject> & objects, ObjectDataArray & stopped_objects,
+  const std::shared_ptr<AvoidanceParameters> & parameters);
+
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
 
 #endif  // AUTOWARE__BEHAVIOR_PATH_STATIC_OBSTACLE_AVOIDANCE_MODULE__UTILS_HPP_

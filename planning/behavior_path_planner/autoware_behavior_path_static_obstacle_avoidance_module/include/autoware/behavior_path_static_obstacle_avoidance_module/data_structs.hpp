@@ -363,6 +363,13 @@ struct AvoidanceParameters
   int obstacle_cluster_merge_in_cycles{1};
   int obstacle_cluster_split_out_cycles{5};
 
+  // [CLUSTER-MOVING 2026-11-02] Whether moving objects may be merged into a cluster. false: an
+  // object judged moving by its own type's th_moving_speed/th_moving_time is kept out of the
+  // clustering and filtered on its own (MOVING_OBJECT), so a pedestrian walking past an object at
+  // the road edge is not avoided as if it stood still. true: the original behaviour above, where a
+  // moving object clustered with a static one is treated as static.
+  bool enable_dynamic_object_clustering{false};
+
   // The avoidance path generation is performed when the shift distance of the
   // avoidance points is greater than this threshold.
   // In multiple targets case: if there are multiple vehicles in a row to be avoided, no new

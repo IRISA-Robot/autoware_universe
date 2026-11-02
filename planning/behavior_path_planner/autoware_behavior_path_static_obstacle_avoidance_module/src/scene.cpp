@@ -35,6 +35,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -486,9 +487,19 @@ void StaticObstacleAvoidanceModule::fillAvoidanceTargetObjects(
   // now treated as static/avoidable" safety-relevant behavior change). Objects with no close
   // neighbor pass through completely unchanged, so this is a strict no-op when
   // enable_obstacle_clustering is false or nothing is close enough to merge.
-  const auto clustered_objects = utils::static_obstacle_avoidance::clusterNearbyObjects(
-    object_within_target_lane.objects, data.reference_path, getEgoPosition(), parameters_,
+  // [CLUSTER-MOVING 2026-11-02] Unless enable_dynamic_object_clustering, an object that is moving
+  // by its own type's filter is kept out of the clustering and handled on its own below.
+  auto clustered_objects = object_within_target_lane.objects;
+  std::vector<PredictedObject> moving_objects;
+  if (parameters_->enable_obstacle_clustering && !parameters_->enable_dynamic_object_clustering) {
+    std::tie(clustered_objects, moving_objects) =
+      utils::static_obstacle_avoidance::separateMovingObjects(
+        object_within_target_lane.objects, stopped_objects_, parameters_);
+  }
+  clustered_objects = utils::static_obstacle_avoidance::clusterNearbyObjects(
+    clustered_objects, data.reference_path, getEgoPosition(), parameters_,
     object_cluster_edge_states_);
+  clustered_objects.insert(clustered_objects.end(), moving_objects.begin(), moving_objects.end());
 
   ObjectDataArray objects;
   for (const auto & object : clustered_objects) {

@@ -160,6 +160,7 @@
           max_neighbor_distance: 2.0                      # [m] path-frame distance threshold to merge two objects
           merge_in_cycles: 1                              # [-] consecutive cycles required before merging (fast merge)
           split_out_cycles: 5                             # [-] consecutive cycles required before splitting back apart (slow split)
+          enable_dynamic_object_clustering: false         # [-] true: moving objects are clustered too (and so treated as static)
 
         # params for avoidance of vehicle type objects that are ambiguous as to whether they are parked.
         avoidance_for_ambiguous_vehicle:

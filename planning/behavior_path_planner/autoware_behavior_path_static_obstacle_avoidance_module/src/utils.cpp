@@ -4032,4 +4032,25 @@ std::vector<PredictedObject> clusterNearbyObjects(
 
   return result;
 }
+
+std::pair<std::vector<PredictedObject>, std::vector<PredictedObject>> separateMovingObjects(
+  const std::vector<PredictedObject> & objects, ObjectDataArray & stopped_objects,
+  const std::shared_ptr<AvoidanceParameters> & parameters)
+{
+  std::vector<PredictedObject> to_cluster;
+  std::vector<PredictedObject> moving;
+  for (const auto & object : objects) {
+    // Same state createObjectData() fills for this object later in the cycle; running it twice in
+    // a cycle gives the same verdict (fillObjectMovingTime() only keys on uuid and time).
+    ObjectData object_data{};
+    object_data.object = object;
+    fillObjectMovingTime(object_data, stopped_objects, parameters);
+    if (filtering_utils::isMovingObject(object_data, parameters)) {
+      moving.push_back(object);
+    } else {
+      to_cluster.push_back(object);
+    }
+  }
+  return {to_cluster, moving};
+}
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance

@@ -4036,4 +4036,47 @@ TEST(TestUtils, chooseAvoidanceSide)
   // lanelet 256 case gives the mirrored answer.
   EXPECT_TRUE(chooseAvoidanceSide(false, none, none, 0.85, 0.59, hysteresis).first);
 }
+
+// [CLUSTER-MOVING 2026-11-02] A moving object stays out of the clustering, judged per object by its
+// own type's filter: faster than th_moving_speed (1.0 here) for longer than th_moving_time (0.5).
+TEST(TestUtils, separateMovingObjectsKeepsMovingObjectsOutOfClusters)
+{
+  const auto parameters = make_cluster_test_parameters(/*max_neighbor_distance=*/2.0);
+  const auto with_speed = [](PredictedObject o, const double v) {
+    o.kinematics.initial_twist_with_covariance.twist.linear.x = v;
+    return o;
+  };
+  const auto label = ObjectClassification::TRUCK;
+  ObjectDataArray stopped_objects;
+
+  // An object first seen already moving is moving at once; a standing one may be clustered.
+  {
+    const std::vector<PredictedObject> objects{
+      with_speed(make_cluster_test_object(5.0, 0.0, 1, label), 0.0),
+      with_speed(make_cluster_test_object(5.5, 0.0, 2, label), 1.5)};
+    const auto [to_cluster, moving] = separateMovingObjects(objects, stopped_objects, parameters);
+    ASSERT_EQ(to_cluster.size(), 1U);
+    ASSERT_EQ(moving.size(), 1U);
+    EXPECT_EQ(to_cluster.front().object_id.uuid[0], 1);
+    EXPECT_EQ(moving.front().object_id.uuid[0], 2);
+
+    // So the two no longer merge: the moving one is handled on its own.
+    ObjectClusterEdgeStateMap edge_states;
+    const auto clustered = clusterNearbyObjects(
+      to_cluster, make_straight_reference_path(0.0), geometry_msgs::msg::Point{}, parameters,
+      edge_states);
+    EXPECT_EQ(clustered.size(), 1U);
+  }
+
+  // An object that stood and has just started moving is still standing by the filter until it has
+  // moved for th_moving_time, the same verdict the per-object MOVING_OBJECT filter would give.
+  {
+    const auto standing = with_speed(make_cluster_test_object(5.0, 0.0, 3, label), 0.0);
+    separateMovingObjects({standing}, stopped_objects, parameters);
+    const auto started = with_speed(make_cluster_test_object(5.0, 0.0, 3, label), 1.5);
+    const auto [to_cluster, moving] = separateMovingObjects({started}, stopped_objects, parameters);
+    EXPECT_EQ(to_cluster.size(), 1U);
+    EXPECT_TRUE(moving.empty());
+  }
+}
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance

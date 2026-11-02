@@ -137,6 +137,8 @@ AvoidanceParameters getParameter(rclcpp::Node * node)
       get_or_declare_parameter<int>(*node, ns + "merge_in_cycles");
     p.obstacle_cluster_split_out_cycles =
       get_or_declare_parameter<int>(*node, ns + "split_out_cycles");
+    p.enable_dynamic_object_clustering =
+      get_or_declare_parameter<bool>(*node, ns + "enable_dynamic_object_clustering");
   }
 
   {
