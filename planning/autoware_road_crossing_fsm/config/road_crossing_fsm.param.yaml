@@ -100,8 +100,24 @@
     green_latch_sec: 30.0               # [s] latch hijau: setelah hijau mengizinkan, lampu yang
                                         # TIDAK terlihat (NONE, mis. body menoleh ke depan) tetap
                                         # dianggap hijau selama ini.  0 = tanpa latch.
-    green_latch_blink_count: 2          # latch reset kalau merah valid terlihat, atau hijau muncul
-                                        # lagi setelah hilang sebanyak ini (= hijau kedip).
+    green_latch_red_to_green_sec: 18.0  # [s] hijau yang datang setelah merah valid = awal fase hijau,
+                                        # belum mungkin kedip: selama ini deteksi hilang / kelap-kelip
+                                        # diabaikan, latch batal HANYA kalau merah valid. Harus < hijau
+                                        # solid terpendek di lokasi. Setelahnya cek pola kedip.
+                                        # 0 = mati (semua hijau pakai cek pola kedip).
+    # Hijau kedip = blink_cycles siklus berturut-turut yang nyala DAN matinya masing-masing di
+    # rentang [min, max] detik. Nyala / hilang lebih lama dari max (hijau solid, deteksi hilang
+    # lama) mereset hitungan -> deteksi yang sesekali hilang bukan kedip.
+    blink_on_min_sec: 0.1
+    blink_on_max_sec: 1.0
+    blink_off_min_sec: 0.1
+    blink_off_max_sec: 1.0
+    blink_cycles: 2
+    # CROSSING (hijau) tapi base_link masih di pre: merah / kedip / latch habis hanya membuat robot
+    # kembali ke WAIT_GREEN kalau masih sempat berhenti sebelum crossing:
+    # jarak bumper >= v^2 / (2 * rollback_decel_mps2) + rollback_margin_m. Lebih dekat = LANJUT.
+    rollback_decel_mps2: 1.0            # [m/s^2]
+    rollback_margin_m: 0.3              # [m]
     aim_only_if_light_unseen: true      # true: body baru noleh ke lampu kalau lampu TIDAK terdeteksi
                                         # (kamera mana pun) selama aim_unseen_grace_sec di WAIT_GREEN.
                                         # Sudah terlihat (merah/hijau) = tidak noleh, hemat motor.

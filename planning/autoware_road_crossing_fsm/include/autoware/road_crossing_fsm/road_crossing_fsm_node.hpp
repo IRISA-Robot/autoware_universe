@@ -144,10 +144,27 @@ private:
     double rezero_before_go_timeout_sec{60.0};  // GO anyway (WARN) after this long
     // Green latch: once the interlock allowed crossing, keep allowing for this long while the
     // light is NOT seen (status NONE) -- the camera loses it when the body turns back to the
-    // front.  Cleared by a valid red, or by green blinking (green seen again after a gap
-    // green_latch_blink_count times).  0 = no latch.
+    // front.  Cleared by a valid red, by rhythmic green blinking (blink_*), or when it runs
+    // out.  0 = no latch.
     double green_latch_sec{30.0};
-    int green_latch_blink_count{2};
+    // Green right after a valid red is the start of the green phase: it cannot blink yet, so
+    // for this long the latch ignores dropouts and blinking alike -- only a valid red clears
+    // it.  Must stay below the shortest solid green.  Afterwards the blink check applies.
+    double green_latch_red_to_green_sec{18.0};
+    // Rhythmic blink = blink_cycles consecutive HIJAU/NONE cycles whose on and off segments
+    // both last within [min, max].  A longer segment (solid green, a long dropout) resets
+    // the count, so a detector that loses the light now and then is not a blink.
+    double blink_on_min_sec{0.1};
+    double blink_on_max_sec{1.0};
+    double blink_off_min_sec{0.1};
+    double blink_off_max_sec{1.0};
+    int blink_cycles{2};
+    // CROSSING on green with base_link still on the pre: a stop reason (red, blink, latch
+    // over) only sends ego back to WAIT_GREEN while it can still stop before the crossing
+    // (front gap >= v^2 / (2 * rollback_decel_mps2) + rollback_margin_m); closer than that it
+    // keeps going.
+    double rollback_decel_mps2{1.0};
+    double rollback_margin_m{0.3};
     // true: only turn the body to the light when it is NOT detected from where the body
     // faces now (any camera) for aim_unseen_grace_sec in WAIT_GREEN; a light already seen
     // (red or green) needs no turn -- saves rotary motor work.  Once turned, the aimer stays
@@ -396,8 +413,15 @@ private:
 
   // Green latch state (see green_latch_sec).
   std::optional<rclcpp::Time> green_latch_since_;
-  LightStatus green_latch_prev_status_{LightStatus::NONE};
-  int green_latch_reappear_{0};
+  bool green_latch_from_red_{false};  // armed on red -> green (green_latch_red_to_green_sec)
+  // Rhythmic blink tracking (updateBlink()), reset when the latch is armed / cleared.
+  struct BlinkTracker
+  {
+    LightStatus last{LightStatus::NONE};
+    std::optional<rclcpp::Time> seg_start;  // start of the current HIJAU / NONE segment
+    double last_on_sec{-1.0};               // last complete HIJAU segment, -1 = none yet
+    int cycles{0};                          // consecutive blink-like on/off cycles
+  } blink_;
 
   // aim_only_if_light_unseen: since when the light has been unseen (status NONE) in
   // WAIT_GREEN, and whether the aimer was needed (sticky until ego goes / the episode ends).
@@ -587,6 +611,8 @@ private:
   void armGreenLatch(const rclcpp::Time & now);
   bool greenLatched(const rclcpp::Time & now);
   void clearGreenLatch();
+  // One tick of rhythmic-blink tracking on interlock_.status_now; true = blinking.
+  bool updateBlink(const rclcpp::Time & now);
 
   // aim_only_if_light_unseen: update aim_needed_ from the interlock (once per WAIT_GREEN tick,
   // after updateLightInterlock()); resetAimNeed() starts over (new wait at the pre).

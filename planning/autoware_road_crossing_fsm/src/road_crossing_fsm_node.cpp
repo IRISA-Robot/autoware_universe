@@ -99,7 +99,15 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
   param_.rezero_before_go_timeout_sec =
     declare_parameter<double>("rezero_before_go_timeout_sec", 60.0);
   param_.green_latch_sec = declare_parameter<double>("green_latch_sec", 30.0);
-  param_.green_latch_blink_count = declare_parameter<int>("green_latch_blink_count", 2);
+  param_.green_latch_red_to_green_sec =
+    declare_parameter<double>("green_latch_red_to_green_sec", 18.0);
+  param_.blink_on_min_sec = declare_parameter<double>("blink_on_min_sec", 0.1);
+  param_.blink_on_max_sec = declare_parameter<double>("blink_on_max_sec", 1.0);
+  param_.blink_off_min_sec = declare_parameter<double>("blink_off_min_sec", 0.1);
+  param_.blink_off_max_sec = declare_parameter<double>("blink_off_max_sec", 1.0);
+  param_.blink_cycles = declare_parameter<int>("blink_cycles", 2);
+  param_.rollback_decel_mps2 = declare_parameter<double>("rollback_decel_mps2", 1.0);
+  param_.rollback_margin_m = declare_parameter<double>("rollback_margin_m", 0.3);
   param_.aim_only_if_light_unseen = declare_parameter<bool>("aim_only_if_light_unseen", true);
   param_.aim_unseen_grace_sec = declare_parameter<double>("aim_unseen_grace_sec", 2.0);
   param_.aim_max_roi_offset = declare_parameter<double>("aim_max_roi_offset", 0.4);
@@ -1292,14 +1300,31 @@ void RoadCrossingFsmNode::onTimer()
       const bool green_latched = greenLatched(now);
 
       // Released by the light but base_link is still on the pre: the release only stands while
-      // the light still allows it.  Green flashing, red or nothing seen (status_now NONE) →
-      // back to WAIT_GREEN and wait at the line again, e.g. when ego was stopped on the pre
-      // after the GO and the light has changed since.  Once base_link is on the crossing there
-      // is no way back: ego keeps going whatever the light does.
-      if (
+      // the light still allows it (or the green latch holds: dropouts / flicker do not count,
+      // a valid red or a rhythmic blink does) → back to WAIT_GREEN and wait at the line again,
+      // e.g. when ego was stopped on the pre after the GO and the light has changed since.
+      // Only while ego can still stop before the crossing: closer than its stopping distance
+      // it keeps going.  Once base_link is on the crossing there is no way back either.
+      const bool light_revoked =
         road_cross_is_green_ && !interlock_.allows_crossing && !green_latched && active_pre_id_ &&
-        active_crossing_id_ && egoOnPre(*active_pre_id_) &&
-        !egoOnLanelet(*active_crossing_id_)) {
+        active_crossing_id_ && egoOnPre(*active_pre_id_) && !egoOnLanelet(*active_crossing_id_);
+      bool can_stop = true;
+      if (light_revoked) {
+        const double v = last_odom_ ? std::max(0.0, last_odom_->twist.twist.linear.x) : 0.0;
+        const double d = distanceToCrossingEntry();
+        const double gap = d - base_link_to_front_m_;
+        const double need =
+          v * v / (2.0 * std::max(param_.rollback_decel_mps2, 0.1)) + param_.rollback_margin_m;
+        if (d >= 0.0 && gap < need) {
+          can_stop = false;
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "CROSSING: lampu %s tidak lagi mengizinkan (status=%s) tapi bumper %.2f m dari "
+            "crossing @ %.2f m/s (butuh %.2f m untuk berhenti) — tidak sempat berhenti, LANJUT",
+            lightIdsText().c_str(), lightStatusName(interlock_.status_now), gap, v, need);
+        }
+      }
+      if (light_revoked && can_stop) {
         RCLCPP_WARN(
           get_logger(),
           "CROSSING: ego masih di pre %ld dan lampu %s tidak lagi mengizinkan (status=%s) — "
@@ -1997,41 +2022,96 @@ void RoadCrossingFsmNode::armGreenLatch(const rclcpp::Time & now)
 {
   if (param_.green_latch_sec <= 0.0) return;
   green_latch_since_ = now;
-  green_latch_prev_status_ = interlock_.status_now;
-  green_latch_reappear_ = 0;
-  RCLCPP_INFO(
-    get_logger(),
-    "latch hijau ON (%.0f s): lampu %s yang hilang dari kamera tetap dianggap hijau, "
-    "reset kalau merah / hijau kedip terlihat",
-    param_.green_latch_sec, lightIdsText().c_str());
+  green_latch_from_red_ = interlock_.red_to_green && param_.green_latch_red_to_green_sec > 0.0;
+  blink_ = BlinkTracker{};
+  if (green_latch_from_red_) {
+    RCLCPP_INFO(
+      get_logger(),
+      "latch hijau ON (merah -> hijau): lampu %s dianggap hijau %.0f s walau hilang / kelap-kelip "
+      "(awal fase hijau), batal hanya kalau merah valid; lalu cek pola kedip s.d. %.0f s",
+      lightIdsText().c_str(), param_.green_latch_red_to_green_sec, param_.green_latch_sec);
+  } else {
+    RCLCPP_INFO(
+      get_logger(),
+      "latch hijau ON (hijau tanpa merah, %.0f s): lampu %s yang hilang tetap dianggap hijau, "
+      "batal kalau merah valid / hijau kedip berirama",
+      param_.green_latch_sec, lightIdsText().c_str());
+  }
 }
 
 bool RoadCrossingFsmNode::greenLatched(const rclcpp::Time & now)
 {
   if (!green_latch_since_) return false;
-  const auto st = interlock_.status_now;
-  if (st == LightStatus::MERAH) {
+  if (interlock_.status_now == LightStatus::MERAH) {
     RCLCPP_WARN(get_logger(), "latch hijau OFF: merah terlihat");
     clearGreenLatch();
     return false;
   }
-  // Green back after a gap: the light is blinking (or was never solid).
-  if (st == LightStatus::HIJAU && green_latch_prev_status_ != LightStatus::HIJAU &&
-      ++green_latch_reappear_ >= param_.green_latch_blink_count) {
+  const bool blinking = updateBlink(now);
+  const double age = (now - *green_latch_since_).seconds();
+  if (green_latch_from_red_) {
+    // Start of the green phase: no blink possible yet, a dropout is the detector.
+    if (age <= param_.green_latch_red_to_green_sec) return true;
+    green_latch_from_red_ = false;
+    blink_ = BlinkTracker{};
+    RCLCPP_INFO(
+      get_logger(), "latch hijau: jendela merah -> hijau habis (%.1f s), lanjut cek pola kedip",
+      age);
+  }
+  if (blinking) {
     RCLCPP_WARN(
-      get_logger(), "latch hijau OFF: hijau kedip (hijau muncul lagi %d x setelah hilang)",
-      green_latch_reappear_);
+      get_logger(), "latch hijau OFF: hijau kedip (%d siklus nyala/mati berirama)",
+      blink_.cycles);
     clearGreenLatch();
     return false;
   }
-  green_latch_prev_status_ = st;
-  const double age = (now - *green_latch_since_).seconds();
   if (age > param_.green_latch_sec) {
     RCLCPP_INFO(get_logger(), "latch hijau OFF: habis (%.1f s)", age);
     clearGreenLatch();
     return false;
   }
   return true;
+}
+
+bool RoadCrossingFsmNode::updateBlink(const rclcpp::Time & now)
+{
+  const auto st = interlock_.status_now;
+  if (st == LightStatus::MERAH) {
+    blink_ = BlinkTracker{};
+    return false;
+  }
+  if (!blink_.seg_start) {
+    blink_.seg_start = now;
+    blink_.last = st;
+    return false;
+  }
+  const double seg = (now - *blink_.seg_start).seconds();
+  if (st == blink_.last) {
+    // A segment longer than a blink phase breaks the rhythm: solid green, long dropout.
+    const double max =
+      st == LightStatus::HIJAU ? param_.blink_on_max_sec : param_.blink_off_max_sec;
+    if (seg > max && (blink_.cycles > 0 || blink_.last_on_sec >= 0.0)) {
+      blink_.cycles = 0;
+      blink_.last_on_sec = -1.0;
+    }
+    return false;
+  }
+  if (blink_.last == LightStatus::HIJAU) {
+    blink_.last_on_sec = seg;  // on segment ended
+  } else if (blink_.last_on_sec >= 0.0) {
+    // Off segment ended: one on/off cycle.
+    const bool on_ok =
+      blink_.last_on_sec >= param_.blink_on_min_sec && blink_.last_on_sec <= param_.blink_on_max_sec;
+    const bool off_ok = seg >= param_.blink_off_min_sec && seg <= param_.blink_off_max_sec;
+    blink_.cycles = (on_ok && off_ok) ? blink_.cycles + 1 : 0;
+    RCLCPP_INFO(
+      get_logger(), "pola kedip: nyala %.2f s mati %.2f s -> %s (siklus %d/%d)",
+      blink_.last_on_sec, seg, (on_ok && off_ok) ? "seperti kedip" : "bukan kedip",
+      blink_.cycles, param_.blink_cycles);
+  }
+  blink_.last = st;
+  blink_.seg_start = now;
+  return blink_.cycles >= param_.blink_cycles;
 }
 
 void RoadCrossingFsmNode::updateAimNeed(const rclcpp::Time & now)
@@ -2086,8 +2166,8 @@ void RoadCrossingFsmNode::resetAimNeed()
 void RoadCrossingFsmNode::clearGreenLatch()
 {
   green_latch_since_.reset();
-  green_latch_prev_status_ = LightStatus::NONE;
-  green_latch_reappear_ = 0;
+  green_latch_from_red_ = false;
+  blink_ = BlinkTracker{};
 }
 
 // ---------------------------------------------------------------------------
