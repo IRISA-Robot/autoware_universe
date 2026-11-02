@@ -217,6 +217,15 @@ void fillObjectMovingTime(
   const std::shared_ptr<AvoidanceParameters> & parameters);
 
 /**
+ * @brief fillObjectMovingTime() at a given time (the overload above uses the ROS clock now).
+ * @details An object counts as standing again only after moving_object_stop_hysteresis_time at or
+ * below its th_moving_speed, so a single slow cycle does not reset th_moving_time.
+ */
+void fillObjectMovingTime(
+  ObjectData & object_data, ObjectDataArray & stopped_objects,
+  const std::shared_ptr<AvoidanceParameters> & parameters, const rclcpp::Time & now);
+
+/**
  * @brief update classification unstable objects.
  * @param current detected object.
  * @param unknown type object first seen time map.

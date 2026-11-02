@@ -689,6 +689,12 @@
               "description": "For the compensation of the detection lost. The object is registered once it is observed as an avoidance target. When the detection loses, the timer will start and the object will be un-registered when the time exceeds this limit.",
               "default": 2.0
             },
+            "moving_object_stop_hysteresis_time": {
+              "type": "number",
+              "description": "An object that has been faster than th_moving_speed counts as standing again only after staying at or below it for this long, so one slow cycle does not reset th_moving_time. 0.0 restores the reset on any slow cycle.",
+              "default": 0.5,
+              "minimum": 0.0
+            },
             "unstable_classification_time": {
               "type": "number",
               "description": "If the object is classified as UNKNOWN type for less than unstable_classification_time seconds, it is probably not an unknown type.",
@@ -930,6 +936,7 @@
             "object_check_goal_distance",
             "object_check_return_pose_distance",
             "max_compensation_time",
+            "moving_object_stop_hysteresis_time",
             "unstable_classification_time",
             "detection_area",
             "merging_vehicle",

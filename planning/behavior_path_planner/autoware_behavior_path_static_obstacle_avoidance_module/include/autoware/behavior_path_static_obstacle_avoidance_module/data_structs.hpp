@@ -330,6 +330,13 @@ struct AvoidanceParameters
   // lost_count and the registered object will be removed when the count exceeds this max count.
   double object_last_seen_threshold{0.0};
 
+  // [MOVING-HYSTERESIS 2026-11-02] An object that has been faster than its th_moving_speed is only
+  // taken as standing again once it has stayed at or below it for this long. A single slow cycle
+  // (tracker velocity dipping while a pedestrian turns, is half occluded or is re-shaped) used to
+  // reset th_moving_time, so a walking pedestrian was read as standing and avoided. 0.0 restores
+  // the old reset-on-any-slow-cycle behaviour. See fillObjectMovingTime() in utils.cpp.
+  double moving_object_stop_hysteresis_time{0.5};
+
   double unstable_classification_time{0.0};
 
   // [OBSTACLE-CLUSTER 2026-09-04] Preprocessing stage run BEFORE per-object filtering
@@ -515,6 +522,14 @@ struct ObjectData  // avoidance target
   // object stopping duration
   rclcpp::Time last_move;
   double stop_time{0.0};
+
+  // [MOVING-HYSTERESIS 2026-11-02] moving/standing state kept per object in the module's
+  // stopped_objects_ (fillObjectMovingTime()). last_fast: last time it was faster than
+  // th_moving_speed (epoch: never). moving_confirmed: move_time passed th_moving_time since it was
+  // last standing. moving_state_stamp: last time it was observed, to forget objects gone for good.
+  rclcpp::Time last_fast{0, 0, RCL_ROS_TIME};
+  bool moving_confirmed{false};
+  rclcpp::Time moving_state_stamp{0, 0, RCL_ROS_TIME};
 
   // It is one of the ego driving lanelets (closest lanelet to the object) and used in the logic to
   // check whether the object is on the ego lane.

@@ -126,6 +126,7 @@
         object_check_return_pose_distance: 20.0         # [m]
         # lost object compensation
         max_compensation_time: 2.0
+        moving_object_stop_hysteresis_time: 0.5        # [s] a moving object counts as standing only after this long at or below th_moving_speed
 
         # detection area generation parameters
         detection_area:

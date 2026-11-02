@@ -2245,6 +2245,14 @@ void fillObjectMovingTime(
   ObjectData & object_data, ObjectDataArray & stopped_objects,
   const std::shared_ptr<AvoidanceParameters> & parameters)
 {
+  fillObjectMovingTime(
+    object_data, stopped_objects, parameters, rclcpp::Clock(RCL_ROS_TIME).now());
+}
+
+void fillObjectMovingTime(
+  ObjectData & object_data, ObjectDataArray & stopped_objects,
+  const std::shared_ptr<AvoidanceParameters> & parameters, const rclcpp::Time & now)
+{
   const auto object_type = utils::getHighestProbLabel(object_data.object.classification);
   const auto object_parameter = parameters->object_parameters.at(object_type);
 
@@ -2252,48 +2260,107 @@ void fillObjectMovingTime(
   const auto object_vel_norm = std::hypot(object_twist.linear.x, object_twist.linear.y);
   const auto is_faster_than_threshold = object_vel_norm > object_parameter.moving_speed_threshold;
 
+  // [MOVING-HYSTERESIS 2026-11-02]
+  // - Every object keeps an entry here, moving ones too. A confirmed-moving object used to be
+  //   erased, and its next slow cycle brought it back as a brand-new STANDING object.
+  // - The entry's move_time is a leaky count of the time the object has been seen fast: a fast
+  //   cycle adds its duration, a slow cycle within moving_object_stop_hysteresis_time of the
+  //   last fast one takes the same off (never below 0) instead of resetting it. A walking
+  //   pedestrian's occasional velocity dip no longer restarts th_moving_time, while a standing
+  //   object's scattered velocity spikes cancel out instead of piling up (replayed on
+  //   avoid_stop_20261102_002555: summing without the leak read standing pedestrians as moving
+  //   ~4x as often as before).
+  // - Moving is confirmed only once that count passes th_moving_time -- for every object,
+  //   including one first seen fast. After that, dips do not count down; only a slow spell
+  //   longer than the hysteresis makes the object standing again.
+  // - An object first seen fast is moving while it stays fast (as before); its first slow
+  //   cycle makes it standing until confirmed (as before).
+  // - An entry not observed for kForgetAfter is dropped, so objects that left do not pile up.
+  constexpr double kForgetAfter = 5.0;  // [s]
+  constexpr double kMaxStep = 0.5;      // [s] longest gap between observations counted as moving
+  const rclcpp::Time never(0, 0, RCL_ROS_TIME);
+  stopped_objects.erase(
+    std::remove_if(
+      stopped_objects.begin(), stopped_objects.end(),
+      [&](const auto & o) { return (now - o.moving_state_stamp).seconds() > kForgetAfter; }),
+    stopped_objects.end());
+
   const auto id = object_data.object.object_id;
-  const auto same_id_obj = std::find_if(
+  auto entry = std::find_if(
     stopped_objects.begin(), stopped_objects.end(),
     [&id](const auto & o) { return o.object.object_id == id; });
 
-  const auto is_new_object = same_id_obj == stopped_objects.end();
-  const rclcpp::Time now = rclcpp::Clock(RCL_ROS_TIME).now();
-
-  if (!is_faster_than_threshold) {
-    object_data.last_stop = now;
-    object_data.move_time = 0.0;
-    if (is_new_object) {
-      object_data.init_pose = object_data.getPose();
-      object_data.stop_time = 0.0;
-      object_data.last_move = now;
-      stopped_objects.push_back(object_data);
-    } else {
-      same_id_obj->stop_time = (now - same_id_obj->last_move).seconds();
-      same_id_obj->last_stop = now;
-      same_id_obj->move_time = 0.0;
-      object_data.stop_time = same_id_obj->stop_time;
-      object_data.init_pose = same_id_obj->init_pose;
-    }
-    return;
-  }
-
-  if (is_new_object) {
-    object_data.init_pose = object_data.getPose();
-    object_data.move_time = std::numeric_limits<double>::infinity();
+  if (entry == stopped_objects.end()) {
+    ObjectData new_entry = object_data;
+    new_entry.init_pose = object_data.getPose();
+    new_entry.stop_time = 0.0;
+    new_entry.last_move = now;
+    new_entry.moving_state_stamp = now;
+    new_entry.move_time = 0.0;
+    new_entry.moving_confirmed = false;
+    new_entry.last_fast = is_faster_than_threshold ? now : never;
+    // last_stop == never marks "never seen slow".
+    new_entry.last_stop = is_faster_than_threshold ? never : now;
+    stopped_objects.push_back(new_entry);
+    object_data.init_pose = new_entry.init_pose;
     object_data.stop_time = 0.0;
     object_data.last_move = now;
+    object_data.last_stop = new_entry.last_stop;
+    object_data.move_time =
+      is_faster_than_threshold ? std::numeric_limits<double>::infinity() : 0.0;
     return;
   }
 
-  object_data.last_stop = same_id_obj->last_stop;
-  object_data.move_time = (now - same_id_obj->last_stop).seconds();
-  object_data.stop_time = 0.0;
-  object_data.init_pose = object_data.getPose();
+  const double step = std::clamp((now - entry->moving_state_stamp).seconds(), 0.0, kMaxStep);
+  entry->moving_state_stamp = now;
 
-  if (object_data.move_time > object_parameter.moving_time_threshold) {
-    stopped_objects.erase(same_id_obj);
+  const bool has_been_fast = entry->last_fast.nanoseconds() > 0;
+  const bool in_dip = !is_faster_than_threshold && has_been_fast &&
+                      (now - entry->last_fast).seconds() <
+                        parameters->moving_object_stop_hysteresis_time;
+
+  if (is_faster_than_threshold) {
+    entry->last_fast = now;
+    entry->move_time += step;
+    if (entry->move_time > object_parameter.moving_time_threshold) {
+      entry->moving_confirmed = true;
+    }
+    const bool never_slow = entry->last_stop.nanoseconds() == 0;
+    object_data.last_stop = entry->last_stop;
+    object_data.move_time = (never_slow && !entry->moving_confirmed)
+                              ? std::numeric_limits<double>::infinity()
+                              : entry->move_time;
+    object_data.stop_time = 0.0;
+    object_data.init_pose = object_data.getPose();
+    return;
   }
+
+  entry->last_stop = now;
+
+  if (in_dip) {
+    if (!entry->moving_confirmed) {
+      entry->move_time = std::max(entry->move_time - step, 0.0);
+    }
+    object_data.last_stop = now;
+    object_data.move_time = entry->move_time;
+    object_data.stop_time = 0.0;
+    object_data.init_pose = object_data.getPose();
+    return;
+  }
+
+  // Standing. Coming from a confirmed move, a new stop starts here (what the old erase and
+  // re-insert did).
+  if (entry->moving_confirmed) {
+    entry->moving_confirmed = false;
+    entry->last_move = now;
+    entry->init_pose = object_data.getPose();
+  }
+  entry->stop_time = (now - entry->last_move).seconds();
+  entry->move_time = 0.0;
+  object_data.last_stop = now;
+  object_data.move_time = 0.0;
+  object_data.stop_time = entry->stop_time;
+  object_data.init_pose = entry->init_pose;
 }
 
 void updateClassificationUnstableObjects(

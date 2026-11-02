@@ -28,6 +28,8 @@
 #include <gtest/gtest.h>
 
 #include <limits>
+#include <optional>
+#include <random>
 #include <memory>
 
 namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
@@ -4077,6 +4079,188 @@ TEST(TestUtils, separateMovingObjectsKeepsMovingObjectsOutOfClusters)
     const auto [to_cluster, moving] = separateMovingObjects({started}, stopped_objects, parameters);
     EXPECT_EQ(to_cluster.size(), 1U);
     EXPECT_TRUE(moving.empty());
+  }
+}
+
+// [MOVING-HYSTERESIS 2026-11-02] fillObjectMovingTime() with an injected clock. TRUCK in
+// get_parameters(): th_moving_speed 1.0, th_moving_time 0.5. Observations every 0.1 s.
+namespace
+{
+PredictedObject movingTestObject(const uint8_t id_seed, const double speed)
+{
+  auto o = make_cluster_test_object(5.0, 0.0, id_seed, ObjectClassification::TRUCK);
+  o.kinematics.initial_twist_with_covariance.twist.linear.x = speed;
+  return o;
+}
+
+rclcpp::Time movingTestTime(const double t)
+{
+  return rclcpp::Time(static_cast<int64_t>(std::llround((100.0 + t) * 1e9)), RCL_ROS_TIME);
+}
+
+// Feeds speeds at 0.1 s steps from t0 and returns the moving verdict after each one.
+std::vector<bool> movingVerdicts(
+  const std::vector<double> & speeds, ObjectDataArray & stopped,
+  const std::shared_ptr<AvoidanceParameters> & parameters, const uint8_t id = 7,
+  const double t0 = 0.0)
+{
+  std::vector<bool> verdicts;
+  for (size_t k = 0; k < speeds.size(); ++k) {
+    ObjectData od{};
+    od.object = movingTestObject(id, speeds[k]);
+    fillObjectMovingTime(od, stopped, parameters, movingTestTime(t0 + 0.1 * k));
+    verdicts.push_back(filtering_utils::isMovingObject(od, parameters));
+  }
+  return verdicts;
+}
+}  // namespace
+
+TEST(TestUtils, fillObjectMovingTimeDipDoesNotRestartTheCount)
+{
+  auto parameters = get_parameters();
+  // stand, then walk with a one-cycle velocity dip at index 3
+  const std::vector<double> speeds{0.0, 1.5, 1.5, 0.2, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5};
+
+  parameters->moving_object_stop_hysteresis_time = 0.5;
+  ObjectDataArray stopped;
+  const auto with_hysteresis = movingVerdicts(speeds, stopped, parameters);
+  // leaky count after each index: 0, 0.1, 0.2, (dip) 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7
+  // (checked away from the 0.5 boundary, where float sums can land either side)
+  EXPECT_FALSE(with_hysteresis[6]);
+  EXPECT_TRUE(with_hysteresis[8]);
+  EXPECT_TRUE(with_hysteresis[9]);
+
+  parameters->moving_object_stop_hysteresis_time = 0.0;
+  ObjectDataArray stopped_old;
+  const auto old_behaviour = movingVerdicts(speeds, stopped_old, parameters);
+  // the dip restarted the count at index 3: 0.5 s by index 8 at most, not moving at index 7
+  EXPECT_FALSE(old_behaviour[7]);
+}
+
+TEST(TestUtils, fillObjectMovingTimeScatteredSpikesDoNotPileUp)
+{
+  auto parameters = get_parameters();
+  parameters->moving_object_stop_hysteresis_time = 0.5;
+  ObjectDataArray stopped;
+  // a standing object whose velocity spikes every third cycle, i.e. always inside the hysteresis
+  std::vector<double> speeds;
+  for (int k = 0; k < 60; ++k) {
+    speeds.push_back(k % 3 == 1 ? 1.5 : 0.0);
+  }
+  for (const bool moving : movingVerdicts(speeds, stopped, parameters)) {
+    EXPECT_FALSE(moving);
+  }
+
+  // the same when its very first observation is a spike: moving on that cycle (as before), then
+  // standing for good -- the spikes never confirm it
+  ObjectDataArray stopped_first_fast;
+  std::vector<double> first_fast;
+  for (int k = 0; k < 60; ++k) {
+    first_fast.push_back(k % 3 == 0 ? 1.5 : 0.0);
+  }
+  const auto v = movingVerdicts(first_fast, stopped_first_fast, parameters, 8);
+  EXPECT_TRUE(v[0]);
+  for (size_t k = 1; k < v.size(); ++k) {
+    EXPECT_FALSE(v[k]) << "step " << k;
+  }
+}
+
+TEST(TestUtils, fillObjectMovingTimeSpikeOnStandingObjectStaysStanding)
+{
+  auto parameters = get_parameters();
+  parameters->moving_object_stop_hysteresis_time = 0.5;
+  ObjectDataArray stopped;
+  // a standing object with one noisy fast cycle never becomes moving, during or after the dip
+  const std::vector<double> speeds{0.0, 0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  for (const bool moving : movingVerdicts(speeds, stopped, parameters)) {
+    EXPECT_FALSE(moving);
+  }
+  ASSERT_EQ(stopped.size(), 1U);
+  EXPECT_DOUBLE_EQ(stopped.front().move_time, 0.0);  // reset once the hysteresis ran out
+}
+
+TEST(TestUtils, fillObjectMovingTimeConfirmedMoverNeedsAStopLongerThanTheHysteresis)
+{
+  auto parameters = get_parameters();
+  parameters->moving_object_stop_hysteresis_time = 0.5;
+  ObjectDataArray stopped;
+  // first seen fast and fast for 0.7 s -> confirmed; slow for 0.4 s (dip) -> still moving;
+  // slow longer -> standing
+  const std::vector<double> speeds{1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 0.0, 0.0, 0.0,
+                                   0.0, 0.0, 0.0, 0.0};
+  const auto v = movingVerdicts(speeds, stopped, parameters);
+  for (size_t k = 0; k < 8; ++k) {
+    EXPECT_TRUE(v[k]) << "step " << k;
+  }
+  EXPECT_TRUE(v[11]);   // 0.4 s after the last fast cycle
+  EXPECT_FALSE(v[12]);  // 0.5 s after it
+  EXPECT_FALSE(v[14]);
+
+  // and a new stop starts there: stop_time counts from that moment
+  ObjectData od{};
+  od.object = movingTestObject(7, 0.0);
+  fillObjectMovingTime(od, stopped, parameters, movingTestTime(1.7));
+  EXPECT_NEAR(od.stop_time, 0.5, 1e-6);
+}
+
+TEST(TestUtils, fillObjectMovingTimeForgetsObjectsThatLeft)
+{
+  auto parameters = get_parameters();
+  ObjectDataArray stopped;
+  movingVerdicts({0.0}, stopped, parameters, 1, 0.0);
+  movingVerdicts({1.5}, stopped, parameters, 2, 0.0);
+  ASSERT_EQ(stopped.size(), 2U);
+  movingVerdicts({0.0}, stopped, parameters, 3, 4.0);
+  EXPECT_EQ(stopped.size(), 3U);  // 4 s: still remembered
+  movingVerdicts({0.0}, stopped, parameters, 3, 6.0);
+  EXPECT_EQ(stopped.size(), 1U);  // objects 1 and 2 unseen for 6 s: dropped
+}
+
+// With the hysteresis at 0 the verdicts are those of the previous implementation, on a long random
+// speed sequence around the threshold.
+TEST(TestUtils, fillObjectMovingTimeZeroHysteresisMatchesPreviousBehaviour)
+{
+  auto parameters = get_parameters();
+  parameters->moving_object_stop_hysteresis_time = 0.0;
+  const double speed_th = 1.0;
+  const double time_th = 0.5;
+
+  // previous implementation, with the clock injected
+  struct OldEntry
+  {
+    double last_stop;
+  };
+  std::optional<OldEntry> old_entry;
+  const auto old_is_moving = [&](const double v, const double now) {
+    if (v <= speed_th) {
+      old_entry = OldEntry{now};
+      return false;
+    }
+    if (!old_entry) {
+      return true;  // move_time = inf
+    }
+    const double move_time = now - old_entry->last_stop;
+    if (move_time > time_th) {
+      old_entry.reset();
+    }
+    return move_time > time_th;
+  };
+
+  std::mt19937 rng(42);
+  std::uniform_real_distribution<double> speed(0.0, 2.0);
+  std::bernoulli_distribution sticky(0.8);
+  std::vector<double> speeds;
+  double v = 0.0;
+  for (int k = 0; k < 2000; ++k) {
+    if (!sticky(rng)) v = speed(rng);
+    speeds.push_back(v);
+  }
+
+  ObjectDataArray stopped;
+  const auto new_verdicts = movingVerdicts(speeds, stopped, parameters);
+  for (size_t k = 0; k < speeds.size(); ++k) {
+    ASSERT_EQ(new_verdicts[k], old_is_moving(speeds[k], 0.1 * static_cast<double>(k)))
+      << "differs at step " << k << " speed " << speeds[k];
   }
 }
 }  // namespace autoware::behavior_path_planner::utils::static_obstacle_avoidance
