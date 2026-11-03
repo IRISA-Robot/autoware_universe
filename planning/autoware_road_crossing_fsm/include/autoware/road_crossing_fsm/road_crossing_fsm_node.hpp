@@ -40,6 +40,8 @@
 #include <std_msgs/msg/float32.hpp>
 #include <std_srvs/srv/set_bool.hpp>
 
+#include "autoware/road_crossing_fsm/direction_utils.hpp"
+
 #include <autoware/route_handler/route_handler.hpp>
 #include <autoware_lanelet2_extension/utility/message_conversion.hpp>
 
@@ -406,6 +408,11 @@ private:
   std::vector<int64_t> active_light_ids_;
   uint8_t active_light_direction_{
     autoware_road_crossing_msgs::msg::PedestrianLightTarget::FORWARD};
+  // Index of active_crossing_id_ in route_lanelets_ (set at arming; an out-and-back route can
+  // hold the same lanelet twice).
+  std::optional<size_t> active_crossing_route_idx_;
+  // Ego moving against the route's travel order during an episode since (retrace guard).
+  std::optional<rclcpp::Time> against_route_since_;
 
   // Interlock lampu hijau (interlock.plan.md): state yang di-reset tiap penyeberangan
   // (masuk ARMED_LIGHT dan resetEpisode()).
@@ -673,7 +680,12 @@ private:
 
   // The tf_pedestrian way ids paired with `crossing_id` for the given direction of travel,
   // read from the crossing's forward_pedestrian_tf / reverse_pedestrian_tf tag.
-  std::vector<int64_t> pairedLights(lanelet::Id crossing_id, bool forward) const;
+  // Lights of one tag of the crossing (key = forward_pedestrian_tf / reverse_pedestrian_tf),
+  // with their map position (nullopt: not a tf_pedestrian way).
+  std::vector<direction::TaggedLight> taggedLights(lanelet::Id crossing_id, const char * key) const;
+  // Lock the episode's light(s) at arming: the tag for the side ego crosses from (route
+  // orientation of the crossing), see direction::selectLights().
+  void selectEpisodeLights();
 
   // Transition helper: change state and log.
   void transitionTo(FsmState new_state);
@@ -683,11 +695,22 @@ private:
   void updateLightInterlock(const char * where);
   // True when ego's base_link is inside lanelet `id`.
   bool egoOnLanelet(lanelet::Id id) const;
-  // On the pre: base_link OR the front bumper on it.  A robot standing at the seam into the pre
-  // (front in, base_link not yet) is at the pre -- the road_crossing stop zone holds it there
-  // rather than creeping it the last decimetres.  The crossing itself stays base_link only.
+  // On the pre: base_link OR the leading bumper on it (front in forward gear, rear in reverse).
+  // A robot standing at the seam into the pre (bumper in, base_link not yet) is at the pre --
+  // the road_crossing stop zone holds it there rather than creeping it the last decimetres.
+  // The crossing itself stays base_link only.
   bool egoOnPre(lanelet::Id id) const;
   double base_link_to_front_m_{0.0};
+  double base_link_to_rear_m_{0.0};
+  // Centerline of a route lanelet in TRAVEL order (the route's own orientation: a lanelet the
+  // route takes against its drawing direction comes back inverted), nullopt if unknown.
+  std::optional<direction::Polyline> routedCenterline(lanelet::Id id) const;
+  // Ego's base_link / leading bumper (by gear) as plain points.
+  direction::Point2 egoPoint() const;
+  double egoYaw() const;
+  // Ego moves along the route's travel order on its current route lanelet (nullopt: unknown,
+  // e.g. standing still or not on the route).  False = backing up along the route (retrace).
+  std::optional<bool> egoTravelsInRouteOrder() const;
   // True when ego is before lanelet `id` (on the travel-direction side) by more than margin.
   bool egoUpstreamOf(lanelet::Id id, double margin) const;
   // The route lanelet right after the active crossing, if it is a pre_road_crossing.

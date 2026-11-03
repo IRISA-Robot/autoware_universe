@@ -13,6 +13,13 @@ rclcpp_components_register_node(${PROJECT_NAME}
   EXECUTABLE road_crossing_fsm_node
 )
 
+if(BUILD_TESTING)
+  ament_add_ros_isolated_gtest(test_${PROJECT_NAME}_direction
+    test/test_direction_utils.cpp
+  )
+  target_link_libraries(test_${PROJECT_NAME}_direction ${PROJECT_NAME})
+endif()
+
 ament_auto_package(INSTALL_TO_SHARE
   config
   launch

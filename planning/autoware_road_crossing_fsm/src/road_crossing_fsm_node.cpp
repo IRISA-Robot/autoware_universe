@@ -179,6 +179,8 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
   // base_link -> front bumper, from the vehicle parameters every node is launched with.
   base_link_to_front_m_ = declare_parameter<double>("wheel_base", 0.0) +
                           declare_parameter<double>("front_overhang", 0.0);
+  // base_link -> rear bumper: the leading edge while reversing.
+  base_link_to_rear_m_ = declare_parameter<double>("rear_overhang", 0.0);
 
   // Planned trajectory: driving direction while standing still (see updateDrivingDirection()).
   sub_trajectory_ = create_subscription<autoware_planning_msgs::msg::Trajectory>(
@@ -396,7 +398,14 @@ void RoadCrossingFsmNode::updateDrivingDirection()
     if (!near_stationary_since_) near_stationary_since_ = now;
 
     const double near_stationary_elapsed = (now - *near_stationary_since_).seconds();
-    if (near_stationary_elapsed >= kNearStationaryFallbackSec) {
+    // During an episode the gear only changes by real motion: a robot held at the line keeps
+    // the gear it arrived with (its planned velocity is 0 there, and the leading bumper, the
+    // re-zero and the rollback distance all follow the gear).
+    const bool in_episode =
+      state_ == FsmState::APPROACH_PRE || state_ == FsmState::AT_PRE ||
+      state_ == FsmState::ARMED_LIGHT || state_ == FsmState::WAIT_GREEN ||
+      state_ == FsmState::CROSSING;
+    if (near_stationary_elapsed >= kNearStationaryFallbackSec && !in_episode) {
       // Genuinely stopped for a while — twist will never recover on its own.
       // Take the direction from the planned trajectory (oriented the way the route really runs,
       // also on a lanelet traversed against its drawing direction), else from the route's own
@@ -516,15 +525,14 @@ std::optional<bool> RoadCrossingFsmNode::deriveDrivingDirectionFromTrajectory() 
       nearest = i;
     }
   }
-  // Same test as motion_utils::isDrivingForward(): is the next point ahead of the pose?
-  for (size_t j = nearest + 1; j < pts.size(); ++j) {
-    const double dx = pts[j].pose.position.x - pts[nearest].pose.position.x;
-    const double dy = pts[j].pose.position.y - pts[nearest].pose.position.y;
-    if (dx * dx + dy * dy > 1e-6) {
-      return autoware_utils_geometry::is_driving_forward(pts[nearest].pose, pts[j].pose.position);
-    }
+  // Sign of the planned velocity from ego on, as the MPC decides it (mpc.cpp).  Not the pose
+  // yaw: on a reversed route it is the travel direction, so a yaw test always says forward.
+  std::vector<double> velocities;
+  velocities.reserve(pts.size() - nearest);
+  for (size_t j = nearest; j < pts.size(); ++j) {
+    velocities.push_back(pts[j].longitudinal_velocity_mps);
   }
-  return std::nullopt;
+  return direction::gearFromVelocities(velocities);
 }
 
 void RoadCrossingFsmNode::onTimer()
@@ -620,6 +628,27 @@ void RoadCrossingFsmNode::onTimer()
     state_ == FsmState::APPROACH_PRE || state_ == FsmState::AT_PRE ||
     state_ == FsmState::ARMED_LIGHT || state_ == FsmState::WAIT_GREEN ||
     state_ == FsmState::CROSSING;
+  // Moving against the route's travel order (backing up along the route) is not this episode's
+  // crossing direction: drop it after a second of it (gates go stale = HOLD).
+  if (episode_active && active_crossing_id_) {
+    if (egoTravelsInRouteOrder() == std::optional<bool>(false)) {
+      if (!against_route_since_) against_route_since_ = now;
+      if ((now - *against_route_since_).seconds() >= 1.0) {
+        RCLCPP_WARN(
+          get_logger(),
+          "ego moves against the route order on crossing %ld (state=%d) — resetting the episode",
+          static_cast<long>(*active_crossing_id_), static_cast<int>(state_));
+        if (state_ == FsmState::CROSSING) {
+          setDetectorEnabled(cli_ped_light_detector_, false, "ped_light_detector");
+        }
+        resetEpisode();
+        transitionTo(FsmState::IDLE);
+        return;
+      }
+    } else {
+      against_route_since_.reset();
+    }
+  }
   if (episode_active && active_crossing_id_) {
     const bool on_pre = active_pre_id_ && egoOnPre(*active_pre_id_);
     const bool on_crossing = egoOnLanelet(*active_crossing_id_);
@@ -649,20 +678,8 @@ void RoadCrossingFsmNode::onTimer()
     case FsmState::IDLE: {
       if (checkArmCondition()) {
         transitionTo(FsmState::APPROACH_PRE);
-        // Lock the paired light(s) for this episode.  Arming only happens while driving
-        // forward (see checkArmCondition()), so today this is always the forward tag.
-        active_light_direction_ =
-          is_driving_forward_ ? autoware_road_crossing_msgs::msg::PedestrianLightTarget::FORWARD
-                              : autoware_road_crossing_msgs::msg::PedestrianLightTarget::REVERSE;
-        active_light_ids_ = active_crossing_id_
-                              ? pairedLights(*active_crossing_id_, is_driving_forward_)
-                              : std::vector<int64_t>{};
-        RCLCPP_INFO(
-          get_logger(), "IDLE: crossing %ld %s light(s): %s",
-          active_crossing_id_ ? static_cast<long>(*active_crossing_id_) : -1L,
-          is_driving_forward_ ? "forward" : "reverse",
-          active_light_ids_.empty() ? "none (unsignalized, no light wait)"
-                                    : lightIdsText().c_str());
+        // Lock the paired light(s) for this episode.
+        selectEpisodeLights();
         // Rotary aimer is NOT enabled here — enabling at approach distance causes the
         // platform to rotate from far away (unstable / weird).  Instead the aimer is
         // enabled lazily in the waiting states.  See the aimer block in onTimer.
@@ -1280,10 +1297,9 @@ void RoadCrossingFsmNode::onTimer()
         break;
       }
 
-      // rotate_body_while_driving=false: the body must face the front before ego moves.
-      // Reversing keeps the aimer enabled (reZeroAimerDirectionAware), so there is nothing to
-      // wait for then.
-      if (!param_.rotate_body_while_driving && is_driving_forward_ && !bodyAtFrontBeforeGo(now)) {
+      // rotate_body_while_driving=false: the body goes back to 0 before ego moves, in both gears
+      // (0 is the body's default; reversing only changes the direction of motion).
+      if (!param_.rotate_body_while_driving && !bodyAtFrontBeforeGo(now)) {
         break;  // road gate stays HOLD (published above)
       }
 
@@ -1321,11 +1337,13 @@ void RoadCrossingFsmNode::onTimer()
         active_crossing_id_ && egoOnPre(*active_pre_id_) && !egoOnLanelet(*active_crossing_id_);
       bool can_stop = true;
       if (light_revoked) {
-        const double v = last_odom_ ? std::max(0.0, last_odom_->twist.twist.linear.x) : 0.0;
+        // |v| and the leading bumper: the same in both gears.
+        const double v = last_odom_ ? std::abs(last_odom_->twist.twist.linear.x) : 0.0;
         const double d = distanceToCrossingEntry();
-        const double gap = d - base_link_to_front_m_;
-        const double need =
-          v * v / (2.0 * std::max(param_.rollback_decel_mps2, 0.1)) + param_.rollback_margin_m;
+        const double gap = d - direction::leadingEdgeOffset(
+                                 base_link_to_front_m_, base_link_to_rear_m_, is_driving_forward_);
+        const double need = direction::stoppingDistance(
+          v, param_.rollback_decel_mps2, param_.rollback_margin_m);
         if (d >= 0.0 && gap < need) {
           can_stop = false;
           RCLCPP_WARN_THROTTLE(
@@ -1460,23 +1478,38 @@ bool RoadCrossingFsmNode::checkArmCondition()
     return false;
   };
 
-  // Bidirectional-driving guard: route order == travel order only while driving forward.
-  if (!is_driving_forward_) {
-    return not_armed("not driving forward", -1);
-  }
-
   lanelet::ConstLanelet cur;
   if (!egoRouteLanelet(&cur)) {
     return not_armed("ego not resolved on the route", -1);
   }
+  // Route order is travel order in both gears (a reversed route inverts its lanelets); only
+  // backing up along the route (retrace, e.g. a recovery) runs against it.
+  if (egoTravelsInRouteOrder() == std::optional<bool>(false)) {
+    return not_armed("ego moves against the route order (retrace)", cur.id());
+  }
+  // The segment ego is on, from the route window, so an out-and-back route over the same
+  // lanelets picks the current pass; else the first occurrence.
+  std::optional<size_t> ego_idx;
+  {
+    constexpr double max_window_age_s = 1.0;
+    const auto & w = active_route_window_;
+    if (
+      w && w->valid && w->route_uuid == route_handler_.getRouteUuid() &&
+      (now() - rclcpp::Time(w->header.stamp)).seconds() < max_window_age_s &&
+      w->ego_segment < route_lanelets_.size() && route_lanelets_[w->ego_segment] == cur.id()) {
+      ego_idx = w->ego_segment;
+    }
+  }
   for (size_t i = 0; i + 1 < route_lanelets_.size(); ++i) {
     if (route_lanelets_[i] != cur.id()) continue;
+    if (ego_idx && i != *ego_idx) continue;
     if (is_crossing(route_lanelets_[i + 1])) {
       if (!egoOnPre(cur.id())) {
         return not_armed("base_link not on the pre lanelet", cur.id());
       }
       active_pre_id_ = cur.id();
       active_crossing_id_ = route_lanelets_[i + 1];
+      active_crossing_route_idx_ = i + 1;
       return true;
     }
     // The route window still has ego on the lanelet before the pre while base_link is already
@@ -1487,6 +1520,7 @@ bool RoadCrossingFsmNode::checkArmCondition()
       egoOnPre(route_lanelets_[i + 1])) {
       active_pre_id_ = route_lanelets_[i + 1];
       active_crossing_id_ = route_lanelets_[i + 2];
+      active_crossing_route_idx_ = i + 2;
       return true;
     }
     return not_armed("next route lanelet is not a crossing", cur.id());
@@ -1497,14 +1531,17 @@ bool RoadCrossingFsmNode::checkArmCondition()
 bool RoadCrossingFsmNode::egoOnPre(const lanelet::Id id) const
 {
   if (egoOnLanelet(id)) return true;
-  if (!last_odom_ || !map_initialized_ || base_link_to_front_m_ <= 0.0) return false;
+  if (!last_odom_ || !map_initialized_) return false;
+  // The leading bumper: front in forward gear, rear in reverse gear.
+  if (
+    direction::leadingEdgeOffset(base_link_to_front_m_, base_link_to_rear_m_, is_driving_forward_) <=
+    0.0) {
+    return false;
+  }
   try {
-    const auto & pose = last_odom_->pose.pose;
-    const auto & q = pose.orientation;
-    const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
-    const lanelet::BasicPoint2d front{
-      pose.position.x + base_link_to_front_m_ * std::cos(yaw),
-      pose.position.y + base_link_to_front_m_ * std::sin(yaw)};
+    const auto lead = direction::leadingEdgePoint(
+      egoPoint(), egoYaw(), base_link_to_front_m_, base_link_to_rear_m_, is_driving_forward_);
+    const lanelet::BasicPoint2d front{lead.x, lead.y};
     const auto polygon =
       route_handler_.getLaneletMapPtr()->laneletLayer.get(id).polygon2d().basicPolygon();
     return boost::geometry::covered_by(front, polygon);
@@ -1611,56 +1648,13 @@ bool RoadCrossingFsmNode::crossingHasTag(const std::string & key) const
 double RoadCrossingFsmNode::arcLengthDistanceToLaneletEntry(
   const std::optional<lanelet::Id> & id) const
 {
-  if (!id || !last_odom_) return -1.0;
-  if (!map_initialized_) return -1.0;
-
-  try {
-    const auto llt = route_handler_.getLaneletMapPtr()->laneletLayer.get(*id);
-    const auto centerline_2d = llt.centerline2d();
-    if (centerline_2d.size() < 2) return -1.0;
-
-    const double total_length =
-      static_cast<double>(boost::geometry::length(centerline_2d.basicLineString()));
-
-    const auto & ego_pos = last_odom_->pose.pose.position;
-    const lanelet::BasicPoint2d ego2d{ego_pos.x, ego_pos.y};
-
-    // Ego's arc-length position along the centerline, measured in the
-    // lanelet's own stored orientation (front()=0 .. back()=total_length).
-    // toArcCoordinates() projects onto the nearest segment — no lateral-offset
-    // contamination, unlike Euclidean-to-vertex — but clamps to [0, L] when ego
-    // is outside the lanelet (see the upstream case below).
-    const double ego_arc_s =
-      lanelet::geometry::toArcCoordinates(centerline_2d, ego2d).length;
-
-    // Entry is the endpoint ego actually arrives at first: arc-length 0
-    // (front()) when driving forward, total_length (back()) when reversing
-    // through this lanelet — same direction convention as before.
-    const double entry_arc_s = is_driving_forward_ ? 0.0 : total_length;
-
-    // Return an along-track (never lateral-inflated) gap. abs() keeps the
-    // same "always >= 0, sign-free proximity" contract the Euclidean version
-    // had (callers gate on d in [0, threshold]), so a robot that is already
-    // slightly past the entry still reads as "arrived" instead of silently
-    // failing the d >= 0.0 checks used throughout this file.
-    const double along = std::abs(entry_arc_s - ego_arc_s);
-
-    // toArcCoordinates() does NOT extrapolate: a point before the start of the
-    // centerline gets length 0 (and one beyond the end gets total_length). So an
-    // ego still upstream of the entry — however far — projects exactly onto the
-    // entry and would read 0 m, i.e. "arrived", letting the FSM run its whole
-    // episode (light wait, GO) while the robot is still driving there.  When ego
-    // projects onto the entry point itself, the along-track gap carries no
-    // information; use the straight-line distance to the entry instead.
-    if (along < 1e-3) {
-      const auto & entry_pt =
-        is_driving_forward_ ? centerline_2d.front() : centerline_2d.back();
-      return std::hypot(ego2d.x() - entry_pt.x(), ego2d.y() - entry_pt.y());
-    }
-    return along;
-  } catch (const lanelet::NoSuchPrimitiveError &) {
-    return -1.0;
-  }
+  // Along-track gap from base_link to the lanelet's entry, >= 0 (a robot slightly past the entry
+  // still reads as arrived), -1 if unknown.  The entry is front() of the routed centerline --
+  // the end ego reaches first in both gears -- see direction::distanceToEntry().
+  if (!id || !last_odom_ || !map_initialized_) return -1.0;
+  const auto line = routedCenterline(*id);
+  if (!line) return -1.0;
+  return direction::distanceToEntry(*line, egoPoint());
 }
 
 double RoadCrossingFsmNode::distanceToCrossingEntry() const
@@ -1676,68 +1670,96 @@ double RoadCrossingFsmNode::distanceToPreEntry() const
 bool RoadCrossingFsmNode::egoUpstreamOf(const lanelet::Id id, const double margin) const
 {
   if (!last_odom_ || !map_initialized_) return false;
-  try {
-    const auto centerline = route_handler_.getLaneletMapPtr()->laneletLayer.get(id).centerline2d();
-    if (centerline.size() < 2) return false;
-    const double total_length =
-      static_cast<double>(boost::geometry::length(centerline.basicLineString()));
-    const lanelet::BasicPoint2d ego2d{
-      last_odom_->pose.pose.position.x, last_odom_->pose.pose.position.y};
-    const double ego_arc_s = lanelet::geometry::toArcCoordinates(centerline, ego2d).length;
-    // Upstream = ego projects onto the entry end itself (toArcCoordinates clamps points
-    // before the lanelet there) and is more than `margin` away from it.
-    const bool at_entry_end =
-      is_driving_forward_ ? ego_arc_s < 1e-3 : ego_arc_s > total_length - 1e-3;
-    if (!at_entry_end) return false;
-    const auto & entry_pt = is_driving_forward_ ? centerline.front() : centerline.back();
-    return std::hypot(ego2d.x() - entry_pt.x(), ego2d.y() - entry_pt.y()) > margin;
-  } catch (const lanelet::NoSuchPrimitiveError &) {
-    return false;
-  }
+  const auto line = routedCenterline(id);
+  return line && direction::upstreamOfEntry(*line, egoPoint(), margin);
 }
 
 std::optional<lanelet::Id> RoadCrossingFsmNode::nextPreAfterCrossing() const
 {
+  // The lanelet after the active crossing counts as the next pre only when another crossing
+  // follows it (two crossings back to back, e.g. 44 -> 81 -> 58).  A crossing tagged for both
+  // directions has a pre_road_crossing on each side; the one ego drives onto after crossing
+  // belongs to the other direction and must not end the episode early.
   if (!active_crossing_id_) return std::nullopt;
-  for (size_t i = 0; i + 1 < route_lanelets_.size(); ++i) {
-    if (route_lanelets_[i] != *active_crossing_id_) continue;
-    try {
-      const auto next = route_handler_.getLaneletMapPtr()->laneletLayer.get(route_lanelets_[i + 1]);
-      if (next.attributeOr("pre_road_crossing", std::string("false")) == "true") {
-        return next.id();
+  std::optional<size_t> idx;
+  if (
+    active_crossing_route_idx_ && *active_crossing_route_idx_ < route_lanelets_.size() &&
+    route_lanelets_[*active_crossing_route_idx_] == *active_crossing_id_) {
+    idx = active_crossing_route_idx_;
+  } else {
+    for (size_t i = 0; i < route_lanelets_.size(); ++i) {
+      if (route_lanelets_[i] == *active_crossing_id_) {
+        idx = i;
+        break;
       }
-    } catch (const lanelet::NoSuchPrimitiveError &) {
     }
-    return std::nullopt;
+  }
+  if (!idx || *idx + 2 >= route_lanelets_.size()) return std::nullopt;
+  try {
+    const auto & layer = route_handler_.getLaneletMapPtr()->laneletLayer;
+    const auto next = layer.get(route_lanelets_[*idx + 1]);
+    const auto after = layer.get(route_lanelets_[*idx + 2]);
+    if (
+      next.attributeOr("pre_road_crossing", std::string("false")) == "true" &&
+      after.attributeOr("road_crossing", std::string("false")) == "true") {
+      return next.id();
+    }
+  } catch (const lanelet::NoSuchPrimitiveError &) {
   }
   return std::nullopt;
 }
 
 bool RoadCrossingFsmNode::egoPastCrossingExit() const
 {
-  if (!active_crossing_id_ || !last_odom_) return false;
-  if (!map_initialized_) return false;
+  if (!active_crossing_id_ || !last_odom_ || !map_initialized_) return false;
+  const auto line = routedCenterline(*active_crossing_id_);
+  return line && direction::pastExit(*line, egoPoint());
+}
 
+std::optional<direction::Polyline> RoadCrossingFsmNode::routedCenterline(const lanelet::Id id) const
+{
+  if (!map_initialized_ || !route_handler_.getLaneletMapPtr()) return std::nullopt;
   try {
-    const auto llt =
-      route_handler_.getLaneletMapPtr()->laneletLayer.get(*active_crossing_id_);
-    const auto cl = llt.centerline2d().basicLineString();
-    if (cl.size() < 2) return false;
-
-    const auto & ego_pos = last_odom_->pose.pose.position;
-    // Entry/exit swap with travel direction — see distanceToCrossingEntry().
-    const auto & entry = is_driving_forward_ ? cl.front() : cl.back();
-    const auto & exit = is_driving_forward_ ? cl.back() : cl.front();
-
-    // Project (ego - exit) onto (entry → exit).
-    const double cdx = exit.x() - entry.x();
-    const double cdy = exit.y() - entry.y();
-    const double proj =
-      (ego_pos.x - exit.x()) * cdx + (ego_pos.y - exit.y()) * cdy;
-    return proj > 0.0;
-  } catch (const lanelet::NoSuchPrimitiveError &) {
-    return false;
+    if (!route_handler_.getLaneletMapPtr()->laneletLayer.exists(id)) return std::nullopt;
+    // getLaneletsFromId() re-applies the route's orientation (inverted where the route takes
+    // the lanelet against its drawing direction).
+    const auto llt = route_handler_.getLaneletsFromId(id);
+    direction::Polyline line;
+    for (const auto & p : llt.centerline2d()) line.push_back({p.x(), p.y()});
+    if (line.size() < 2) return std::nullopt;
+    return line;
+  } catch (const std::exception &) {
+    return std::nullopt;
   }
+}
+
+direction::Point2 RoadCrossingFsmNode::egoPoint() const
+{
+  if (!last_odom_) return {};
+  return {last_odom_->pose.pose.position.x, last_odom_->pose.pose.position.y};
+}
+
+double RoadCrossingFsmNode::egoYaw() const
+{
+  if (!last_odom_) return 0.0;
+  const auto & q = last_odom_->pose.pose.orientation;
+  return std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+}
+
+std::optional<bool> RoadCrossingFsmNode::egoTravelsInRouteOrder() const
+{
+  if (!last_odom_) return std::nullopt;
+  // Only while actually moving: standing still there is no direction of motion to compare.
+  if (std::abs(last_odom_->twist.twist.linear.x) <= kDrivingDirectionDeadbandMps) {
+    return std::nullopt;
+  }
+  lanelet::ConstLanelet cur;
+  if (!egoRouteLanelet(&cur)) return std::nullopt;
+  const auto line = routedCenterline(cur.id());
+  if (!line) return std::nullopt;
+  const auto tangent = direction::tangentYawAt(*line, egoPoint());
+  if (!tangent) return std::nullopt;
+  return direction::travelsInRouteOrder(egoYaw(), is_driving_forward_, *tangent);
 }
 
 bool RoadCrossingFsmNode::egoLeftPreLanelet() const
@@ -1958,23 +1980,10 @@ void RoadCrossingFsmNode::setDetectorEnabled(
 
 void RoadCrossingFsmNode::reZeroAimerDirectionAware()
 {
-  if (is_driving_forward_) {
-    // Forward: unchanged behavior — disable triggers the aimer's own
-    // zero_on_disable ramp back to rotary angle 0 (nose), which is correct
-    // since the nose leads while driving forward.
-    setDetectorEnabled(cli_rotary_aimer_, false, "rotary_aimer");
-    return;
-  }
-
-  // Reversing: do NOT disable. See header comment on this function — the
-  // aimer's hardcoded "re-zero to nose" would point the turret away from the
-  // direction of travel while reversing. Leaving it enabled keeps it running
-  // its own TF/pose-based tf_pedestrian light search, which is direction-
-  // correct by construction (unlike the fixed-zero fallback).
-  RCLCPP_INFO(
-    get_logger(),
-    "reZeroAimerDirectionAware: ego reversing — skipping aimer disable/nose-zero, "
-    "leaving aimer enabled to keep tracking via TF/pose-based light search");
+  // Disabling starts the aimer's ramp back to rotary angle 0 -- the body's default in both
+  // gears (the rear camera faces the travel direction while reversing).  It used to stay
+  // enabled while reversing, which left the body turned after a reverse crossing.
+  setDetectorEnabled(cli_rotary_aimer_, false, "rotary_aimer");
 }
 
 bool RoadCrossingFsmNode::bodyAtFrontBeforeGo(const rclcpp::Time & now)
@@ -2433,15 +2442,15 @@ void RoadCrossingFsmNode::publishTargetLight()
   pub_target_light_->publish(msg);
 }
 
-std::vector<int64_t> RoadCrossingFsmNode::pairedLights(
-  const lanelet::Id crossing_id, const bool forward) const
+std::vector<direction::TaggedLight> RoadCrossingFsmNode::taggedLights(
+  const lanelet::Id crossing_id, const char * key) const
 {
-  const std::string key = forward ? "forward_pedestrian_tf" : "reverse_pedestrian_tf";
-  std::vector<int64_t> ids;
+  std::vector<direction::TaggedLight> lights;
   try {
     const auto map = route_handler_.getLaneletMapPtr();
+    if (!map || !map->laneletLayer.exists(crossing_id)) return lights;
     const std::string value =
-      map->laneletLayer.get(crossing_id).attributeOr(key.c_str(), std::string(""));
+      map->laneletLayer.get(crossing_id).attributeOr(key, std::string(""));
     std::stringstream ss(value);
     std::string token;
     while (std::getline(ss, token, ',')) {
@@ -2454,23 +2463,86 @@ std::vector<int64_t> RoadCrossingFsmNode::pairedLights(
       } catch (const std::exception &) {
         RCLCPP_WARN(
           get_logger(), "crossing %ld: %s has a non-numeric entry '%s' — ignored",
-          static_cast<long>(crossing_id), key.c_str(), token.c_str());
+          static_cast<long>(crossing_id), key, token.c_str());
         continue;
       }
+      direction::TaggedLight light{id, std::nullopt};
       // Catch map typos early: the id must be a tf_pedestrian way.
-      const bool is_light =
+      if (
         map->lineStringLayer.exists(id) &&
-        map->lineStringLayer.get(id).attributeOr("tf_pedestrian", std::string("")) == "true";
-      if (!is_light) {
+        map->lineStringLayer.get(id).attributeOr("tf_pedestrian", std::string("")) == "true") {
+        const auto ls = map->lineStringLayer.get(id);
+        if (!ls.empty()) {
+          double x = 0.0;
+          double y = 0.0;
+          for (const auto & p : ls) {
+            x += p.x();
+            y += p.y();
+          }
+          light.position = direction::Point2{x / ls.size(), y / ls.size()};
+        }
+      } else {
         RCLCPP_WARN(
           get_logger(), "crossing %ld: %s=%ld is not a tf_pedestrian way in the map",
-          static_cast<long>(crossing_id), key.c_str(), static_cast<long>(id));
+          static_cast<long>(crossing_id), key, static_cast<long>(id));
       }
-      ids.push_back(id);
+      lights.push_back(light);
     }
-  } catch (const lanelet::NoSuchPrimitiveError &) {
+  } catch (const std::exception &) {
   }
-  return ids;
+  return lights;
+}
+
+void RoadCrossingFsmNode::selectEpisodeLights()
+{
+  active_light_ids_.clear();
+  if (!active_crossing_id_) return;
+  bool inverted = false;
+  try {
+    inverted = route_handler_.isLaneletInvertedInRoute(
+      route_handler_.getLaneletMapPtr()->laneletLayer.get(*active_crossing_id_));
+  } catch (const std::exception &) {
+  }
+  const char * key = direction::lightTagKey(inverted);
+  const char * other_key = direction::lightTagKey(!inverted);
+  const auto tagged = taggedLights(*active_crossing_id_, key);
+  const auto other = taggedLights(*active_crossing_id_, other_key);
+  const auto line = routedCenterline(*active_crossing_id_);
+  const auto sel = direction::selectLights(line ? *line : direction::Polyline{}, tagged, other);
+  active_light_ids_ = sel.ids;
+  active_light_direction_ = inverted
+                              ? autoware_road_crossing_msgs::msg::PedestrianLightTarget::REVERSE
+                              : autoware_road_crossing_msgs::msg::PedestrianLightTarget::FORWARD;
+  const char * how = "";
+  switch (sel.choice) {
+    case direction::LightChoice::FROM_TAG:
+      how = key;
+      break;
+    case direction::LightChoice::FROM_OTHER_TAG:
+      how = other_key;
+      RCLCPP_WARN(
+        get_logger(),
+        "crossing %ld: %s kosong — pakai %s (lampu di kedua ujung crossing satu fase); tambahkan "
+        "%s di peta",
+        static_cast<long>(*active_crossing_id_), key, other_key, key);
+      break;
+    case direction::LightChoice::SWAPPED_TAGS:
+      how = other_key;
+      RCLCPP_WARN(
+        get_logger(),
+        "crossing %ld: lampu %s ada di sisi robot dan lampu %s di seberang — tag peta tertukar? "
+        "pakai lampu seberang",
+        static_cast<long>(*active_crossing_id_), key, other_key);
+      break;
+    case direction::LightChoice::NONE:
+      how = "none";
+      break;
+  }
+  RCLCPP_INFO(
+    get_logger(), "IDLE: crossing %ld (%s, gear %s) light(s) from %s: %s",
+    static_cast<long>(*active_crossing_id_), inverted ? "against its drawing" : "along its drawing",
+    is_driving_forward_ ? "forward" : "reverse", how,
+    active_light_ids_.empty() ? "none (unsignalized, no light wait)" : lightIdsText().c_str());
 }
 
 void RoadCrossingFsmNode::publishFsmState()
@@ -2623,6 +2695,9 @@ void RoadCrossingFsmNode::resetEpisode()
   crossing_timeout_start_.reset();  // reset CROSSING safety-timeout watchdog (#1)
   interlock_ = LightInterlock{};  // penyeberangan baru: semua counter & status dari nol
   active_light_ids_.clear();
+  active_light_direction_ = autoware_road_crossing_msgs::msg::PedestrianLightTarget::FORWARD;
+  active_crossing_route_idx_.reset();
+  against_route_since_.reset();
   road_cross_is_green_ = false;  // reset green-cross flag for next episode
   cancelRezeroBeforeGo();
   clearGreenLatch();
