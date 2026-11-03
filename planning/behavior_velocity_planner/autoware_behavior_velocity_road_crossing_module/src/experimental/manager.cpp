@@ -72,6 +72,7 @@ RoadCrossingModuleManager::RoadCrossingModuleManager(rclcpp::Node & node)
   // GREEN-cross bounded timeout: max seconds to wait while GO_GREEN + predicted-path blocked.
   p.green_block_timeout_sec =
     get_or_declare_parameter<double>(node, ns + ".green_block_timeout_sec");
+  p.enable_vehicle_scan = get_or_declare_parameter<bool>(node, ns + ".enable_vehicle_scan");
 
   p.gate_stale_sec = get_or_declare_parameter<double>(node, ns + ".gate_stale_sec");
 

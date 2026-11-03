@@ -102,6 +102,9 @@ public:
     // Plain GO (bypass/timeout/unsignalized) TIDAK menggunakan timeout ini — tetap pakai
     // sustained-clear normal.
     double green_block_timeout_sec{5.0};
+    // false: no predicted-path vehicle scan of this module (isPredictedBlocked() is always
+    // clear); obstacles are left to obstacle_stop and the other motion planners.
+    bool enable_vehicle_scan{false};
 
     // A gate command older than this counts as HOLD.  The FSM republishes the gate of the
     // crossing it is handling every tick, so a stale one is left over from an earlier

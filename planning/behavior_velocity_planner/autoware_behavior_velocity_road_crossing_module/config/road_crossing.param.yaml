@@ -55,6 +55,10 @@
       # [ROAD, hijau] tunggu maksimal N detik kalau predicted-path kendaraan nge-block sebelum nyebrang anyway;
       # 0.0 = langsung nyebrang pas hijau; besar = nunggu kendaraan clear lebih lama.
       green_block_timeout_sec: 2.0
+      # false (2026-11-03): no predicted-path vehicle scan in this module -- GO / GO_GREEN cross
+      # without waiting for predicted vehicle paths; obstacles are left to obstacle_stop and the
+      # other motion planners.  true = the old scan (block_on_*, predict_horizon_sec, ...).
+      enable_vehicle_scan: false
       # Tidak ada watchdog yang memaksa CROSSING selama gate HOLD: lampu merah bisa ~60 s.
       # Gate lebih tua dari ini = HOLD. FSM publish gate crossing aktif tiap tick (10 Hz);
       # gate lama dari episode sebelumnya (atau FSM mati) tidak boleh melepas robot.

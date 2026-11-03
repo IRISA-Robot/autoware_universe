@@ -217,6 +217,7 @@ double RoadCrossingModule::computeHorizon(const lanelet::ConstLanelet & crossing
 bool RoadCrossingModule::isPredictedBlocked(
   const lanelet::ConstLanelet & crossing, const PlannerData & planner_data) const
 {
+  if (!planner_param_.enable_vehicle_scan) return false;
   if (!planner_data.predicted_objects) return false;
 
   const auto polygon = crossing.polygon2d().basicPolygon();
@@ -781,6 +782,12 @@ bool RoadCrossingModule::modifyPathVelocity(
           logger_,
           "RoadCrossing %ld [ROAD]: GREEN + clear before the stop line → CROSSING without "
           "stopping",
+          getModuleId());
+      } else {
+        RCLCPP_INFO_THROTTLE(
+          logger_, *clock_, 1000,
+          "RoadCrossing %ld [ROAD]: GREEN but vehicle predicted-block before the stop line — "
+          "keeps the stop at the line",
           getModuleId());
       }
     } else if (
