@@ -80,14 +80,31 @@ RoadCrossingModuleManager::RoadCrossingModuleManager(rclcpp::Node & node)
   // them corrupts the executor wait_set (SIGABRT).  The manager lives for the full
   // node lifetime so its subscription is safe.
   if (p.require_fsm_gate) {
+    gate_callback_group_ =
+      node.create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, true);
+    rclcpp::SubscriptionOptions options;
+    options.callback_group = gate_callback_group_;
     sub_gate_ = node.create_subscription<autoware_road_crossing_msgs::msg::RoadCrossingGate>(
       // Depth 10: the FSM publishes the PRE and the ROAD gate back to back every tick;
       // depth 1 lets the second overwrite the first before it is taken.
       p.gate_topic, rclcpp::QoS(10),
       [this](const autoware_road_crossing_msgs::msg::RoadCrossingGate::SharedPtr msg) {
+        const auto now = clock_->now();
         std::lock_guard<std::mutex> lk(gate_mutex_);
-        gate_commands_[static_cast<lanelet::Id>(msg->lanelet_id)] = {msg->command, clock_->now()};
-      });
+        auto & gate = gate_commands_[static_cast<lanelet::Id>(msg->lanelet_id)];
+        // The FSM sends the gate of its crossing every tick: a gap above gate_stale_sec
+        // (but not a new episode much later) means the gate was not delivered in time.
+        if (gate.received.nanoseconds() > 0) {
+          const double gap = (now - gate.received).seconds();
+          if (gap > planner_param_.gate_stale_sec && gap < 10.0) {
+            RCLCPP_WARN(
+              logger_, "RoadCrossing %ld: FSM gate arrived after a %.2f s gap (> %.2f s)",
+              static_cast<long>(msg->lanelet_id), gap, planner_param_.gate_stale_sec);
+          }
+        }
+        gate = {msg->command, now};
+      },
+      options);
     RCLCPP_INFO(
       logger_,
       "[RoadCrossingModuleManager] FSM gate enabled — subscribed to '%s'",

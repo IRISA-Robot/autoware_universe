@@ -45,6 +45,10 @@ private:
   // lifetime of the node — never destroyed while modules are created/destroyed.
   // This avoids the wait_set SIGABRT triggered by per-module subscriptions.
   rclcpp::Subscription<autoware_road_crossing_msgs::msg::RoadCrossingGate>::SharedPtr sub_gate_;
+  // Own callback group: in the node's default (mutually exclusive) group the gate callback
+  // queues behind the planning trigger, and a planning cycle that keeps finding a new path
+  // waiting starved it for seconds -- the gate went stale (= HOLD) while the FSM sent GO.
+  rclcpp::CallbackGroup::SharedPtr gate_callback_group_;
 
   // Map: lanelet_id → latest gate command and when it arrived.  Written by sub_gate_
   // callback; read in modifyPathVelocity() before iterating modules, where a command older
