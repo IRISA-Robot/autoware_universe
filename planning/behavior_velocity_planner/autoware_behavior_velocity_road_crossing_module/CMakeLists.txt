@@ -16,6 +16,9 @@ if(BUILD_TESTING)
   ament_add_ros_isolated_gtest(test_${PROJECT_NAME}_stop_zone
     test/test_stop_zone.cpp
   )
+  ament_add_ros_isolated_gtest(test_${PROJECT_NAME}_direction
+    test/test_direction.cpp
+  )
 endif()
 
 ament_auto_package(INSTALL_TO_SHARE config)

@@ -182,6 +182,18 @@ private:
   /** Get the road_crossing lanelet from the map by module_id_. Returns empty optional if missing. */
   std::optional<lanelet::ConstLanelet> getCrossingLanelet(const PlannerData & planner_data) const;
 
+  // Gear from the planned velocity (direction.hpp), updated every cycle in
+  // modifyPathVelocity(); kept while the path is all zero (held at a stop).
+  bool gear_forward_{true};
+  bool gear_known_{false};
+  void updateGear(const Trajectory & path, const PlannerData & planner_data);
+  double leadingEdge(const PlannerData & planner_data) const;
+
+  // Entry / exit of the crossing in travel order: front() / back() of its centerline in the
+  // route's orientation, whatever the gear.  nullopt if the centerline is degenerate.
+  std::optional<std::pair<lanelet::BasicPoint2d, lanelet::BasicPoint2d>> crossingEntryExit(
+    const lanelet::ConstLanelet & crossing, const PlannerData & planner_data) const;
+
   /** Compute the dynamic prediction horizon based on crossing length. */
   double computeHorizon(const lanelet::ConstLanelet & crossing) const;
 
