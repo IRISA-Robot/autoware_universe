@@ -119,7 +119,7 @@
     # lampu pejalan kaki tidak sejajar ("mbleset"). Hanya aktif di roi_source=map.
     # Sekarang AMAN di-nyalakan karena dibatasi oleh debug_rate_hz (lihat bawah).
     # Set false untuk benar-benar mematikan overhead di produksi.
-    debug_all_cameras: true
+    debug_all_cameras: false
 
     # debug_rate_hz: frekuensi timer lambat khusus debug_all_cameras (Hz).
     # Decode cv_bridge + draw + publish semua kamera dilakukan di timer ini,
@@ -155,7 +155,7 @@
     # aimer memutar body supaya kamera dengan error terkecil menghadap lampu -- samakan
     # `cameras` di rotary_aimer.param.yaml dengan daftar ini.
     # Hanya kamera depan: ["front"]
-    cameras: ["front", "left", "rear", "right"]
+    cameras: ["front", "right", "left"]   # 2026-11-03: kamera belakang tidak dipakai
 
     # roi_margin_px: margin piksel yang ditambahkan ke setiap sisi bbox proyeksi
     # (padded bbox untuk crop ke classifier). Naikkan jika lampu terpotong.
