@@ -189,10 +189,15 @@ private:
   void updateGear(const Trajectory & path, const PlannerData & planner_data);
   double leadingEdge(const PlannerData & planner_data) const;
 
-  // Entry / exit of the crossing in travel order: front() / back() of its centerline in the
-  // route's orientation, whatever the gear.  nullopt if the centerline is degenerate.
+  // Whether the current path takes the crossing against its drawing direction (path point order
+  // near the crossing), updated with the gear in modifyPathVelocity(); kept while unknown.
+  bool travel_against_drawing_{false};
+  void updateTravelDirection(const Trajectory & path, const lanelet::ConstLanelet & crossing);
+
+  // Entry / exit of the crossing in travel order (see travel_against_drawing_).  nullopt if the
+  // centerline is degenerate.
   std::optional<std::pair<lanelet::BasicPoint2d, lanelet::BasicPoint2d>> crossingEntryExit(
-    const lanelet::ConstLanelet & crossing, const PlannerData & planner_data) const;
+    const lanelet::ConstLanelet & crossing) const;
 
   /** Compute the dynamic prediction horizon based on crossing length. */
   double computeHorizon(const lanelet::ConstLanelet & crossing) const;

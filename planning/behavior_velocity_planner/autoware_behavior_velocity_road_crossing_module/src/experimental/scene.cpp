@@ -163,25 +163,44 @@ double RoadCrossingModule::leadingEdge(const PlannerData & planner_data) const
     planner_data.vehicle_info_.min_longitudinal_offset_m, gear_forward_);
 }
 
-std::optional<std::pair<lanelet::BasicPoint2d, lanelet::BasicPoint2d>>
-RoadCrossingModule::crossingEntryExit(
-  const lanelet::ConstLanelet & crossing, const PlannerData & planner_data) const
+void RoadCrossingModule::updateTravelDirection(
+  const Trajectory & path, const lanelet::ConstLanelet & crossing)
 {
-  lanelet::ConstLanelet routed = crossing;
-  if (planner_data.route_handler_) {
-    try {
-      // The route's orientation: inverted where the route takes the crossing against its
-      // drawing direction.
-      routed = planner_data.route_handler_->getLaneletsFromId(crossing.id());
-    } catch (const std::exception &) {
-      routed = crossing;
+  const auto centerline = crossing.centerline2d();
+  if (centerline.size() < 2) return;
+  const auto points = path.restore();
+  if (points.size() < 2) return;
+  // Path segment nearest to the crossing's middle: the path's travel vector there.
+  const auto & f = centerline.front();
+  const auto & bk = centerline.back();
+  const double mx = 0.5 * (f.x() + bk.x());
+  const double my = 0.5 * (f.y() + bk.y());
+  size_t nearest = 0;
+  double best = std::numeric_limits<double>::max();
+  for (size_t i = 0; i < points.size(); ++i) {
+    const auto & p = points[i].point.pose.position;
+    const double d2 = (p.x - mx) * (p.x - mx) + (p.y - my) * (p.y - my);
+    if (d2 < best) {
+      best = d2;
+      nearest = i;
     }
   }
-  const auto centerline = routed.centerline2d();
+  const size_t i0 = nearest + 1 < points.size() ? nearest : nearest - 1;
+  const auto & a = points[i0].point.pose.position;
+  const auto & b = points[i0 + 1].point.pose.position;
+  if (std::hypot(b.x - a.x, b.y - a.y) < 1e-6) return;
+  travel_against_drawing_ =
+    road_crossing::travelAgainstDrawing(f.x(), f.y(), bk.x(), bk.y(), a.x, a.y, b.x, b.y);
+}
+
+std::optional<std::pair<lanelet::BasicPoint2d, lanelet::BasicPoint2d>>
+RoadCrossingModule::crossingEntryExit(const lanelet::ConstLanelet & crossing) const
+{
+  const auto centerline = crossing.centerline2d();
   if (centerline.size() < 2) return std::nullopt;
-  const lanelet::BasicPoint2d entry{centerline.front().x(), centerline.front().y()};
-  const lanelet::BasicPoint2d exit{centerline.back().x(), centerline.back().y()};
-  return std::make_pair(entry, exit);
+  const lanelet::BasicPoint2d first{centerline.front().x(), centerline.front().y()};
+  const lanelet::BasicPoint2d last{centerline.back().x(), centerline.back().y()};
+  return travel_against_drawing_ ? std::make_pair(last, first) : std::make_pair(first, last);
 }
 
 double RoadCrossingModule::computeHorizon(const lanelet::ConstLanelet & crossing) const
@@ -351,8 +370,8 @@ void RoadCrossingModule::updateState(
           // If not, ego is past → DONE. Otherwise path hasn't reached yet → wait.
           // We approximate this by checking the centroid: project ego onto
           // lanelet centerline; if arc length > centerline length, past.
-          // Entry / exit in travel order (route orientation), see crossingEntryExit().
-          if (const auto ends = crossingEntryExit(crossing, planner_data)) {
+          // Entry / exit in travel order (path point order), see crossingEntryExit().
+          if (const auto ends = crossingEntryExit(crossing)) {
             const auto & [entry_pt, exit_pt] = *ends;
             if (road_crossing::pastExit(
                   entry_pt.x(), entry_pt.y(), exit_pt.x(), exit_pt.y(), ego_pos.x, ego_pos.y)) {
@@ -549,8 +568,8 @@ void RoadCrossingModule::updateState(
       }
 
       bool past_exit = false;
-      // Entry / exit in travel order (route orientation), see crossingEntryExit().
-      if (const auto ends = crossingEntryExit(crossing, planner_data)) {
+      // Entry / exit in travel order (path point order), see crossingEntryExit().
+      if (const auto ends = crossingEntryExit(crossing)) {
         const auto & [entry, exit] = *ends;
         past_exit =
           road_crossing::pastExit(entry.x(), entry.y(), exit.x(), exit.y(), ego_pos.x, ego_pos.y);
@@ -648,6 +667,7 @@ bool RoadCrossingModule::modifyPathVelocity(
     return true;
   }
   const auto & crossing = *crossing_opt;
+  updateTravelDirection(path, crossing);
 
   // Geometry: ego s + stop point s on path.
   std::optional<double> entry_s;

@@ -89,3 +89,20 @@ TEST(StopZoneParity, SameBumperPositionGivesTheSameStop)
     }
   }
 }
+
+TEST(TravelDirection, FromThePathPointOrderNotTheGear)
+{
+  // Crossing drawn (0,0) -> (10,0).  Path through it along the drawing and against it; the
+  // answer must not depend on anything but the path's point order (both gears).
+  EXPECT_FALSE(rc::travelAgainstDrawing(0, 0, 10, 0, 4.0, 0.1, 4.5, 0.1));
+  EXPECT_TRUE(rc::travelAgainstDrawing(0, 0, 10, 0, 4.5, 0.1, 4.0, 0.1));
+  // a curved approach, up to ~80 deg off the crossing, keeps the sign
+  EXPECT_FALSE(rc::travelAgainstDrawing(0, 0, 10, 0, 5.0, -1.0, 5.1, -0.4));
+  EXPECT_TRUE(rc::travelAgainstDrawing(0, 0, 10, 0, 5.1, -0.4, 4.9, -1.0));
+  // mirrored crossing (drawn the other way) gives the opposite answer for the same path
+  for (double x = 1.0; x < 9.0; x += 1.0) {
+    EXPECT_NE(
+      rc::travelAgainstDrawing(0, 0, 10, 0, x, 0.0, x + 0.3, 0.0),
+      rc::travelAgainstDrawing(10, 0, 0, 0, x, 0.0, x + 0.3, 0.0));
+  }
+}
