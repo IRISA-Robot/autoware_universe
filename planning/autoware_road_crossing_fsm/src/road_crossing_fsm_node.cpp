@@ -108,6 +108,15 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
   param_.blink_cycles = declare_parameter<int>("blink_cycles", 2);
   param_.rollback_decel_mps2 = declare_parameter<double>("rollback_decel_mps2", 1.0);
   param_.rollback_margin_m = declare_parameter<double>("rollback_margin_m", 0.3);
+  param_.body_base_frame = declare_parameter<std::string>("body_base_frame", "base_link");
+  param_.body_frame = declare_parameter<std::string>("body_frame", "body_link");
+  param_.body_moving_rate_deg_s = declare_parameter<double>("body_moving_rate_deg_s", 2.0);
+  param_.body_settle_sec = declare_parameter<double>("body_settle_sec", 1.0);
+  param_.latch_red_max_roi_offset = declare_parameter<double>("latch_red_max_roi_offset", 0.4);
+  param_.latch_red_min_sec = declare_parameter<double>("latch_red_min_sec", 1.0);
+  param_.red_to_green_min_red_sec = declare_parameter<double>("red_to_green_min_red_sec", 2.0);
+  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
+  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
   param_.aim_only_if_light_unseen = declare_parameter<bool>("aim_only_if_light_unseen", true);
   param_.aim_unseen_grace_sec = declare_parameter<double>("aim_unseen_grace_sec", 2.0);
   param_.aim_max_roi_offset = declare_parameter<double>("aim_max_roi_offset", 0.4);
@@ -532,6 +541,7 @@ void RoadCrossingFsmNode::onTimer()
   updateDrivingDirection();
 
   const rclcpp::Time now = this->now();
+  updateBodyMotion(now);
 
   // Relocalized (2D Pose Estimate / localization jump): ego is somewhere else entirely, so
   // the episode (and the re-arm suppression) refer to a crossing that may no longer be the
@@ -1987,7 +1997,9 @@ bool RoadCrossingFsmNode::bodyAtFrontBeforeGo(const rclcpp::Time & now)
     std::abs(*last_aim_cmd_value_) <= param_.rezero_before_go_tol_deg * M_PI / 180.0;
   if (at_zero) {
     if (!rezero_at_zero_since_) rezero_at_zero_since_ = now;
-    if ((now - *rezero_at_zero_since_).seconds() >= param_.rezero_before_go_settle_sec) {
+    if (
+      (now - *rezero_at_zero_since_).seconds() >= param_.rezero_before_go_settle_sec &&
+      !bodyUnsettled(now)) {
       RCLCPP_INFO(
         get_logger(), "WAIT_GREEN: body sudah menghadap depan (%.1f s) — boleh jalan",
         (now - *rezero_before_go_since_).seconds());
@@ -2022,8 +2034,17 @@ void RoadCrossingFsmNode::armGreenLatch(const rclcpp::Time & now)
 {
   if (param_.green_latch_sec <= 0.0) return;
   green_latch_since_ = now;
-  green_latch_from_red_ = interlock_.red_to_green && param_.green_latch_red_to_green_sec > 0.0;
+  const double red_sec = interlock_.red_ticks_before_green / param_.update_rate_hz;
+  green_latch_from_red_ = interlock_.red_to_green && param_.green_latch_red_to_green_sec > 0.0 &&
+                          red_sec >= param_.red_to_green_min_red_sec;
   blink_ = BlinkTracker{};
+  if (interlock_.red_to_green && !green_latch_from_red_) {
+    RCLCPP_WARN(
+      get_logger(),
+      "latch hijau: merah sebelum hijau hanya %.1f s (< %.1f s) — bukan awal fase hijau yang "
+      "pasti, pakai latch biasa",
+      red_sec, param_.red_to_green_min_red_sec);
+  }
   if (green_latch_from_red_) {
     RCLCPP_INFO(
       get_logger(),
@@ -2042,13 +2063,59 @@ void RoadCrossingFsmNode::armGreenLatch(const rclcpp::Time & now)
 bool RoadCrossingFsmNode::greenLatched(const rclcpp::Time & now)
 {
   if (!green_latch_since_) return false;
-  if (interlock_.status_now == LightStatus::MERAH) {
-    RCLCPP_WARN(get_logger(), "latch hijau OFF: merah terlihat");
-    clearGreenLatch();
-    return false;
+  const double age = (now - *green_latch_since_).seconds();
+  const bool red = interlock_.status_now == LightStatus::MERAH;
+  if (!red) {
+    red_since_.reset();
+  } else if (!red_since_) {
+    red_since_ = now;
+  }
+
+  // Body turning (or just stopped): what the camera sees now is not the light -- nothing
+  // clears the latch, and the blink pattern starts over afterwards.
+  if (bodyUnsettled(now)) {
+    blink_ = BlinkTracker{};
+    if (red) {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "latch hijau tetap: merah terlihat saat body berputar / belum settle — diabaikan");
+    }
+    if (age > param_.green_latch_sec) {
+      RCLCPP_INFO(get_logger(), "latch hijau OFF: habis (%.1f s)", age);
+      clearGreenLatch();
+      return false;
+    }
+    return true;
+  }
+
+  if (red) {
+    bool cancel = true;
+    if (green_latch_from_red_ && age <= param_.green_latch_red_to_green_sec) {
+      // Start of the green phase: only a red from a good view, held a while, is real.
+      const bool offset_fresh =
+        last_roi_offset_time_ &&
+        (now - *last_roi_offset_time_).seconds() <= param_.aim_roi_offset_timeout_sec;
+      const bool good_view =
+        !offset_fresh || std::abs(last_roi_offset_) <= param_.latch_red_max_roi_offset;
+      const double red_for = (now - *red_since_).seconds();
+      cancel = good_view && red_for >= param_.latch_red_min_sec;
+      if (!cancel) {
+        RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "latch hijau (merah -> hijau) tetap: merah %.1f s, offset ROI %s — butuh merah >= "
+          "%.1f s dengan |offset| <= %.2f",
+          red_for, offset_fresh ? std::to_string(last_roi_offset_).c_str() : "n/a",
+          param_.latch_red_min_sec, param_.latch_red_max_roi_offset);
+      }
+    }
+    if (cancel) {
+      RCLCPP_WARN(get_logger(), "latch hijau OFF: merah terlihat");
+      clearGreenLatch();
+      return false;
+    }
+    return true;
   }
   const bool blinking = updateBlink(now);
-  const double age = (now - *green_latch_since_).seconds();
   if (green_latch_from_red_) {
     // Start of the green phase: no blink possible yet, a dropout is the detector.
     if (age <= param_.green_latch_red_to_green_sec) return true;
@@ -2168,6 +2235,67 @@ void RoadCrossingFsmNode::clearGreenLatch()
   green_latch_since_.reset();
   green_latch_from_red_ = false;
   blink_ = BlinkTracker{};
+  red_since_.reset();
+}
+
+void RoadCrossingFsmNode::updateBodyMotion(const rclcpp::Time & now)
+{
+  const double thr = param_.body_moving_rate_deg_s * M_PI / 180.0;
+  bool moving = false;
+
+  // Commanded motion: the aimer's command is still changing (it leads the encoder).
+  if (last_aim_cmd_value_) {
+    if (body_prev_cmd_ && body_prev_cmd_time_) {
+      const double dt = (now - *body_prev_cmd_time_).seconds();
+      if (dt > 1e-3 && std::abs(*last_aim_cmd_value_ - *body_prev_cmd_) / dt > thr) moving = true;
+    }
+    body_prev_cmd_ = *last_aim_cmd_value_;
+    body_prev_cmd_time_ = now;
+  }
+
+  // Measured motion: yaw of body_frame in body_base_frame (encoder_body TF).
+  try {
+    const auto tf = tf_buffer_->lookupTransform(
+      param_.body_base_frame, param_.body_frame, tf2::TimePointZero);
+    const auto & q = tf.transform.rotation;
+    const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    const rclcpp::Time stamp(tf.header.stamp, now.get_clock_type());
+    if (body_yaw_ && body_yaw_stamp_) {
+      const double dt = (stamp - *body_yaw_stamp_).seconds();
+      if (dt > 1e-3) {
+        double d = yaw - *body_yaw_;
+        d = std::atan2(std::sin(d), std::cos(d));
+        if (std::abs(d) / dt > thr) moving = true;
+        body_yaw_ = yaw;
+        body_yaw_stamp_ = stamp;
+      }
+    } else {
+      body_yaw_ = yaw;
+      body_yaw_stamp_ = stamp;
+    }
+    body_tf_ok_ = true;
+  } catch (const tf2::TransformException & e) {
+    body_tf_ok_ = false;
+    if (!body_tf_missing_logged_) {
+      body_tf_missing_logged_ = true;
+      RCLCPP_WARN(
+        get_logger(), "body TF %s -> %s belum ada (%s) — gerak body hanya dari aim cmd",
+        param_.body_base_frame.c_str(), param_.body_frame.c_str(), e.what());
+    }
+  }
+
+  if (moving) {
+    if (!bodyUnsettled(now)) {
+      RCLCPP_INFO(get_logger(), "body berputar — lampu tidak dipercaya sampai settle %.1f s",
+                  param_.body_settle_sec);
+    }
+    body_last_moving_ = now;
+  }
+}
+
+bool RoadCrossingFsmNode::bodyUnsettled(const rclcpp::Time & now) const
+{
+  return body_last_moving_ && (now - *body_last_moving_).seconds() < param_.body_settle_sec;
 }
 
 // ---------------------------------------------------------------------------
@@ -2441,6 +2569,7 @@ void RoadCrossingFsmNode::updateLightInterlock(const char * where)
   // transisinya terjadi.
   if (il.prev_status == LightStatus::MERAH && il.status_now == LightStatus::HIJAU) {
     il.red_to_green = true;
+    il.red_ticks_before_green = il.counter_merah_detected;
   }
   if (il.status_now != LightStatus::HIJAU) {
     il.red_to_green = false;

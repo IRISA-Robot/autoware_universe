@@ -35,6 +35,8 @@
 #include <geometry_msgs/msg/pose.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 #include <std_msgs/msg/float32.hpp>
 #include <std_srvs/srv/set_bool.hpp>
 
@@ -165,6 +167,21 @@ private:
     // keeps going.
     double rollback_decel_mps2{1.0};
     double rollback_margin_m{0.3};
+    // Body (rotary) motion from TF base_frame -> body_frame (encoder_body).  While the body
+    // turns -- yaw rate or aim command rate above body_moving_rate_deg_s -- and for
+    // body_settle_sec after (late frames from a busy PC), the light seen is not trusted: the
+    // green latch cannot be cleared, and GO after the re-zero waits for the settle.
+    std::string body_base_frame{"base_link"};
+    std::string body_frame{"body_link"};
+    double body_moving_rate_deg_s{2.0};
+    double body_settle_sec{1.0};
+    // Latch from red -> green: a red clears it only when seen from a good view -- ROI centre
+    // within latch_red_max_roi_offset of the image centre -- for latch_red_min_sec.
+    double latch_red_max_roi_offset{0.4};
+    double latch_red_min_sec{1.0};
+    // The red -> green latch needs a red seen this long before the green (a flicker is not the
+    // start of a green phase); a shorter red arms the plain latch instead.
+    double red_to_green_min_red_sec{2.0};
     // true: only turn the body to the light when it is NOT detected from where the body
     // faces now (any camera) for aim_unseen_grace_sec in WAIT_GREEN; a light already seen
     // (red or green) needs no turn -- saves rotary motor work.  Once turned, the aimer stays
@@ -408,6 +425,7 @@ private:
     LightStatus status_now{LightStatus::NONE};
     LightStatus prev_status{LightStatus::NONE};
     bool red_to_green{false};     // Rule 1, latched while green stays continuous
+    uint16_t red_ticks_before_green{0};  // red detections before the last red -> green
     bool allows_crossing{false};  // Rule 1 || Rule 2
   } interlock_;
 
@@ -458,6 +476,19 @@ private:
   // rotate_body_while_driving=false: green seen, waiting for the body to face the front.
   std::optional<rclcpp::Time> rezero_before_go_since_;
   std::optional<rclcpp::Time> rezero_at_zero_since_;
+
+  // Body motion (updateBodyMotion()).
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  std::optional<double> body_yaw_;
+  std::optional<rclcpp::Time> body_yaw_stamp_;
+  std::optional<double> body_prev_cmd_;
+  std::optional<rclcpp::Time> body_prev_cmd_time_;
+  std::optional<rclcpp::Time> body_last_moving_;
+  bool body_tf_ok_{false};
+  bool body_tf_missing_logged_{false};
+  // Red seen continuously since (latch_red_min_sec).
+  std::optional<rclcpp::Time> red_since_;
 
   // ------------------------------------------------------------------
   // AdAPI reroute sub-step state machine
@@ -613,6 +644,10 @@ private:
   void clearGreenLatch();
   // One tick of rhythmic-blink tracking on interlock_.status_now; true = blinking.
   bool updateBlink(const rclcpp::Time & now);
+  // Once per tick: body yaw rate from TF + aim command rate -> body_last_moving_.
+  void updateBodyMotion(const rclcpp::Time & now);
+  // Body turning now or within body_settle_sec (false without the body TF).
+  bool bodyUnsettled(const rclcpp::Time & now) const;
 
   // aim_only_if_light_unseen: update aim_needed_ from the interlock (once per WAIT_GREEN tick,
   // after updateLightInterlock()); resetAimNeed() starts over (new wait at the pre).

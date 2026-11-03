@@ -118,6 +118,21 @@
     # jarak bumper >= v^2 / (2 * rollback_decel_mps2) + rollback_margin_m. Lebih dekat = LANJUT.
     rollback_decel_mps2: 1.0            # [m/s^2]
     rollback_margin_m: 0.3              # [m]
+    # Gerak body dari TF body_base_frame -> body_frame (encoder_body). Selama body berputar (laju
+    # yaw ATAU laju aim cmd > body_moving_rate_deg_s) dan body_settle_sec sesudahnya (frame telat
+    # saat PC sibuk), lampu tidak dipercaya: latch hijau tidak bisa batal, dan GO setelah body
+    # balik ke depan menunggu settle. Tanpa TF body: gerak hanya dari aim cmd.
+    body_base_frame: "base_link"
+    body_frame: "body_link"
+    body_moving_rate_deg_s: 2.0         # [deg/s]
+    body_settle_sec: 1.0                # [s]
+    # Latch merah -> hijau: merah baru membatalkan kalau terlihat dari pandangan bagus
+    # (|offset ROI| <= latch_red_max_roi_offset) selama >= latch_red_min_sec.
+    latch_red_max_roi_offset: 0.4
+    latch_red_min_sec: 1.0              # [s]
+    # Latch merah -> hijau hanya kalau merah terlihat >= ini sebelum hijau (merah kelap-kelip
+    # sesaat bukan awal fase hijau) -> lebih pendek = latch biasa (cek merah / pola kedip).
+    red_to_green_min_red_sec: 2.0       # [s]
     aim_only_if_light_unseen: true      # true: body baru noleh ke lampu kalau lampu TIDAK terdeteksi
                                         # (kamera mana pun) selama aim_unseen_grace_sec di WAIT_GREEN.
                                         # Sudah terlihat (merah/hijau) = tidak noleh, hemat motor.
