@@ -179,6 +179,9 @@ private:
     // within latch_red_max_roi_offset of the image centre -- for latch_red_min_sec.
     double latch_red_max_roi_offset{0.4};
     double latch_red_min_sec{1.0};
+    // Any other latch (green without a long red first): a red clears it once seen this long
+    // (false reds from a poor view last up to ~2 s, real ones tens of seconds).
+    double latch_plain_red_min_sec{2.0};
     // The red -> green latch needs a red seen this long before the green (a flicker is not the
     // start of a green phase); a shorter red arms the plain latch instead.
     double red_to_green_min_red_sec{2.0};

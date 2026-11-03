@@ -130,6 +130,9 @@
     # (|offset ROI| <= latch_red_max_roi_offset) selama >= latch_red_min_sec.
     latch_red_max_roi_offset: 0.4
     latch_red_min_sec: 1.0              # [s]
+    latch_plain_red_min_sec: 2.0        # [s] latch lain (hijau tanpa merah lama sebelumnya): merah baru
+                                        # membatalkan setelah terlihat selama ini. Log 2026-11-03: merah
+                                        # palsu (pandangan jelek) <= ~2 s, merah asli >= 5 s.
     # Latch merah -> hijau hanya kalau merah terlihat >= ini sebelum hijau (merah kelap-kelip
     # sesaat bukan awal fase hijau) -> lebih pendek = latch biasa (cek merah / pola kedip).
     red_to_green_min_red_sec: 2.0       # [s]

@@ -114,6 +114,7 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
   param_.body_settle_sec = declare_parameter<double>("body_settle_sec", 1.0);
   param_.latch_red_max_roi_offset = declare_parameter<double>("latch_red_max_roi_offset", 0.4);
   param_.latch_red_min_sec = declare_parameter<double>("latch_red_min_sec", 1.0);
+  param_.latch_plain_red_min_sec = declare_parameter<double>("latch_plain_red_min_sec", 2.0);
   param_.red_to_green_min_red_sec = declare_parameter<double>("red_to_green_min_red_sec", 2.0);
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -2089,15 +2090,22 @@ bool RoadCrossingFsmNode::greenLatched(const rclcpp::Time & now)
   }
 
   if (red) {
-    bool cancel = true;
-    if (green_latch_from_red_ && age <= param_.green_latch_red_to_green_sec) {
+    const double red_for = (now - *red_since_).seconds();
+    bool cancel = red_for >= param_.latch_plain_red_min_sec;
+    const bool from_red_window = green_latch_from_red_ && age <= param_.green_latch_red_to_green_sec;
+    if (!cancel && !from_red_window) {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "latch hijau tetap: merah baru %.1f s (< %.1f s untuk batal)", red_for,
+        param_.latch_plain_red_min_sec);
+    }
+    if (from_red_window) {
       // Start of the green phase: only a red from a good view, held a while, is real.
       const bool offset_fresh =
         last_roi_offset_time_ &&
         (now - *last_roi_offset_time_).seconds() <= param_.aim_roi_offset_timeout_sec;
       const bool good_view =
         !offset_fresh || std::abs(last_roi_offset_) <= param_.latch_red_max_roi_offset;
-      const double red_for = (now - *red_since_).seconds();
       cancel = good_view && red_for >= param_.latch_red_min_sec;
       if (!cancel) {
         RCLCPP_INFO_THROTTLE(
