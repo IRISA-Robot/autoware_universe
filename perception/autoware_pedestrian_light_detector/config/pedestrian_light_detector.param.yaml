@@ -155,7 +155,7 @@
     # aimer memutar body supaya kamera dengan error terkecil menghadap lampu -- samakan
     # `cameras` di rotary_aimer.param.yaml dengan daftar ini.
     # Hanya kamera depan: ["front"]
-    cameras: ["front", "right", "left"]   # 2026-11-03: kamera belakang tidak dipakai
+    cameras: ["front", "right", "left", "rear"]   # rear = depan saat mundur (body tetap 0)
 
     # roi_margin_px: margin piksel yang ditambahkan ke setiap sisi bbox proyeksi
     # (padded bbox untuk crop ke classifier). Naikkan jika lampu terpotong.

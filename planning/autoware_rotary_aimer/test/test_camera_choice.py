@@ -136,3 +136,24 @@ def test_invert_sign_reads_the_body_angle_in_the_physical_convention():
     # command +40 = physical -40: front axis at -40, a light at -60 is 20 deg off front
     _, cam, err = _aim(n, -60.0, body_deg=40.0)
     assert cam == 'front' and err == pytest.approx(-20.0)
+
+
+def _wrap_deg(a):
+    return (a + 180.0) % 360.0 - 180.0
+
+
+@pytest.mark.parametrize('cameras', [
+    ('front', 'right', 'left', 'rear'),   # deployed order (2026-11-03)
+    ('front', 'left', 'rear', 'right'),
+])
+def test_reverse_mirrors_forward_with_the_rear_camera(cameras):
+    # Reversing with the body at 0 puts the light behind the robot: the rear camera takes it
+    # with the same small body turn the front camera needs when driving forward.
+    for b in range(-40, 41, 5):
+        n = _aimer(cameras=cameras)
+        t_f, cam_f, err_f = _aim(n, float(b))
+        n = _aimer(cameras=cameras)
+        t_r, cam_r, err_r = _aim(n, _wrap_deg(b + 180.0))
+        assert cam_f == 'front' and cam_r == 'rear', b
+        assert t_r == pytest.approx(t_f, abs=1e-6), b
+        assert err_r == pytest.approx(err_f, abs=1e-6), b
