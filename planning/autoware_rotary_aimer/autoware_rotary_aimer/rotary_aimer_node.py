@@ -204,6 +204,17 @@ class RotaryAimerNode(Node):
         self.declare_parameter('camera_frame_template', 'camera_{}_link')
         self.declare_parameter('body_frame', 'body_link')
         self.declare_parameter('camera_switch_hysteresis_deg', 15.0)
+        # Aim with tolerance (hysteresis): the body turns only once the chosen camera is more
+        # than aim_enter_deg off the light, and only until it is aim_tolerance_deg off -- not to
+        # 0.  Right after enable it always turns (to aim_tolerance_deg): the FSM enables the
+        # aimer because the IMAGE says the light is unseen / at the edge, which the map bearing
+        # may not.  0 / 0 = the old behaviour (always to 0).
+        self.declare_parameter('aim_enter_deg', 0.0)
+        # The ramp back to 0 (disable) may go on while ego drives, even with
+        # rotate_body_while_driving=false (that one keeps the AIMING to standstill): the FSM lets
+        # ego go once the body is within its rezero_before_go_tol_deg, the rest turns on the way.
+        self.declare_parameter('zero_while_driving', False)
+        self.declare_parameter('aim_tolerance_deg', 0.0)
 
         self._map_path = str(self.get_parameter('map_path').value)
         self._base_frame = str(self.get_parameter('base_frame').value)
@@ -246,6 +257,17 @@ class RotaryAimerNode(Node):
         self._body_frame = str(self.get_parameter('body_frame').value)
         self._camera_hysteresis_rad = math.radians(
             float(self.get_parameter('camera_switch_hysteresis_deg').value))
+        self._aim_tol_rad = math.radians(
+            max(0.0, float(self.get_parameter('aim_tolerance_deg').value)))
+        self._aim_enter_rad = math.radians(
+            max(0.0, float(self.get_parameter('aim_enter_deg').value)))
+        if self._aim_enter_rad < self._aim_tol_rad:
+            self.get_logger().warn(
+                f'aim_enter_deg {math.degrees(self._aim_enter_rad):.1f} < aim_tolerance_deg '
+                f'{math.degrees(self._aim_tol_rad):.1f}: using aim_enter_deg = aim_tolerance_deg')
+            self._aim_enter_rad = self._aim_tol_rad
+        self._aim_rotating = True
+        self._zero_while_driving = bool(self.get_parameter('zero_while_driving').value)
 
         # ------------------------------------------------------------------ state
         self._enabled = False
@@ -404,6 +426,7 @@ class RotaryAimerNode(Node):
             # Already aiming — repeated enable is a no-op.
             return
         self._aim_camera = None
+        self._aim_rotating = True  # turn on enable, see aim_tolerance_deg
 
         # Seed the slew tracker from the ACTUAL current rotary position so that
         # the first _aim_tick ramps FROM here toward the desired angle rather than
@@ -487,7 +510,7 @@ class RotaryAimerNode(Node):
             if self._zero_done:
                 return
 
-            if not self._may_rotate():
+            if not self._zero_while_driving and not self._may_rotate():
                 # Ego is moving: keep the platform where it is, resume the ramp once it stops.
                 if self._last_published_angle is not None:
                     self._publish_angle(self._last_published_angle)
@@ -803,7 +826,27 @@ class RotaryAimerNode(Node):
                 + ', '.join(f'{n} {math.degrees(e):+.1f}' for n, e in errors.items()) + ')')
             self._aim_camera = best
         cam = self._aim_camera
-        return targets[cam], cam, errors[cam]
+        return self._tolerant_target(targets[cam], errors[cam], current), cam, errors[cam]
+
+    def _tolerant_target(self, target: float, err: float, current: float) -> float:
+        """Target with aim tolerance: hold while within it, else turn only to its edge.
+
+        target / current are physical [rad], err = target - current.  Rotating until
+        |err| <= aim_tolerance, then holding until |err| > aim_enter (hysteresis).
+        """
+        eps = 1e-3  # [rad] the slew lands exactly on the tolerance edge, give it float slack
+        if self._aim_rotating:
+            if abs(err) <= self._aim_tol_rad + eps:
+                self._aim_rotating = False
+                return current
+        elif abs(err) > self._aim_enter_rad:
+            self._aim_rotating = True
+        else:
+            return current
+        # Turn only as far as needed: leave the light aim_tolerance off the camera axis.
+        if abs(err) <= self._aim_tol_rad + eps:
+            return current
+        return _wrap_pi(target - math.copysign(self._aim_tol_rad, err))
 
     # ---------------------------------------------------------------------- CENTER mode
 

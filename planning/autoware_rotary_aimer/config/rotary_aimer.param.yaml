@@ -77,6 +77,17 @@
     camera_switch_hysteresis_deg: 15.0  # kamera yang dipakai baru diganti kalau kamera lain lebih
                                         # dekat ke lampu lebih dari ini (anti bolak-balik di 45 deg)
 
+    # ---- Toleransi bidik ----
+    # Bidik dengan toleransi (histeresis): body baru berputar kalau kamera terpilih meleset
+    # > aim_enter_deg dari lampu, dan hanya sampai sisa aim_tolerance_deg -- tidak sampai 0.
+    # Saat baru di-enable FSM selalu berputar (ke aim_tolerance_deg): FSM meng-enable karena
+    # GAMBAR bilang lampu tidak terlihat / di pinggir. 0 / 0 = perilaku lama (selalu ke 0).
+    aim_enter_deg: 21.0
+    aim_tolerance_deg: 18.0
+    # Ramp balik ke 0 (disable) boleh lanjut sambil jalan walau rotate_body_while_driving=false
+    # (itu hanya membatasi MEMBIDIK): FSM jalan begitu body <= rezero_before_go_tol_deg.
+    zero_while_driving: true
+
     # ---- Putar body hanya saat berhenti ----
     # rotate_body_while_driving: false = body hanya boleh berputar (bidik lampu DAN balik ke
     # depan) saat robot diam (|v| < stopped_speed_mps selama stopped_hold_sec); saat jalan sudut
