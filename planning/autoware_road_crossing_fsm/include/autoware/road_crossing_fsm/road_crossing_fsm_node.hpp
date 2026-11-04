@@ -144,6 +144,10 @@ private:
     // front -- so it never turns while driving.  true = old behaviour (re-zero while crossing).
     bool rotate_body_while_driving{true};
     double rezero_before_go_tol_deg{1.0};      // aim cmd within this of 0 = body at the front
+    // true: GO also waits for the body to stop turning (+ body_settle_sec).  false: GO as soon as
+    // the aim command is within rezero_before_go_tol_deg -- the body finishes its last degrees
+    // while driving (aimer zero_while_driving).
+    bool rezero_before_go_wait_settle{false};
     double rezero_before_go_settle_sec{0.5};   // cmd at 0 this long before GO (body catches up)
     double rezero_before_go_timeout_sec{60.0};  // GO anyway (WARN) after this long
     // Green latch: once the interlock allowed crossing, keep allowing for this long while the

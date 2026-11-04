@@ -94,7 +94,9 @@
                                         # kembali menghadap depan, baru jalan -- body tidak pernah
                                         # berputar saat robot jalan (rotary_aimer, switch sama).
                                         # Di launch: arg road_crossing_rotate_body_while_driving.
-    rezero_before_go_tol_deg: 1.0       # [deg] aim cmd sedekat ini ke 0 = body di depan, boleh jalan
+    rezero_before_go_tol_deg: 10.0      # [deg] aim cmd sedekat ini ke 0 = body di depan, boleh jalan
+                                        # (sisa putaran diselesaikan sambil jalan, aimer zero_while_driving)
+    rezero_before_go_wait_settle: false # true = GO juga menunggu body berhenti berputar + body_settle_sec
     rezero_before_go_settle_sec: 0.12   # [s] cmd sudah 0 selama ini baru GO (body menyusul)
     rezero_before_go_timeout_sec: 60.0  # [s] lewat ini tetap GO (WARN)
     green_latch_sec: 30.0               # [s] latch hijau: setelah hijau mengizinkan, lampu yang

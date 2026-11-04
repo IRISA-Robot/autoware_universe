@@ -94,6 +94,8 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
   param_.rotate_body_while_driving =
     declare_parameter<bool>("rotate_body_while_driving", true);
   param_.rezero_before_go_tol_deg = declare_parameter<double>("rezero_before_go_tol_deg", 1.0);
+  param_.rezero_before_go_wait_settle =
+    declare_parameter<bool>("rezero_before_go_wait_settle", false);
   param_.rezero_before_go_settle_sec =
     declare_parameter<double>("rezero_before_go_settle_sec", 0.5);
   param_.rezero_before_go_timeout_sec =
@@ -2009,7 +2011,7 @@ bool RoadCrossingFsmNode::bodyAtFrontBeforeGo(const rclcpp::Time & now)
     if (!rezero_at_zero_since_) rezero_at_zero_since_ = now;
     if (
       (now - *rezero_at_zero_since_).seconds() >= param_.rezero_before_go_settle_sec &&
-      !bodyUnsettled(now)) {
+      (!param_.rezero_before_go_wait_settle || !bodyUnsettled(now))) {
       RCLCPP_INFO(
         get_logger(), "WAIT_GREEN: body sudah menghadap depan (%.1f s) — boleh jalan",
         (now - *rezero_before_go_since_).seconds());
