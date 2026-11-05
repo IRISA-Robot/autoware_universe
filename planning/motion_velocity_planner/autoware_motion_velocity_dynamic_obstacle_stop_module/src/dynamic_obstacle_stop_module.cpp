@@ -30,6 +30,7 @@
 #include <autoware_utils/system/stop_watch.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <memory>
 #include <string>
@@ -111,8 +112,7 @@ void DynamicObstacleStopModule::publish_processing_time(const double processing_
 }
 
 VelocityPlanningResult DynamicObstacleStopModule::plan(
-  [[maybe_unused]] const std::vector<autoware_planning_msgs::msg::TrajectoryPoint> &
-    raw_trajectory_points,
+  const std::vector<autoware_planning_msgs::msg::TrajectoryPoint> & raw_trajectory_points,
   const std::vector<autoware_planning_msgs::msg::TrajectoryPoint> & smoothed_trajectory_points,
   const std::shared_ptr<const PlannerData> planner_data)
 {
@@ -129,6 +129,26 @@ VelocityPlanningResult DynamicObstacleStopModule::plan(
   dynamic_obstacle_stop::EgoData ego_data;
   ego_data.pose = planner_data->current_odometry.pose.pose;
   ego_data.is_driving_forward = planner_data->is_driving_forward;
+  // [REVERSE-STOP-OFFSET 2026-11-05] reverse_lane_follow paths carry yaw = direction of travel with
+  // a negative velocity, so is_driving_forward is true while the robot backs up and every
+  // "forward" formula here (footprint, object filter, stop distance) is laid out along the travel
+  // direction -- correctly, except that it uses the front bumper's length (0.9 m) for the leading
+  // edge, which is the rear bumper (0.3 m). Swap the length for this cycle only; directions stay.
+  auto params = params_;
+  if (ego_data.is_driving_forward) {
+    const bool is_reversing = [&]() {
+      // raw trajectory: the velocity sign of the plan (the smoothed copy is not relied on for it)
+      for (const auto & p : raw_trajectory_points) {
+        if (std::abs(p.longitudinal_velocity_mps) > 1e-3) {
+          return p.longitudinal_velocity_mps < 0.0;
+        }
+      }
+      return planner_data->current_odometry.twist.twist.linear.x < 0.0;
+    }();
+    if (is_reversing) {
+      params.ego_longitudinal_offset = params.ego_rear_longitudinal_offset;
+    }
+  }
   ego_data.trajectory = smoothed_trajectory_points;
   ego_data.trajectory = autoware::motion_utils::removeOverlapPoints(ego_data.trajectory);
   ego_data.first_trajectory_idx =
@@ -146,27 +166,27 @@ VelocityPlanningResult DynamicObstacleStopModule::plan(
   ego_data.earliest_stop_pose = autoware::motion_utils::calcLongitudinalOffsetPose(
     ego_data.trajectory, ego_data.pose.position, min_stop_distance);
 
-  dynamic_obstacle_stop::make_ego_footprint_rtree(ego_data, params_);
+  dynamic_obstacle_stop::make_ego_footprint_rtree(ego_data, params);
   double hysteresis =
     std::find_if(
       object_map_.begin(), object_map_.end(),
       [](const auto & pair) { return pair.second.should_be_avoided(); }) == object_map_.end()
       ? 0.0
-      : params_.hysteresis;
+      : params.hysteresis;
   const auto dynamic_obstacles = dynamic_obstacle_stop::filter_predicted_objects(
-    planner_data->objects, ego_data, params_, hysteresis);
+    planner_data->objects, ego_data, params, hysteresis);
 
   const auto preprocessing_duration_us = stopwatch.toc("preprocessing");
 
   stopwatch.tic("footprints");
   const auto obstacle_forward_footprints =
-    dynamic_obstacle_stop::make_forward_footprints(dynamic_obstacles, params_, hysteresis);
+    dynamic_obstacle_stop::make_forward_footprints(dynamic_obstacles, params, hysteresis);
   const auto footprints_duration_us = stopwatch.toc("footprints");
   stopwatch.tic("collisions");
   auto collisions = dynamic_obstacle_stop::find_collisions(
     ego_data, dynamic_obstacles, obstacle_forward_footprints);
   update_object_map(
-    object_map_, collisions, clock_->now(), ego_data.trajectory, params_,
+    object_map_, collisions, clock_->now(), ego_data.trajectory, params,
     ego_data.is_driving_forward);
   std::optional<geometry_msgs::msg::Point> earliest_collision =
     dynamic_obstacle_stop::find_earliest_collision(object_map_, ego_data);
@@ -174,8 +194,8 @@ VelocityPlanningResult DynamicObstacleStopModule::plan(
   // Offset from base_link to ego's leading edge along its current direction of travel: forward ->
   // front bumper, reversing -> rear bumper (the physically leading edge while backing up).
   const auto ego_leading_edge_offset = ego_data.is_driving_forward
-                                          ? params_.ego_longitudinal_offset
-                                          : params_.ego_rear_longitudinal_offset;
+                                          ? params.ego_longitudinal_offset
+                                          : params.ego_rear_longitudinal_offset;
   if (earliest_collision) {
     // Raw arc length (src=collision, dst=ego) is positive only when ego is ahead of the collision
     // in trajectory index order, which happens when reversing (ego moves towards decreasing
@@ -188,7 +208,7 @@ VelocityPlanningResult DynamicObstacleStopModule::plan(
       ego_data.is_driving_forward ? raw_arc_length_diff : -raw_arc_length_diff;
     const auto can_stop_before_limit =
       arc_length_diff <
-      min_stop_distance - ego_leading_edge_offset - params_.stop_distance_buffer;
+      min_stop_distance - ego_leading_edge_offset - params.stop_distance_buffer;
     // calcLongitudinalOffsetPose() offsets along the trajectory's fixed index order (positive ->
     // increasing index). Placing the stop pose "behind" the collision (from ego's leading edge)
     // in ego's direction of travel means decreasing index when driving forward (negative offset,
@@ -198,7 +218,7 @@ VelocityPlanningResult DynamicObstacleStopModule::plan(
       can_stop_before_limit
         ? autoware::motion_utils::calcLongitudinalOffsetPose(
             ego_data.trajectory, *earliest_collision,
-            stop_pose_offset_sign * (params_.stop_distance_buffer + ego_leading_edge_offset))
+            stop_pose_offset_sign * (params.stop_distance_buffer + ego_leading_edge_offset))
         : ego_data.earliest_stop_pose;
     debug_data_.stop_pose = stop_pose;
     if (stop_pose) {
