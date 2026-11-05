@@ -202,9 +202,11 @@ std::optional<PIDBasedPlanner::CruiseObstacleInfo> PIDBasedPlanner::calc_obstacl
   const std::shared_ptr<const PlannerData> planner_data,
   const std::vector<CruiseObstacle> & obstacles)
 {
-  cruise_planning_debug_info_.set(
-    CruisePlanningDebugInfo::TYPE::EGO_VELOCITY,
-    planner_data->current_odometry.twist.twist.linear.x);
+  // [REVERSE-CRUISE 2026-11-05] ego speed in its direction of travel: the raw odometry vx is
+  // negative while reversing, which made the RSS distance negative (the target sat on the
+  // obstacle) and the PID never slowed down.
+  const double ego_vel = calc_ego_velocity_along_travel(stop_traj_points, planner_data);
+  cruise_planning_debug_info_.set(CruisePlanningDebugInfo::TYPE::EGO_VELOCITY, ego_vel);
   cruise_planning_debug_info_.set(
     CruisePlanningDebugInfo::TYPE::EGO_ACCELERATION,
     planner_data->current_acceleration.accel.accel.linear.x);
@@ -225,12 +227,12 @@ std::optional<PIDBasedPlanner::CruiseObstacleInfo> PIDBasedPlanner::calc_obstacl
     const double dist_to_obstacle =
       calc_distance_to_collisionPoint(
         stop_traj_points, planner_data, obstacle.collision_points.front().point) +
-      (obstacle.velocity - planner_data->current_odometry.twist.twist.linear.x) *
+      (obstacle.velocity - ego_vel) *
         time_to_evaluate_rss_;
 
     // calculate distance between ego and obstacle based on RSS
     const double target_dist_to_obstacle = calc_rss_distance(
-      planner_data->current_odometry.twist.twist.linear.x, obstacle.velocity,
+      ego_vel, obstacle.velocity,
       cruise_planning_param_.safe_distance_margin);
 
     // calculate error distance and normalized one
@@ -255,11 +257,9 @@ std::optional<PIDBasedPlanner::CruiseObstacleInfo> PIDBasedPlanner::calc_obstacl
   {  // debug data
     cruise_planning_debug_info_.set(
       CruisePlanningDebugInfo::TYPE::CRUISE_RELATIVE_EGO_VELOCITY,
-      planner_data->current_odometry.twist.twist.linear.x -
-        cruise_obstacle_info->obstacle.velocity);
+      ego_vel - cruise_obstacle_info->obstacle.velocity);
     const double non_zero_relative_vel = [&]() {
-      const double relative_vel = planner_data->current_odometry.twist.twist.linear.x -
-                                  cruise_obstacle_info->obstacle.velocity;
+      const double relative_vel = ego_vel - cruise_obstacle_info->obstacle.velocity;
       constexpr double epsilon = 0.001;
       if (epsilon < std::abs(relative_vel)) {
         return relative_vel;
@@ -338,20 +338,28 @@ std::vector<TrajectoryPoint> PIDBasedPlanner::plan_cruise_trajectory(
       const double dist_to_obstacle = cruise_obstacle_info->dist_to_obstacle;
       const size_t ego_idx =
         planner_data->find_index(stop_traj_points, planner_data->current_odometry.pose.pose);
-      const double abs_ego_offset =
-        planner_data->is_driving_forward
-          ? std::abs(planner_data->vehicle_info_.max_longitudinal_offset_m)
-          : std::abs(planner_data->vehicle_info_.min_longitudinal_offset_m);
+      // [REVERSE-CRUISE 2026-11-05] the bumper leading in the direction of travel (the rear one
+      // while reversing on a yaw = travel-direction path, where is_driving_forward is true).
+      const double abs_ego_offset = calc_leading_edge_offset(stop_traj_points, planner_data);
       const double dist_to_rss_wall =
         std::min(error_cruise_dist + abs_ego_offset, dist_to_obstacle + abs_ego_offset);
       const size_t wall_idx =
         utils::get_index_with_longitudinal_offset(stop_traj_points, dist_to_rss_wall, ego_idx);
+      // [REVERSE-CRUISE 2026-11-05] Place the wall at the exact distance from ego rather than on
+      // the nearest trajectory point: a reverse_lane_follow path is the raw lanelet centerline
+      // (no resampling, points metres apart), and snapping to a point -- counted from the point
+      // nearest ego rather than from ego -- put the wall past a small obstacle.
+      const auto wall_pose = [&]() {
+        const auto pose = autoware::motion_utils::calcLongitudinalOffsetPose(
+          stop_traj_points, planner_data->current_odometry.pose.pose.position, dist_to_rss_wall);
+        return pose ? *pose : stop_traj_points.at(wall_idx).pose;
+      }();
 
       const std::string wall_reason_string = cruise_obstacle_info->obstacle.is_yield_obstacle
                                                ? "obstacle cruise (yield)"
                                                : "obstacle cruise";
       auto markers = autoware::motion_utils::createSlowDownVirtualWallMarker(
-        stop_traj_points.at(wall_idx).pose, wall_reason_string, clock_->now(), 0);
+        wall_pose, wall_reason_string, clock_->now(), 0);
       // NOTE: use a different color from slow down one to visualize cruise and slow down
       // separately.
       markers.markers.front().color = autoware_utils::create_marker_color(1.0, 0.6, 0.1, 0.5);
@@ -372,7 +380,7 @@ std::vector<TrajectoryPoint> PIDBasedPlanner::plan_cruise_trajectory(
       safety_factor_array.is_safe = false;
       planning_factor_interface->add(
         stop_traj_points, planner_data->current_odometry.pose.pose,
-        stop_traj_points.at(wall_idx).pose, PlanningFactor::UNKNOWN, safety_factor_array);
+        wall_pose, PlanningFactor::UNKNOWN, safety_factor_array);
     }
 
     // do cruise planning
@@ -382,7 +390,8 @@ std::vector<TrajectoryPoint> PIDBasedPlanner::plan_cruise_trajectory(
       return cruise_traj;
     }
 
-    velocity_limit = plan_cruise_with_velocity_limit(planner_data, *cruise_obstacle_info);
+    velocity_limit =
+      plan_cruise_with_velocity_limit(planner_data, stop_traj_points, *cruise_obstacle_info);
     return stop_traj_points;
   }
 
@@ -403,6 +412,7 @@ std::vector<TrajectoryPoint> PIDBasedPlanner::plan_cruise_trajectory(
 
 VelocityLimit PIDBasedPlanner::plan_cruise_with_velocity_limit(
   const std::shared_ptr<const PlannerData> planner_data,
+  const std::vector<TrajectoryPoint> & stop_traj_points,
   const CruiseObstacleInfo & cruise_obstacle_info)
 {
   const auto & p = velocity_limit_based_planner_param_;
@@ -424,10 +434,12 @@ VelocityLimit PIDBasedPlanner::plan_cruise_with_velocity_limit(
     return pid_output_vel;
   }();
 
+  // [REVERSE-CRUISE 2026-11-05] ego speed in its direction of travel; the limit is a speed
+  // magnitude (velocity_smoother flips a reverse trajectory positive before applying it).
   const double positive_target_vel = lpf_output_vel_ptr_->filter(
     std::max(
       min_cruise_target_vel_,
-      planner_data->current_odometry.twist.twist.linear.x + additional_vel));
+      calc_ego_velocity_along_travel(stop_traj_points, planner_data) + additional_vel));
 
   // calculate target acceleration
   const double target_acc = [&]() {

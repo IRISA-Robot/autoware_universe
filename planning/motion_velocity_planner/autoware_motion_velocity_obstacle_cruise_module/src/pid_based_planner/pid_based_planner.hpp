@@ -92,6 +92,7 @@ private:
   // velocity limit based planner
   VelocityLimit plan_cruise_with_velocity_limit(
     const std::shared_ptr<const PlannerData> planner_data,
+    const std::vector<TrajectoryPoint> & stop_traj_points,
     const CruiseObstacleInfo & cruise_obstacle_info);
 
   // velocity insertion based planner

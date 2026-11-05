@@ -399,7 +399,8 @@ std::optional<CruiseObstacle> ObstacleCruiseModule::create_cruise_obstacle(
     }
     // obstacle is outside the trajectory
     // If the ego is stopping, do not plan cruise for outside obstacles. Stop will be planned.
-    if (odometry.twist.twist.linear.x < 0.1) {
+    // [REVERSE-CRUISE 2026-11-05] speed, not signed vx: reversing is not stopping.
+    if (std::abs(odometry.twist.twist.linear.x) < 0.1) {
       return std::nullopt;
     }
     return create_collision_points_for_outside_cruise_obstacle(

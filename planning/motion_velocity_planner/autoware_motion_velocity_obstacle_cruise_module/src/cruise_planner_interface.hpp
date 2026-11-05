@@ -22,6 +22,7 @@
 
 #include <autoware/planning_factor_interface/planning_factor_interface.hpp>
 
+#include <cmath>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -66,14 +67,55 @@ protected:
   CommonParam common_param_;
   CruisePlanningParam cruise_planning_param_;
 
+  // [REVERSE-CRUISE 2026-11-05] reverse_lane_follow paths carry yaw = direction of travel and a
+  // negative velocity, so planner_data->is_driving_forward (decided from the yaw) is true while
+  // the robot backs up. Everything measured along such a path (arc lengths, obstacle velocity
+  // relative to the trajectory) is already in the direction of travel; only the ego velocity
+  // (signed in body frame, negative) and the leading edge (the rear bumper) need the real
+  // direction, which the velocity sign of the plan at ego gives.
+  static bool is_reversing(
+    const std::vector<TrajectoryPoint> & traj_points,
+    const std::shared_ptr<const PlannerData> planner_data)
+  {
+    if (!traj_points.empty()) {
+      const size_t ego_idx =
+        planner_data->find_index(traj_points, planner_data->current_odometry.pose.pose);
+      for (size_t i = ego_idx; i < traj_points.size(); ++i) {
+        const double v = traj_points.at(i).longitudinal_velocity_mps;
+        if (std::abs(v) > 1e-3) {
+          return v < 0.0;
+        }
+      }
+    }
+    return planner_data->current_odometry.twist.twist.linear.x < 0.0;
+  }
+
+  // Ego speed in its direction of travel: positive while it moves the way the plan drives.
+  static double calc_ego_velocity_along_travel(
+    const std::vector<TrajectoryPoint> & traj_points,
+    const std::shared_ptr<const PlannerData> planner_data)
+  {
+    const double vx = planner_data->current_odometry.twist.twist.linear.x;
+    return is_reversing(traj_points, planner_data) ? -vx : vx;
+  }
+
+  // base_link to the bumper that leads in the direction of travel.
+  static double calc_leading_edge_offset(
+    const std::vector<TrajectoryPoint> & traj_points,
+    const std::shared_ptr<const PlannerData> planner_data)
+  {
+    const bool rear_leads =
+      !planner_data->is_driving_forward || is_reversing(traj_points, planner_data);
+    return rear_leads ? std::abs(planner_data->vehicle_info_.min_longitudinal_offset_m)
+                      : std::abs(planner_data->vehicle_info_.max_longitudinal_offset_m);
+  }
+
   static double calc_distance_to_collisionPoint(
     const std::vector<TrajectoryPoint> & traj_points,
     const std::shared_ptr<const PlannerData> planner_data,
     const geometry_msgs::msg::Point & collision_point)
   {
-    const double offset = planner_data->is_driving_forward
-                            ? std::abs(planner_data->vehicle_info_.max_longitudinal_offset_m)
-                            : std::abs(planner_data->vehicle_info_.min_longitudinal_offset_m);
+    const double offset = calc_leading_edge_offset(traj_points, planner_data);
 
     const size_t ego_segment_idx =
       planner_data->find_segment_index(traj_points, planner_data->current_odometry.pose.pose);
