@@ -127,6 +127,7 @@
         # lost object compensation
         max_compensation_time: 2.0
         moving_object_stop_hysteresis_time: 0.5        # [s] a moving object counts as standing only after this long at or below th_moving_speed
+        new_object_min_stop_time: 0.0                  # [s] a never-standing object must stay at or below th_moving_speed this long before it can be avoided (0.0 = off)
 
         # detection area generation parameters
         detection_area:

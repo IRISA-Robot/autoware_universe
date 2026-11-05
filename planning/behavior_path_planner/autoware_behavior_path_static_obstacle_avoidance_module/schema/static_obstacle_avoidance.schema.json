@@ -695,6 +695,12 @@
               "default": 0.5,
               "minimum": 0.0
             },
+            "new_object_min_stop_time": {
+              "type": "number",
+              "description": "An object that has never been taken as standing must stay at or below th_moving_speed, without a fast cycle, for this long before it can become an avoidance target; until then it is treated as moving. 0.0 restores the old behaviour.",
+              "default": 0.0,
+              "minimum": 0.0
+            },
             "unstable_classification_time": {
               "type": "number",
               "description": "If the object is classified as UNKNOWN type for less than unstable_classification_time seconds, it is probably not an unknown type.",
@@ -937,6 +943,7 @@
             "object_check_return_pose_distance",
             "max_compensation_time",
             "moving_object_stop_hysteresis_time",
+            "new_object_min_stop_time",
             "unstable_classification_time",
             "detection_area",
             "merging_vehicle",

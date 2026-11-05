@@ -4203,6 +4203,58 @@ TEST(TestUtils, fillObjectMovingTimeConfirmedMoverNeedsAStopLongerThanTheHystere
   EXPECT_NEAR(od.stop_time, 0.5, 1e-6);
 }
 
+TEST(TestUtils, fillObjectMovingTimeNewObjectMustSettleBeforeStanding)
+{
+  auto parameters = get_parameters();
+  parameters->moving_object_stop_hysteresis_time = 0.5;
+  parameters->new_object_min_stop_time = 1.0;
+
+  // a new object slow from its first sighting: moving until it has been slow for 1.0 s
+  {
+    ObjectDataArray stopped;
+    std::vector<double> speeds(15, 0.0);
+    const auto v = movingVerdicts(speeds, stopped, parameters);
+    EXPECT_TRUE(v[0]);
+    EXPECT_TRUE(v[9]);    // 0.9 s
+    EXPECT_FALSE(v[11]);  // 1.1 s
+    EXPECT_FALSE(v[14]);
+  }
+
+  // a spawned walker whose tracker velocity ramps up: never becomes standing on the way
+  {
+    ObjectDataArray stopped;
+    const std::vector<double> speeds{0.0, 0.0, 0.0, 0.0, 0.0, 1.5, 1.5, 1.5, 1.5, 1.5,
+                                     1.5, 1.5, 1.5, 1.5, 1.5};
+    for (const bool moving : movingVerdicts(speeds, stopped, parameters)) {
+      EXPECT_TRUE(moving);
+    }
+  }
+
+  // a fast cycle restarts the count; once settled, a later spike does not un-settle it
+  {
+    ObjectDataArray stopped;
+    std::vector<double> speeds(8, 0.0);
+    speeds.push_back(1.5);                 // index 8: before settling
+    speeds.insert(speeds.end(), 25, 0.0);  // indices 9..33
+    speeds.push_back(1.5);                 // index 34: after settling
+    speeds.insert(speeds.end(), 3, 0.0);   // indices 35..37
+    const auto v = movingVerdicts(speeds, stopped, parameters);
+    EXPECT_TRUE(v[15]);   // 0.7 s after the fast cycle at index 8
+    EXPECT_FALSE(v[19]);  // 1.1 s after it
+    EXPECT_FALSE(v[34]);  // first fast cycle of a settled standing object: hysteresis keeps it
+    EXPECT_FALSE(v[36]);
+  }
+
+  // 0.0 keeps the old behaviour: standing on the first slow cycle
+  {
+    parameters->new_object_min_stop_time = 0.0;
+    ObjectDataArray stopped;
+    const auto v = movingVerdicts({0.0, 0.0}, stopped, parameters);
+    EXPECT_FALSE(v[0]);
+    EXPECT_FALSE(v[1]);
+  }
+}
+
 TEST(TestUtils, fillObjectMovingTimeForgetsObjectsThatLeft)
 {
   auto parameters = get_parameters();

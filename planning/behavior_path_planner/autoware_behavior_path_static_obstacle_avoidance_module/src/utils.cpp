@@ -2285,6 +2285,25 @@ void fillObjectMovingTime(
       [&](const auto & o) { return (now - o.moving_state_stamp).seconds() > kForgetAfter; }),
     stopped_objects.end());
 
+  // [NEW-OBJECT-SETTLE 2026-11-05] Called on every not-fast verdict: true while an object that has
+  // never been taken as standing has not yet been slow for new_object_min_stop_time, counted from
+  // when it was first seen or its last fast cycle, whichever is later. The caller then reports it
+  // as moving. Once it passes, the entry is settled and the check never applies again.
+  // Nanoseconds are compared directly so entries stamped with different clock types never throw.
+  const auto still_settling = [&](ObjectData & e) {
+    if (e.standing_settled) {
+      return false;
+    }
+    const double min_stop_time = parameters->new_object_min_stop_time;
+    const int64_t slow_since_ns = std::max(e.first_seen.nanoseconds(), e.last_fast.nanoseconds());
+    const double slow_for = static_cast<double>(now.nanoseconds() - slow_since_ns) * 1e-9;
+    if (min_stop_time <= 0.0 || slow_for >= min_stop_time) {
+      e.standing_settled = true;
+      return false;
+    }
+    return true;
+  };
+
   const auto id = object_data.object.object_id;
   auto entry = std::find_if(
     stopped_objects.begin(), stopped_objects.end(),
@@ -2301,13 +2320,17 @@ void fillObjectMovingTime(
     new_entry.last_fast = is_faster_than_threshold ? now : never;
     // last_stop == never marks "never seen slow".
     new_entry.last_stop = is_faster_than_threshold ? never : now;
+    new_entry.first_seen = now;
+    new_entry.standing_settled = false;
     stopped_objects.push_back(new_entry);
     object_data.init_pose = new_entry.init_pose;
     object_data.stop_time = 0.0;
     object_data.last_move = now;
     object_data.last_stop = new_entry.last_stop;
     object_data.move_time =
-      is_faster_than_threshold ? std::numeric_limits<double>::infinity() : 0.0;
+      (is_faster_than_threshold || still_settling(stopped_objects.back()))
+        ? std::numeric_limits<double>::infinity()
+        : 0.0;
     return;
   }
 
@@ -2327,7 +2350,9 @@ void fillObjectMovingTime(
     }
     const bool never_slow = entry->last_stop.nanoseconds() == 0;
     object_data.last_stop = entry->last_stop;
-    object_data.move_time = (never_slow && !entry->moving_confirmed)
+    // An unsettled object (NEW-OBJECT-SETTLE) is moving here too: a spawned walker read slow while
+    // its tracker velocity ramps up must not turn standing on its first fast cycles.
+    object_data.move_time = ((never_slow || !entry->standing_settled) && !entry->moving_confirmed)
                               ? std::numeric_limits<double>::infinity()
                               : entry->move_time;
     object_data.stop_time = 0.0;
@@ -2342,7 +2367,8 @@ void fillObjectMovingTime(
       entry->move_time = std::max(entry->move_time - step, 0.0);
     }
     object_data.last_stop = now;
-    object_data.move_time = entry->move_time;
+    object_data.move_time =
+      still_settling(*entry) ? std::numeric_limits<double>::infinity() : entry->move_time;
     object_data.stop_time = 0.0;
     object_data.init_pose = object_data.getPose();
     return;
@@ -2358,7 +2384,8 @@ void fillObjectMovingTime(
   entry->stop_time = (now - entry->last_move).seconds();
   entry->move_time = 0.0;
   object_data.last_stop = now;
-  object_data.move_time = 0.0;
+  object_data.move_time =
+    still_settling(*entry) ? std::numeric_limits<double>::infinity() : 0.0;
   object_data.stop_time = entry->stop_time;
   object_data.init_pose = entry->init_pose;
 }

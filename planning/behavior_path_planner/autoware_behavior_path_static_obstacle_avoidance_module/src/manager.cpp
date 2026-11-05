@@ -110,6 +110,8 @@ void StaticObstacleAvoidanceModuleManager::updateModuleParams(
       parameters, ns + "moving_object_stop_hysteresis_time",
       p->moving_object_stop_hysteresis_time);
     update_param<double>(
+      parameters, ns + "new_object_min_stop_time", p->new_object_min_stop_time);
+    update_param<double>(
       parameters, ns + "unstable_classification_time", p->unstable_classification_time);
   }
 

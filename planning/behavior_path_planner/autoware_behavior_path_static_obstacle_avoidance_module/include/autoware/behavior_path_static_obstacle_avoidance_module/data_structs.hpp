@@ -337,6 +337,15 @@ struct AvoidanceParameters
   // the old reset-on-any-slow-cycle behaviour. See fillObjectMovingTime() in utils.cpp.
   double moving_object_stop_hysteresis_time{0.5};
 
+  // [NEW-OBJECT-SETTLE 2026-11-05] An object that has never been taken as standing must stay at or
+  // below its th_moving_speed, without a single fast cycle, for this long before it can become an
+  // avoidance target. Until then it is treated as moving. Without it a freshly appeared object is
+  // standing on its very first slow cycle -- e.g. a pedestrian spawned in front of ego, whose
+  // tracker velocity starts near 0 and ramps up, was avoided at once instead of being left to
+  // obstacle_stop/obstacle_cruise. Once an object has passed this check it is never re-checked.
+  // 0.0 restores the old behaviour. See fillObjectMovingTime() in utils.cpp.
+  double new_object_min_stop_time{0.0};
+
   double unstable_classification_time{0.0};
 
   // [OBSTACLE-CLUSTER 2026-09-04] Preprocessing stage run BEFORE per-object filtering
@@ -530,6 +539,12 @@ struct ObjectData  // avoidance target
   rclcpp::Time last_fast{0, 0, RCL_ROS_TIME};
   bool moving_confirmed{false};
   rclcpp::Time moving_state_stamp{0, 0, RCL_ROS_TIME};
+
+  // [NEW-OBJECT-SETTLE 2026-11-05] first_seen: when the stopped_objects entry was created.
+  // standing_settled: the object has once stayed slow for new_object_min_stop_time (from
+  // first_seen or its last fast cycle, whichever is later); until then it is treated as moving.
+  rclcpp::Time first_seen{0, 0, RCL_ROS_TIME};
+  bool standing_settled{false};
 
   // It is one of the ego driving lanelets (closest lanelet to the object) and used in the logic to
   // check whether the object is on the ego lane.
