@@ -15,6 +15,7 @@
 #include "autoware/behavior_path_planner/planner_manager.hpp"
 
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/static_drivable_area.hpp"
+#include "autoware/behavior_path_planner_common/utils/path_direction_utils.hpp"
 #include "autoware/behavior_path_planner_common/utils/path_utils.hpp"
 #include "autoware/behavior_path_planner_common/utils/utils.hpp"
 
@@ -49,6 +50,22 @@ PlannerManager::PlannerManager(rclcpp::Node & node)
   processing_time_.emplace("total_time", 0.0);
   debug_publisher_ptr_ = std::make_unique<DebugPublisher>(&node, "~/debug");
   state_publisher_ptr_ = std::make_unique<DebugPublisher>(&node, "~/debug");
+
+  // [TURN-IN-PLACE 2026-11-05] "substitute" (default: today's behaviour) | "truncate".
+  const std::string fold_handling =
+    node.has_parameter("fold_handling")
+      ? node.get_parameter("fold_handling").as_string()
+      : node.declare_parameter<std::string>("fold_handling", "substitute");
+  if (fold_handling == "truncate") {
+    fold_handling_ = FoldHandling::TRUNCATE;
+  } else {
+    if (fold_handling != "substitute") {
+      RCLCPP_WARN(
+        logger_, "[PATH-FOLD] unknown fold_handling '%s', using 'substitute'",
+        fold_handling.c_str());
+    }
+    fold_handling_ = FoldHandling::SUBSTITUTE;
+  }
 }
 
 void PlannerManager::launchScenePlugin(rclcpp::Node & node, const std::string & name)
@@ -322,7 +339,45 @@ BehaviorModuleOutput PlannerManager::run(const std::shared_ptr<PlannerData> & da
   // now loudly. The bound is short: it exists to bridge a transient fold, not to mask a
   // persistent one.
   constexpr size_t max_fold_substitutions = 10;  // ~1 s at 10 Hz
-  if (!fold_after_resample) {
+  // [TURN-IN-PLACE 2026-11-05] fold_handling="truncate": a fold on a robot that rotates in place
+  // is usually not transient but the planned seam of an out-and-back route (forward leg meets
+  // the inverted return leg ~180 deg). Stop at the end of the first leg instead of republishing a
+  // stale path; once stopped, the turn-in-place supervisor rotates the robot and the path ahead
+  // no longer folds. Orientation is left untouched.
+  // Only ego's own leg is kept: after the robot has turned at the fold, the leg it arrived on is
+  // behind it and is dropped instead (see utils::truncatePathAtFold()).
+  std::optional<utils::FoldTruncation> fold_truncated_at;
+  if (fold_handling_ == FoldHandling::TRUNCATE && fold_after_resample) {
+    std::optional<geometry_msgs::msg::Pose> ego_pose;
+    if (data->self_odometry) {
+      ego_pose = data->self_odometry->pose.pose;
+    }
+    fold_truncated_at = utils::truncatePathAtFold(
+      result_output.valid_output.path, reversal_threshold_rad, ego_pose);
+  }
+  if (fold_handling_ == FoldHandling::TRUNCATE) {
+    // log once per change of what is being done (none / drop-behind / stop-ahead).
+    const int state =
+      !fold_truncated_at ? 0 : (fold_truncated_at->stops_at_end ? 2 : 1);
+    if (state != fold_truncation_state_) {
+      if (state == 0) {
+        RCLCPP_INFO(logger_, "[PATH-FOLD] fold_handling=truncate: path no longer folds.");
+      } else {
+        RCLCPP_WARN(
+          logger_,
+          "[PATH-FOLD] fold_handling=truncate: path folds back on itself; keeping ego's leg, "
+          "points %zu..%zu (%zu kept)%s.",
+          fold_truncated_at->kept_from, fold_truncated_at->kept_to,
+          result_output.valid_output.path.points.size(),
+          fold_truncated_at->stops_at_end ? ", stopping at the fold ahead"
+                                          : ", the fold is behind ego");
+      }
+      fold_truncation_state_ = state;
+    }
+  }
+  if (fold_truncated_at) {
+    // truncated path is published as is; the substitute bookkeeping below does not apply.
+  } else if (!fold_after_resample) {
     last_unfolded_path_ = result_output.valid_output.path;
     fold_substitution_count_ = 0;
   } else if (last_unfolded_path_ && fold_substitution_count_ < max_fold_substitutions) {
@@ -342,7 +397,8 @@ BehaviorModuleOutput PlannerManager::run(const std::shared_ptr<PlannerData> & da
       last_unfolded_path_ ? "substitution budget spent" : "no unfolded path seen yet");
   }
 
-  if (fold_before_resample || fold_after_resample) {
+  // [TURN-IN-PLACE 2026-11-05] a truncated fold is handled (and logged once above), not a hazard.
+  if (!fold_truncated_at && (fold_before_resample || fold_after_resample)) {
     const auto describe = [](const std::optional<DirectionReversal> & fold) {
       if (!fold) {
         return std::string{"none"};

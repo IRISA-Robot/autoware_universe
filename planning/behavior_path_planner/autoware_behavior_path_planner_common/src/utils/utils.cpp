@@ -729,6 +729,23 @@ bool is_turn_direction_lane(const lanelet::ConstLanelet & lanelet)
   return is_turn_direction_lane(turn_direction);
 }
 
+std::string get_turn_direction_in_travel_direction(
+  const lanelet::ConstLanelet & lanelet, const bool is_inverted_in_route,
+  const std::string & default_value)
+{
+  const std::string turn_direction = lanelet.attributeOr("turn_direction", default_value);
+  if (!is_inverted_in_route) {
+    return turn_direction;
+  }
+  if (turn_direction == "left") {
+    return "right";
+  }
+  if (turn_direction == "right") {
+    return "left";
+  }
+  return turn_direction;
+}
+
 lanelet::ConstLanelets nearest_turn_direction_lane_within_route(
   const Pose & current_pose, const RouteHandler & route_handler,
   const lanelet::ConstLanelets & lanelets)
@@ -803,8 +820,10 @@ std::optional<double> calc_distance_to_next_turn_direction_lane(
     return std::nullopt;
   }
 
-  const auto is_same_direction_shift_and_turn_lane = [&shift_direction_str](const auto & llt) {
-    const std::string turn_direction = llt.attributeOr("turn_direction", "else");
+  const auto is_same_direction_shift_and_turn_lane = [&](const auto & llt) {
+    // [TURN-IN-PLACE 2026-11-05] left/right swap on a lanelet traversed inverted in the route.
+    const std::string turn_direction = get_turn_direction_in_travel_direction(
+      llt, route_handler.isLaneletInvertedInRoute(llt), "else");
     return turn_direction == shift_direction_str;
   };
 

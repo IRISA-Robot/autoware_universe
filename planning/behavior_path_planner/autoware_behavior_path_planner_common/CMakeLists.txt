@@ -13,6 +13,7 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/interface/scene_module_manager_interface.cpp
   src/utils/utils.cpp
   src/utils/path_utils.cpp
+  src/utils/path_direction_utils.cpp
   src/utils/traffic_light_utils.cpp
   src/utils/path_safety_checker/safety_check.cpp
   src/utils/path_safety_checker/objects_filtering.cpp
@@ -35,6 +36,7 @@ if(BUILD_TESTING)
   ament_add_ros_isolated_gmock(test_${PROJECT_NAME}_utilities
     test/test_utils.cpp
     test/test_path_utils.cpp
+    test/test_path_direction_utils.cpp
     test/test_traffic_light_utils.cpp
   )
 

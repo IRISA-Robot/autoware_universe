@@ -609,6 +609,14 @@ private:
   /// cycles it has been republished in place of a folded one. See the [PATH-FOLD] block in run().
   std::optional<PathWithLaneId> last_unfolded_path_;
   size_t fold_substitution_count_{0};
+
+  /// [TURN-IN-PLACE 2026-11-05] What to do with a folded path (param `fold_handling`):
+  /// SUBSTITUTE (default, legacy) republishes last_unfolded_path_ up to N times; TRUNCATE cuts the
+  /// path at its first fold and stops at that point (an out-and-back route on a robot that turns
+  /// in place: drive the first leg, stop, let the turn-in-place supervisor rotate it).
+  enum class FoldHandling { SUBSTITUTE, TRUNCATE };
+  FoldHandling fold_handling_{FoldHandling::SUBSTITUTE};
+  int fold_truncation_state_{0};  ///< 0 none, 1 dropped behind, 2 stop ahead; log on change
 };
 }  // namespace autoware::behavior_path_planner
 

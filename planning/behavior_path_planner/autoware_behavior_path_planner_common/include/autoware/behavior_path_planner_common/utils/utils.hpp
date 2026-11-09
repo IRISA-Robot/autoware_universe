@@ -166,6 +166,20 @@ bool is_turn_direction_lane(const std::string & lanelet_attribute_string);
 bool is_turn_direction_lane(const lanelet::ConstLanelet & lanelet);
 
 /**
+ * @brief [TURN-IN-PLACE 2026-11-05] The lanelet's "turn_direction" as seen in the direction it is
+ * actually travelled. The tag is authored for the lanelet's own (lanelet2) direction, so on a
+ * lanelet traversed inverted in the route "left" and "right" swap; any other value is returned
+ * unchanged.
+ *
+ * @param lanelet The lanelet whose tag is read.
+ * @param is_inverted_in_route RouteHandler::isLaneletInvertedInRoute(lanelet).
+ * @param default_value Returned (unswapped) when the attribute is absent.
+ */
+std::string get_turn_direction_in_travel_direction(
+  const lanelet::ConstLanelet & lanelet, const bool is_inverted_in_route,
+  const std::string & default_value);
+
+/**
  * @brief Finds the nearest turn direction lanelet(s) in the route that precede the current lanelet.
  *
  * @param current_pose The ego vehicle's current pose.

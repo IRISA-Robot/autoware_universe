@@ -197,7 +197,10 @@ std::optional<TurnSignalInfo> TurnSignalDecider::getIntersectionTurnSignalInfo(
   const bool is_in_nearest_turn_direction_lane = std::any_of(
     nearest_turn_direction_lanes.begin(), nearest_turn_direction_lanes.end(),
     [&](const auto & llt) {
-      return std::string(llt.attributeOr("turn_direction", "else")) == expected_turn_command;
+      // [TURN-IN-PLACE 2026-11-05] the tag is authored for the lanelet's own direction; on a
+      // lanelet traversed inverted in the route left/right swap (same for every read below).
+      return utils::get_turn_direction_in_travel_direction(
+               llt, route_handler.isLaneletInvertedInRoute(llt), "else") == expected_turn_command;
     });
 
   const auto requires_intersection_turn_signal = [&](const auto & turn_direction) -> bool {
@@ -233,8 +236,8 @@ std::optional<TurnSignalInfo> TurnSignalDecider::getIntersectionTurnSignalInfo(
 
     lanelet::ConstLanelets combined_lane_elems{};
     // Get the lane and its attribute
-    const std::string lane_attribute =
-      current_lane.attributeOr("turn_direction", std::string("none"));
+    const std::string lane_attribute = utils::get_turn_direction_in_travel_direction(
+      current_lane, route_handler.isLaneletInvertedInRoute(current_lane), "none");
     if (!requires_intersection_turn_signal(lane_attribute)) continue;
 
     do {
@@ -243,7 +246,9 @@ std::optional<TurnSignalInfo> TurnSignalDecider::getIntersectionTurnSignalInfo(
       lanelet::ConstLanelet next_lane{};
       current_lane = next_lane;
     } while (route_handler.getNextLaneletWithinRoute(current_lane, &current_lane) &&
-             current_lane.attributeOr("turn_direction", std::string("none")) == lane_attribute);
+             utils::get_turn_direction_in_travel_direction(
+               current_lane, route_handler.isLaneletInvertedInRoute(current_lane), "none") ==
+               lane_attribute);
 
     if (!combined_lane_elems.empty()) {
       // store combined lane and its front lane
@@ -266,8 +271,8 @@ std::optional<TurnSignalInfo> TurnSignalDecider::getIntersectionTurnSignalInfo(
     const auto lane_id = front_lane.id();
     const double search_distance =
       front_lane.attributeOr("turn_signal_distance", base_search_distance);
-    const std::string lane_attribute =
-      front_lane.attributeOr("turn_direction", std::string("none"));
+    const std::string lane_attribute = utils::get_turn_direction_in_travel_direction(
+      front_lane, route_handler.isLaneletInvertedInRoute(front_lane), "none");
 
     const auto lane_front_pose = calculateLaneFrontPose(combined_lane.centerline3d());
     const auto lane_back_pose = calculateLaneBackPose(combined_lane.centerline3d());
