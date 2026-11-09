@@ -266,6 +266,9 @@ void StuckRecoverySupervisorNode::load_parameters()
   p.topic_emergency_code =
     declare_parameter<std::string>("topic_emergency_code", "/gama/mw/emergency_code");
   p.topic_robot_fsm = declare_parameter<std::string>("topic_robot_fsm", "/robot_fsm");
+  // [TURN-IN-PLACE 2026-11-05]
+  p.topic_turn_in_place_state = declare_parameter<std::string>(
+    "topic_turn_in_place_state", "/planning/turn_in_place/supervisor/state");
 
   p.topic_out_scenario =
     declare_parameter<std::string>("topic_out_scenario", "/planning/recovery/scenario");
@@ -291,6 +294,27 @@ void StuckRecoverySupervisorNode::load_parameters()
     "road_crossing_hold_states", std::vector<int64_t>{1, 3, 4, 5, 8});
 
   mode_ = parse_mode(p.mode);
+
+  // [TURN-IN-PLACE 2026-11-05] See mission_direction.hpp and turn_in_place_gate.hpp.
+  // Read once at start-up like every other parameter here: the node has no
+  // parameter-update callback, and the motion mode of a robot does not change mid-run.
+  p.mission_direction = declare_parameter<std::string>("mission_direction", "auto");
+  p.respect_turn_in_place = declare_parameter<bool>("respect_turn_in_place", true);
+  p.turn_in_place_state_timeout_sec =
+    declare_parameter<double>("turn_in_place_state_timeout_sec", 2.0);
+  if (const auto parsed = parse_mission_direction(p.mission_direction)) {
+    mission_direction_ = *parsed;
+  } else {
+    RCLCPP_WARN(
+      get_logger(), "parameter 'mission_direction' = '%s' is not auto|forward_only; using auto",
+      p.mission_direction.c_str());
+    mission_direction_ = MissionDirection::AUTO;
+  }
+  p.mission_direction = mission_direction_name(mission_direction_);
+  RCLCPP_INFO(
+    get_logger(), "mission_direction=%s, respect_turn_in_place=%s (timeout %.1f s)",
+    p.mission_direction.c_str(), p.respect_turn_in_place ? "true" : "false",
+    p.turn_in_place_state_timeout_sec);
 
   // Hard ceilings.  A typo in a yaml must not be able to make the robot reverse
   // ten metres at walking pace, so clamp instead of trusting the file.
@@ -480,6 +504,16 @@ void StuckRecoverySupervisorNode::setup_interfaces()
       robot_fsm_ = msg->data;
       has_robot_fsm_ = true;
     });
+  // [TURN-IN-PLACE 2026-11-05] Volatile, depth 1: the turn supervisor republishes every
+  // tick, and a latched holding state from a previous run must not gate a fresh one.
+  sub_turn_in_place_state_ =
+    create_subscription<autoware_turn_in_place_msgs::msg::TurnInPlaceSupervisorState>(
+      param_.topic_turn_in_place_state, qos,
+      [this](const autoware_turn_in_place_msgs::msg::TurnInPlaceSupervisorState::ConstSharedPtr
+               msg) {
+        turn_in_place_state_ = msg;
+        turn_in_place_received_at_ = this->now();
+      });
 
   // Planning factors are the only way to learn *who* asked for the stop.  Topic
   // names follow planning_factor_interface.hpp: "/planning/planning_factors/" + name.
@@ -549,6 +583,9 @@ void StuckRecoverySupervisorNode::setup_interfaces()
 // ---------------------------------------------------------------------------
 void StuckRecoverySupervisorNode::on_timer()
 {
+  // [TURN-IN-PLACE 2026-11-05] First, so update_motion() and classify_stop() both see
+  // this tick's verdict.
+  update_turn_in_place_gate();
   update_motion();
   classify_stop();
 
@@ -569,6 +606,26 @@ void StuckRecoverySupervisorNode::on_timer()
     distance2d(odom_->pose.pose, route_->goal_pose) <= param_.goal_reached_dist_m) {
     arrival_handled_ = true;
     reset_for_new_mission("the robot arrived at its goal");
+  }
+
+  // [TURN-IN-PLACE 2026-11-05] A turn in place ends any open episode, from every state.
+  //
+  // classify_stop() already calls the stop legitimate, and SUSPECT, PROBE and BLOCKED leave
+  // for NOMINAL on that by themselves.  RECOVERY, TRANSIT and COOLDOWN do not consult
+  // legit_stop_ at all -- and RECOVERY/TRANSIT are the dangerous ones: they hold the
+  // scenario switched over and drive the robot, while the turn supervisor is trying to hold
+  // it still and then spin it.  So the exit is made here, once, for all of them.
+  //
+  // The exit is the plain transition(NOMINAL) that "stop became legitimate" and "ego made
+  // progress" use, NOT reset_for_new_mission(): the mission has not changed, so there is
+  // nothing cross-episode to wipe.  transition(NOMINAL) already drops the plan, the goals,
+  // the reference path and the attempt count, and arming is derived from the state below,
+  // so force_recovery and the costmap scenario drop on this very tick.
+  if (turn_in_place_holding_ && state_ != State::NOMINAL) {
+    transition(
+      State::NOMINAL, "turn-in-place supervisor is " +
+                        turn_in_place_state_name(turn_in_place_state_->state) +
+                        "; standing down for it");
   }
 
   switch (state_) {
@@ -637,6 +694,12 @@ void StuckRecoverySupervisorNode::update_motion()
   }
 
   const bool stopped_now = std::abs(measured) < param_.th_stopped_velocity_mps;
+  // [TURN-IN-PLACE 2026-11-05] Time stood still for the turn supervisor is not time stuck:
+  // keep the stop clock at zero while it holds, so the 1 s debounce in step_nominal() only
+  // starts counting once it has handed the robot back.  is_stopped_ itself stays truthful.
+  if (turn_in_place_holding_) {
+    stopped_since_ = now;
+  }
   if (!stopped_now) {
     stopped_since_ = now;
     // Movement is the only evidence that the situation actually changed, so it is what
@@ -759,6 +822,17 @@ void StuckRecoverySupervisorNode::classify_stop()
       legit_reason_ = "road_crossing_hold";
       return;
     }
+  }
+
+  // [TURN-IN-PLACE 2026-11-05] Same rule as the road-crossing hold above: the turn-in-place
+  // supervisor holds the robot with a zero velocity limit and then spins it, and none of
+  // that is a blockage.  The map-stop patience is restarted too, so a stop line the robot
+  // was already waiting at does not come back from the turn with its patience used up.
+  if (turn_in_place_holding_) {
+    legit_stop_ = true;
+    legit_reason_ = "turn_in_place:" + turn_in_place_state_name(turn_in_place_state_->state);
+    map_stop_active_ = false;
+    return;
   }
 
   // A STOP factor only counts when its control point is actually near: an
@@ -900,6 +974,59 @@ bool StuckRecoverySupervisorNode::is_operational() const
 bool StuckRecoverySupervisorNode::is_stuck_candidate() const
 {
   return is_stopped_ && !legit_stop_ && is_operational() && odom_ != nullptr;
+}
+
+void StuckRecoverySupervisorNode::update_turn_in_place_gate()
+{
+  // [TURN-IN-PLACE 2026-11-05] The verdict itself is pure logic (turn_in_place_gate.cpp, unit
+  // tested); this only feeds it and logs when it changes.  Logged on change, not per tick:
+  // the gate can stay closed for the whole of a 30 s turn, and a line every 100 ms of that
+  // buries everything else in the log.
+  TurnInPlaceGateInput input;
+  input.respect = param_.respect_turn_in_place;
+  input.have_message = turn_in_place_state_ != nullptr;
+  input.state = turn_in_place_state_ ? turn_in_place_state_->state : 0;
+  input.age_sec =
+    turn_in_place_state_ ? (this->now() - turn_in_place_received_at_).seconds() : 0.0;
+  input.timeout_sec = param_.turn_in_place_state_timeout_sec;
+
+  const auto status = evaluate_turn_in_place_gate(input);
+  turn_in_place_holding_ = gate_holds(status);
+
+  // A change of status is logged, and so is a change of the turn supervisor's state
+  // (REQUEST_STOP -> CHECK_CLEARANCE -> TURNING -> COOLDOWN, or MONITOR -> ERROR), which is
+  // what tells the story of a turn when reading the log afterwards.  MONITOR is its steady
+  // state, so this is a handful of lines per turn.  The never-heard start-up is not news.
+  const bool status_changed = turn_in_place_logged_status_ != status;
+  const bool state_changed =
+    status == TurnInPlaceGateStatus::HOLDING || status == TurnInPlaceGateStatus::NOT_HOLDING
+      ? input.state != turn_in_place_logged_state_
+      : false;
+  if (!status_changed && !state_changed) {
+    return;
+  }
+  const bool first = !turn_in_place_logged_status_.has_value();
+  turn_in_place_logged_status_ = status;
+  turn_in_place_logged_state_ = input.state;
+  if (first && status == TurnInPlaceGateStatus::NEVER_HEARD) {
+    return;
+  }
+  const std::string state_text =
+    turn_in_place_state_ ? turn_in_place_state_name(input.state) : std::string("-");
+  const std::string why = turn_in_place_state_ && !turn_in_place_state_->reason.empty()
+                            ? " -- " + turn_in_place_state_->reason
+                            : std::string{};
+  if (turn_in_place_holding_) {
+    RCLCPP_INFO(
+      get_logger(),
+      "[TURN-IN-PLACE gate] HOLD: turn supervisor is %s; ego's stop is legitimate, stuck "
+      "detection paused (state %s)%s",
+      state_text.c_str(), state_name(state_).c_str(), why.c_str());
+  } else {
+    RCLCPP_INFO(
+      get_logger(), "[TURN-IN-PLACE gate] RELEASE (%s): turn supervisor %s (age %.1f s)%s",
+      turn_in_place_gate_status_name(status), state_text.c_str(), input.age_sec, why.c_str());
+  }
 }
 
 std::optional<lanelet::Id> StuckRecoverySupervisorNode::recovery_disabled_lanelet() const
@@ -1766,7 +1893,9 @@ std::vector<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::collect_goal_
   if (reference_path_.size() < 2) {
     return candidates;
   }
-  const bool mirror = path_yaw_opposes_ego();
+  // [TURN-IN-PLACE 2026-11-05] The heading the robot will ARRIVE with -- a motion decision,
+  // so mission_is_reverse(), not the raw geometry.
+  const bool mirror = mission_is_reverse();
 
   size_t ego_index = 0;
   if (odom_) {
@@ -2263,8 +2392,10 @@ std::optional<double> StuckRecoverySupervisorNode::heading_error_to_reference() 
   // Against the DIRECTION OF TRAVEL, not the raw path yaw: in reverse motion the robot
   // faces away from the way it is going, and comparing against the path yaw there would
   // read a perfectly aligned robot as 180 degrees out.
+  // [TURN-IN-PLACE 2026-11-05] mission_is_reverse(): with forward_only the robot must line
+  // up nose-first, so a body facing against the path is 180 degrees out, not aligned.
   const double ref_yaw = tf2::getYaw(reference_path_[*nearest].orientation) +
-                         (path_yaw_opposes_ego() ? M_PI : 0.0);
+                         (mission_is_reverse() ? M_PI : 0.0);
   return autoware_utils::normalize_radian(tf2::getYaw(odom_->pose.pose.orientation) - ref_yaw);
 }
 
@@ -2286,7 +2417,7 @@ autoware_planning_msgs::msg::Trajectory StuckRecoverySupervisorNode::build_trans
   // resume on.  Driving it here, at the recovery crawl, is what turns the handover from a
   // step change into something the robot can follow.
   const double sign = mission_travel_sign();
-  const bool mirror = path_yaw_opposes_ego();
+  const bool mirror = mission_is_reverse();  // [TURN-IN-PLACE 2026-11-05] same decision as sign
 
   const auto set_yaw = [](geometry_msgs::msg::Pose & pose, const double yaw) {
     pose.orientation.x = 0.0;
@@ -2865,10 +2996,21 @@ double StuckRecoverySupervisorNode::mission_travel_sign() const
 {
   // The mission runs in one motion mode from start to goal: forward motion drives the
   // robot nose-first, reverse motion drives it backwards along the route the whole way.
-  // path_yaw_opposes_ego() already answers which one is in force, and it is the same
-  // answer the corridor sweep and the escape goals are built from -- so both modes go
-  // through identical code from here on.
-  return path_yaw_opposes_ego() ? -1.0 : 1.0;
+  // mission_is_reverse() answers which one is in force, and it is the same answer the
+  // escape goals and the TRANSIT line-up are built from -- so both modes go through
+  // identical code from here on.
+  return stuck_recovery_supervisor::mission_travel_sign(
+    mission_direction_, path_yaw_opposes_ego());
+}
+
+bool StuckRecoverySupervisorNode::mission_is_reverse() const
+{
+  // [TURN-IN-PLACE 2026-11-05] With mission_direction=auto this is exactly
+  // path_yaw_opposes_ego(), as before.  With forward_only (robot v2) it is always false:
+  // a body facing against the route there means "about to be turned round", not "driving
+  // this mission backwards".
+  return stuck_recovery_supervisor::mission_is_reverse(
+    mission_direction_, path_yaw_opposes_ego());
 }
 
 bool StuckRecoverySupervisorNode::plan_follows_mission_direction(
@@ -3534,7 +3676,8 @@ std::optional<geometry_msgs::msg::Pose> StuckRecoverySupervisorNode::compute_esc
   //
   // Nearest-valid-first is deliberate: it is the shortest detour that clears the
   // blockage, and freespace is free to reverse as much as it likes to reach it.
-  const bool mirror = path_yaw_opposes_ego();
+  // [TURN-IN-PLACE 2026-11-05] Arrival heading: a motion decision, see mission_is_reverse().
+  const bool mirror = mission_is_reverse();
 
   double total = 0.0;
   std::vector<double> arc(reference_path_.size(), 0.0);
@@ -4095,6 +4238,9 @@ void StuckRecoverySupervisorNode::publish_outputs()
   diag.stop_source_module = stop_source_module_;
   diag.legit_stop = legit_stop_;
   diag.legit_reason = legit_reason_;
+  // [TURN-IN-PLACE 2026-11-05] Stays GEOMETRIC on purpose: this flag documents the frame
+  // free_left_m/free_right_m below are reported in, and sweep_path() mirrors those on the
+  // raw geometry in every mission_direction.
   diag.path_reversed = path_yaw_opposes_ego();
   diag.free_left_m = static_cast<float>(last_sweep_.free_left_m);
   diag.free_right_m = static_cast<float>(last_sweep_.free_right_m);
@@ -4349,6 +4495,10 @@ void StuckRecoverySupervisorNode::on_diagnostics(
   stat.add("stop_source_module", stop_source_module_);
   stat.add("legit_reason", legit_reason_);
   stat.add("path_reversed", path_yaw_opposes_ego());
+  // [TURN-IN-PLACE 2026-11-05]
+  stat.add("mission_direction", param_.mission_direction);
+  stat.add("mission_reverse", mission_is_reverse());
+  stat.add("turn_in_place_holding", turn_in_place_holding_);
   stat.add("start_blocked", start_blocked_);
   stat.add("goal_candidate", std::to_string(goal_index_ + 1) + "/" +
                                std::to_string(goal_candidates_.size()));

@@ -14,6 +14,7 @@
        from the command line without editing it. -->
   <arg name="recovery_freespace_algorithm" default="astar" description="freespace algorithm for the stuck recovery: astar | rrtstar"/>
   <arg name="vehicle_param_file"/>
+  <arg name="mission_direction" default="auto" description="auto | forward_only (robot v2: inverted lanelets are driven nose-first after a turn in place)"/>
   <arg name="container_type" default="component_container_mt"/>
 
   <arg name="input_objects_topic_name" default="/perception/object_recognition/objects"/>
@@ -35,6 +36,7 @@
       <param from="$(var stuck_recovery_supervisor_param_path)"/>
       <param from="$(var vehicle_param_file)"/>
       <param name="mode" value="$(var stuck_recovery_mode)"/>
+      <param name="mission_direction" value="$(var mission_direction)"/>
     </node>
   </group>
 

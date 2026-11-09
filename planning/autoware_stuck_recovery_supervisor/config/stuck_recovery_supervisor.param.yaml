@@ -474,6 +474,25 @@
     # REROUTING_TO_GOAL(8).  That FSM has its own watchdog -- never compete with it.
     road_crossing_hold_states: [1, 3, 4, 5, 8]
 
+    # --- turn in place / mission direction [TURN-IN-PLACE 2026-11-05] -----------
+    # Which way the MISSION drives the robot:
+    #   auto         : infer it -- a path heading near ego that opposes ego's heading means
+    #                  the mission is driven backwards (reverse motion mode).  Original
+    #                  behaviour.
+    #   forward_only : always nose-first.  Robot v2 drives inverted lanelets nose-first
+    #                  after the turn-in-place supervisor has spun it round, so a body
+    #                  facing against the route means "about to turn", never "reversing".
+    # Only the motion decisions follow this (plan direction, escape-goal and TRANSIT
+    # headings, counter-mission ledger); left/right mirroring stays geometric.
+    mission_direction: "auto"
+    # While the turn-in-place supervisor is REQUEST_STOP / CHECK_CLEARANCE / TURNING /
+    # COOLDOWN, ego's stop is legitimate: no episode starts, stopped time does not count,
+    # and an open episode stands down to NOMINAL.  MONITOR and ERROR do not gate.  Inert
+    # until the first state message arrives, so harmless on a robot without that node.
+    respect_turn_in_place: true
+    # A holding state older than this no longer gates (the turn supervisor runs at 1 Hz).
+    turn_in_place_state_timeout_sec: 2.0
+
     # --- topics ------------------------------------------------------------
     topic_odometry: "/localization/kinematic_state"
     topic_velocity_status: "/vehicle/status/velocity_status"
@@ -493,6 +512,7 @@
     topic_road_crossing_state: "/planning/road_crossing/fsm_state"
     topic_emergency_code: "/gama/mw/emergency_code"
     topic_robot_fsm: "/robot_fsm"
+    topic_turn_in_place_state: "/planning/turn_in_place/supervisor/state"
 
     topic_out_scenario: "/planning/recovery/scenario"
     topic_out_route: "/planning/recovery/route"

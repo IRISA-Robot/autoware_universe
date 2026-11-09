@@ -16,6 +16,8 @@
 #define AUTOWARE__STUCK_RECOVERY_SUPERVISOR__STUCK_RECOVERY_SUPERVISOR_NODE_HPP_
 
 #include "autoware/stuck_recovery_supervisor/corridor_checker.hpp"
+#include "autoware/stuck_recovery_supervisor/mission_direction.hpp"
+#include "autoware/stuck_recovery_supervisor/turn_in_place_gate.hpp"
 
 #include <diagnostic_updater/diagnostic_updater.hpp>
 #include <autoware/route_handler/route_handler.hpp>
@@ -33,6 +35,7 @@
 #include <autoware_stuck_recovery_msgs/msg/recovery_state.hpp>
 #include <autoware_stuck_recovery_msgs/msg/stuck_diagnosis.hpp>
 #include <autoware_stuck_recovery_msgs/srv/force_recovery.hpp>
+#include <autoware_turn_in_place_msgs/msg/turn_in_place_supervisor_state.hpp>
 #include <autoware_vehicle_msgs/msg/control_mode_report.hpp>
 #include <autoware_vehicle_msgs/msg/gear_report.hpp>
 #include <autoware_vehicle_msgs/msg/velocity_report.hpp>
@@ -405,6 +408,8 @@ private:
     std::string topic_road_crossing_state;
     std::string topic_emergency_code;
     std::string topic_robot_fsm;
+    // [TURN-IN-PLACE 2026-11-05] The turn-in-place supervisor's state.
+    std::string topic_turn_in_place_state;
     std::string topic_out_scenario;
     std::string topic_out_route;
     std::string topic_out_force_recovery;
@@ -417,6 +422,16 @@ private:
     std::string service_force_recovery;
 
     std::vector<int64_t> road_crossing_hold_states{};
+
+    // [TURN-IN-PLACE 2026-11-05]
+    /// "auto" (infer reverse missions from the geometry) or "forward_only" (robot v2: the
+    /// mission is always driven nose-first).  See mission_direction.hpp.
+    std::string mission_direction{"auto"};
+    /// While the turn-in-place supervisor is holding / turning the robot, its stop is
+    /// legitimate here.  Inert until the first state message arrives.
+    bool respect_turn_in_place{true};
+    /// A holding state older than this no longer gates (its publisher is gone).
+    double turn_in_place_state_timeout_sec{2.0};
   };
 
   // ------------------------------------------------------------------
@@ -505,6 +520,9 @@ private:
   void classify_stop();
   bool is_operational() const;
   bool is_stuck_candidate() const;
+  /// [TURN-IN-PLACE 2026-11-05] Re-evaluate the turn-in-place gate for this tick and log
+  /// when its verdict changes.  Sets turn_in_place_holding_.
+  void update_turn_in_place_gate();
   /// Id of a lanelet tagged `disable_recovery=true` that contains the robot, if any.  Such a
   /// lanelet is one the map author does not want recovery manoeuvring in at all.
   std::optional<lanelet::Id> recovery_disabled_lanelet() const;
@@ -537,6 +555,11 @@ private:
   /// True on a reversed route, where the path yaw is the travel direction and the
   /// robot faces the other way -- so lateral left/right has to be mirrored.
   bool path_yaw_opposes_ego() const;
+  /// [TURN-IN-PLACE 2026-11-05] The MOTION decision: is the mission driven backwards along
+  /// the route?  path_yaw_opposes_ego() unless mission_direction pins it to forward.  Every
+  /// "which way does the mission drive / which heading will the robot arrive with" question
+  /// goes through here; geometric left/right mirroring keeps asking path_yaw_opposes_ego().
+  bool mission_is_reverse() const;
   /// Is the inflated vehicle footprint at `pose` clear of the recovery grid?  Off-grid
   /// counts as blocked, which also keeps the goal inside the costmap window.
   bool footprint_is_free(const geometry_msgs::msg::Pose & pose) const;
@@ -563,7 +586,8 @@ private:
   /// Direction the MISSION travels in, in the robot's own frame: +1 when the robot drives
   /// nose-first (forward motion mode), -1 when it drives backwards along the route
   /// (reverse motion mode).  One definition, used everywhere, so both motion modes go
-  /// through identical code.
+  /// through identical code.  [TURN-IN-PLACE 2026-11-05] Always +1 with
+  /// mission_direction=forward_only.
   double mission_travel_sign() const;
   /// Does this plan move the robot the way the mission is going, all of it?  The strict
   /// rule: used for TRANSIT, and for freespace segments when allow_counter_mission_legs is
@@ -709,6 +733,17 @@ private:
   std::string legit_reason_{};
   rclcpp::Time map_stop_since_{0, 0, RCL_ROS_TIME};
   bool map_stop_active_{false};
+
+  // [TURN-IN-PLACE 2026-11-05]
+  MissionDirection mission_direction_{MissionDirection::AUTO};
+  autoware_turn_in_place_msgs::msg::TurnInPlaceSupervisorState::ConstSharedPtr
+    turn_in_place_state_{};
+  /// Receipt time on this node's clock: freshness is judged here, not by the sender's stamp.
+  rclcpp::Time turn_in_place_received_at_{0, 0, RCL_ROS_TIME};
+  /// The gate verdict this tick, and what was last logged (so transitions log once).
+  bool turn_in_place_holding_{false};
+  std::optional<TurnInPlaceGateStatus> turn_in_place_logged_status_{};
+  uint8_t turn_in_place_logged_state_{0};
 
   // ------------------------------------------------------------------
   // Latest inputs
@@ -872,6 +907,8 @@ private:
     sub_road_crossing_{};
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr sub_emergency_{};
   rclcpp::Subscription<std_msgs::msg::Int16>::SharedPtr sub_robot_fsm_{};
+  rclcpp::Subscription<autoware_turn_in_place_msgs::msg::TurnInPlaceSupervisorState>::SharedPtr
+    sub_turn_in_place_state_{};  // [TURN-IN-PLACE 2026-11-05]
   std::vector<rclcpp::Subscription<autoware_internal_planning_msgs::msg::PlanningFactorArray>::
                 SharedPtr>
     sub_factors_{};
