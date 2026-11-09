@@ -1,0 +1,24 @@
+/**:
+  ros__parameters:
+    rate_hz: 20.0
+    # middleware_controller_manager steering modes: 0=FWS 1=RWS 2=4WCS 3=CRAB 4=HOLONOMIC.
+    spin_mode: 4
+    # Restored after the turn when the chassis did not report its mode before the turn.
+    driving_mode: 2
+    # Yaw-rate loop: rate = clamp(kp * remaining, min_yaw_rate, max_yaw_rate) [rad/s].
+    kp: 1.5
+    max_yaw_rate: 0.6
+    min_yaw_rate: 0.1
+    # Stop rotating within this of the route heading; the MPC corrects the rest while driving.
+    done_tolerance_deg: 7.0
+    # Phase timeouts -> FAILED.
+    switch_timeout_sec: 5.0
+    rotate_timeout_sec: 30.0
+    # Re-send a steering-mode request the chassis has not taken up after this long.
+    request_retry_sec: 1.0
+    # A supervisor command older than this counts as cancelled.
+    command_timeout_sec: 3.0
+    feedback_timeout_sec: 1.0
+    # twist.angular.z = yaw_rate * gain. 1.0 for the simulator mock; for the real middleware this
+    # is 1 / holonomic_yaw_gain (hardware phase, not wired yet).
+    yaw_rate_command_gain: 1.0

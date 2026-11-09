@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Turn-in-place: a 1 Hz supervisor that decides when the robot must turn around in place, and the
+  executor that switches the chassis' steering mode and spins it.
+
+  Obstacles for the turning area come from the no-ground pointcloud, cropped to a box around the
+  robot (the box must contain the swept circle: body corner distance + sweep_margin_m).
+-->
+<launch>
+  <arg name="supervisor_param_path" default="$(find-pkg-share autoware_turn_in_place_supervisor)/config/turn_in_place_supervisor.param.yaml"/>
+  <arg name="executor_param_path" default="$(find-pkg-share autoware_turn_in_place_supervisor)/config/turn_in_place_executor.param.yaml"/>
+  <arg name="vehicle_param_file" default="$(find-pkg-share gama_vehicle_description)/config/vehicle_info.param.yaml"/>
+  <arg name="input_pointcloud_topic_name" default="/perception/obstacle_segmentation/pointcloud"/>
+  <arg name="input_pointcloud_frame" default="base_link"/>
+  <arg name="crop_half_size_m" default="2.0"/>
+  <arg name="crop_min_z_m" default="-0.5"/>
+  <arg name="crop_max_z_m" default="2.0"/>
+  <arg name="steering_mode_topic" default="/gama/cmd/steering_mode"/>
+  <arg name="steering_mode_feedback_topic" default="/gama/feedback/steering_mode"/>
+  <arg name="spin_twist_topic" default="/control/turn_in_place/cmd_vel"/>
+
+  <group>
+    <push-ros-namespace namespace="planning/turn_in_place"/>
+
+    <node pkg="autoware_crop_box_filter" exec="crop_box_filter" name="pointcloud_crop">
+      <remap from="input" to="$(var input_pointcloud_topic_name)"/>
+      <remap from="output" to="/planning/turn_in_place/pointcloud_near"/>
+      <param name="input_pointcloud_frame" value="$(var input_pointcloud_frame)"/>
+      <param name="input_frame" value="base_link"/>
+      <param name="output_frame" value="base_link"/>
+      <param name="min_x" value="-$(var crop_half_size_m)"/>
+      <param name="max_x" value="$(var crop_half_size_m)"/>
+      <param name="min_y" value="-$(var crop_half_size_m)"/>
+      <param name="max_y" value="$(var crop_half_size_m)"/>
+      <param name="min_z" value="$(var crop_min_z_m)"/>
+      <param name="max_z" value="$(var crop_max_z_m)"/>
+      <param name="negative" value="false"/>
+    </node>
+
+    <node pkg="autoware_turn_in_place_supervisor" exec="turn_in_place_supervisor_node" name="supervisor" output="screen">
+      <param from="$(var supervisor_param_path)"/>
+      <param from="$(var vehicle_param_file)"/>
+      <remap from="~/input/vector_map" to="/map/vector_map"/>
+      <remap from="~/input/route" to="/planning/mission_planning/route"/>
+      <remap from="~/input/odometry" to="/localization/kinematic_state"/>
+      <remap from="~/input/active_route_window" to="/planning/mission_planning/active_route_window"/>
+      <remap from="~/input/operation_mode_state" to="/api/operation_mode/state"/>
+      <remap from="~/input/pointcloud" to="/planning/turn_in_place/pointcloud_near"/>
+      <remap from="~/input/executor_status" to="/planning/turn_in_place/executor/status"/>
+      <remap from="~/output/command" to="/planning/turn_in_place/command"/>
+      <remap from="~/output/state" to="/planning/turn_in_place/supervisor/state"/>
+      <remap from="~/output/velocity_limit" to="/planning/scenario_planning/max_velocity_candidates"/>
+      <remap from="~/output/clear_velocity_limit" to="/planning/scenario_planning/clear_velocity_limit"/>
+      <remap from="~/output/reverse_request" to="/planning/turn_in_place/reverse_request"/>
+    </node>
+
+    <node pkg="autoware_turn_in_place_supervisor" exec="turn_in_place_executor_node" name="executor" output="screen">
+      <param from="$(var executor_param_path)"/>
+      <remap from="~/input/command" to="/planning/turn_in_place/command"/>
+      <remap from="~/input/odometry" to="/localization/kinematic_state"/>
+      <remap from="~/input/steering_mode_feedback" to="$(var steering_mode_feedback_topic)"/>
+      <remap from="~/output/steering_mode" to="$(var steering_mode_topic)"/>
+      <remap from="~/output/twist" to="$(var spin_twist_topic)"/>
+      <remap from="~/output/status" to="/planning/turn_in_place/executor/status"/>
+    </node>
+  </group>
+</launch>

@@ -1,0 +1,64 @@
+/**:
+  ros__parameters:
+    # Decision cycle. The robot is held (zero velocity limit) from the first cycle its heading is
+    # off the route -- also before it is engaged -- so it never moves the wrong way while the turn
+    # is being confirmed. Steering-mode switches happen once per turn, in the executor.
+    decision_rate_hz: 10.0
+    # |route heading - body heading| above which the robot is turned around, sustained for
+    # trigger_confirm_sec while autonomous. A moving robot is stopped first.
+    trigger_angle_deg: 80.0
+    trigger_confirm_sec: 0.3
+    # |yaw error| below which the heading counts as fine (turn done); the MPC takes the rest.
+    # Must be >= the executor's done_tolerance_deg.
+    done_angle_deg: 10.0
+    # Speed below which the robot counts as standing still before it may turn.
+    stop_speed_mps: 0.05
+    # Hold after a turn before handing back to lane driving.
+    cooldown_sec: 0.5
+    # Phase timeouts -> ERROR (robot held still).
+    stop_timeout_sec: 15.0
+    clearance_timeout_sec: 60.0
+    turn_timeout_sec: 30.0
+    # Turning area. The body rectangle (vehicle_info), inflated, is swept through the rotation in
+    # each direction (every sweep_step_deg) and must
+    #  - stay inside the road lanelets (all lanelets of road_subtypes, any lane / direction),
+    #    inflated by road_margin_m, and
+    #  - not touch the no-ground pointcloud cropped around the robot, inflated by sweep_margin_m.
+    sweep_margin_m: 0.2
+    road_margin_m: 0.1
+    road_subtypes: ["road", "road_shoulder"]
+    sweep_step_deg: 5.0
+    footprint_sample_spacing_m: 0.15
+    # Spin centre along the body, relative to base_link [m] (the chassis spins about its centre).
+    rotation_centre_x_m: 0.0
+    base_frame: "base_link"
+    # When the road is too narrow to turn here (both sweeps leave the lanelets), back up along
+    # the route -- towards the goal, the robot facing away from it -- to the first spot where a
+    # full spin fits in the lanelets, or all the way to the goal when there is none
+    # (behavior_path_planner reverse_lane_follow, activation "external_request").
+    enable_reverse_to_turn_spot: true
+    turn_spot:
+      search_step_m: 0.25
+      search_max_m: 300.0
+      # Spots closer than this are skipped: a back-up that short cannot be started, and it must
+      # exceed reached_tolerance_m so a spot searched again from a stop is never "reached" at once.
+      min_distance_m: 1.6
+      # Aim this far into the wide stretch (or at the middle of a shorter one). reverse_lane_follow
+      # counts its stop as reached within goal_reach_tolerance_m (1.3 m) and may stop that much
+      # short, so aim deeper than that.
+      entry_margin_m: 1.5
+      # Once the back-up comes to rest (for settle_sec) the turning area is judged where the robot
+      # actually stands -- stopping is not precise -- and if the spin does not fit there, the
+      # next spot is searched from there. Coming to rest further than reached_tolerance_m from
+      # the spot is only logged.
+      reached_tolerance_m: 1.5
+      settle_sec: 1.0
+      # The back-up is asked to stop this far past the spot: the longitudinal controller stops
+      # short of a stop point by about its stopping distance (PID stopping_state_stop_dist).
+      stop_overshoot_m: 0.7
+      # How often the spot is searched again while backing up towards the goal.
+      research_period_sec: 1.0
+    # Inputs older than this are not used (no window -> no decision; no cloud -> blocked).
+    active_route_window_timeout_sec: 2.0
+    pointcloud_timeout_sec: 1.0
+    executor_status_timeout_sec: 2.0
