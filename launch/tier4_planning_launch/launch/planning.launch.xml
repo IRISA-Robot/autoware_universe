@@ -4,6 +4,8 @@
   <!-- mission planner -->
   <arg name="mission_planner_param_path"/>
   <arg name="allow_reverse_route" default="false"/>
+  <!-- [TURN-IN-PLACE 2026-11-05] read by mission_planner.launch.xml and behavior_planning.launch.xml -->
+  <arg name="turn_in_place_mode" default="false"/>
   <!-- parking -->
   <arg name="freespace_planner_param_path"/>
   <!-- planning validator -->

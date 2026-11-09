@@ -49,6 +49,7 @@
 
   <arg name="vehicle_model" description="vehicle model name"/>
   <arg name="initial_engage_state" default="true" description="/vehicle/engage state after starting Autoware"/>
+  <arg name="steering_mode_mock" default="false" description="mock steering-mode switching / spin-in-place in the simple planning simulator"/>
 
   <let name="vehicle_model_pkg" value="$(find-pkg-share $(var vehicle_model)_description)"/>
 
@@ -277,6 +278,7 @@
       <arg name="initial_engage_state" value="$(var initial_engage_state)"/>
       <arg name="raw_vehicle_cmd_converter_param_path" value="$(var raw_vehicle_cmd_converter_param_path)"/>
       <arg name="motion_publish_mode" value="$(var motion_publish_mode)"/>
+      <arg name="steering_mode_mock" value="$(var steering_mode_mock)"/>
     </include>
   </group>
 </launch>
