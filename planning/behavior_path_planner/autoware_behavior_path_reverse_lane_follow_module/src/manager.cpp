@@ -66,6 +66,18 @@ void ReverseLaneFollowModuleManager::init(rclcpp::Node * node)
   p.arrived_stop_velocity_mps =
     node->declare_parameter<double>(ns + "arrived_stop_velocity_mps", p.arrived_stop_velocity_mps);
 
+  // [TURN-IN-PLACE 2026-11-05] see data_structs.hpp.
+  const auto activation = node->declare_parameter<std::string>(ns + "activation", "inverted_lanelets");
+  if (activation != "inverted_lanelets" && activation != "external_request") {
+    RCLCPP_WARN(
+      node->get_logger(),
+      "reverse_lane_follow.activation '%s' is unknown; using 'inverted_lanelets'",
+      activation.c_str());
+  }
+  p.external_request_activation = activation == "external_request";
+  p.external_request_timeout_sec = node->declare_parameter<double>(
+    ns + "external_request_timeout_sec", p.external_request_timeout_sec);
+
   parameters_ = std::make_shared<ReverseLaneFollowParameters>(p);
 
   // See manager.hpp for why this subscriber must be owned here (persistent manager) rather than
@@ -73,6 +85,8 @@ void ReverseLaneFollowModuleManager::init(rclcpp::Node * node)
   retrace_request_subscriber_ =
     autoware_utils::InterProcessPollingSubscriber<std_msgs::msg::Float64>::create_subscription(
       node, "~/input/reverse_lane_follow/retrace_request");
+  turn_spot_request_subscriber_ = TurnSpotRequestSubscriber::create_subscription(
+    node, "~/input/reverse_lane_follow/turn_spot_request");
 }
 
 void ReverseLaneFollowModuleManager::updateModuleParams(

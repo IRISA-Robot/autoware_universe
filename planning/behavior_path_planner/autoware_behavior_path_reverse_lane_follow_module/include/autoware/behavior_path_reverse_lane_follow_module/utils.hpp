@@ -168,7 +168,13 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
   const std::shared_ptr<RouteHandler> & route_handler, const Pose & ego_pose,
   const double backward_distance_m, const double forward_distance_m,
   const double cruise_velocity_mps, const double goal_decel_mps2,
-  const double goal_decel_ramp_resample_interval_m);
+  const double goal_decel_ramp_resample_interval_m,
+  // [TURN-IN-PLACE 2026-11-05] false: build the backing-up path on any lanelet (the turn-in-place
+  // supervisor asked for it), not only where the run traverses an inverted lanelet.
+  const bool require_inverted_lanelet = true,
+  // [TURN-IN-PLACE 2026-11-05] stop here (with the goal's deceleration ramp) instead of at the
+  // route goal; ignored when it is not on this run of lanelets.
+  const std::optional<Pose> & stop_pose = std::nullopt);
 
 /**
  * @brief Pure decision function for the one-way reverse-follow reactivation latch (see

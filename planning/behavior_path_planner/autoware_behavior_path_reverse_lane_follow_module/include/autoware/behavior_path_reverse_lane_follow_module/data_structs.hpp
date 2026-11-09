@@ -161,6 +161,16 @@ struct ReverseLaneFollowParameters
   // settle to a clean, unperturbed near-zero that isVehicleStopped()'s much stricter downstream
   // bound can then observe over its own full 1.0s window.
   double arrived_stop_velocity_mps{0.05};
+
+  // [TURN-IN-PLACE 2026-11-05] What makes the module drive backwards along the route:
+  //   "inverted_lanelets" (default): whenever ego's run of lanelets traverses an inverted one
+  //                                  (robot v1, bidirectional driving by reversing).
+  //   "external_request": only while the turn-in-place supervisor asks for it, on any lanelet
+  //                       (robot v2 turns around in place, and backs up only where the road is
+  //                       too narrow to turn -- to the first spot wide enough, or to the goal).
+  bool external_request_activation{false};
+  // A request older than this counts as withdrawn.
+  double external_request_timeout_sec{1.0};
 };
 
 // This module's own "am I currently retracing" status flag -- the reverse-lane-follow analogue of

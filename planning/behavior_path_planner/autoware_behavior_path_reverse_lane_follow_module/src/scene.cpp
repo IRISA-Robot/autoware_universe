@@ -45,14 +45,32 @@ ReverseLaneFollowModule::ReverseLaneFollowModule(
   std::unordered_map<std::string, std::shared_ptr<ObjectsOfInterestMarkerInterface>> &
     objects_of_interest_marker_interface_ptr_map,
   const std::shared_ptr<PlanningFactorInterface> planning_factor_interface,
-  const std::shared_ptr<std::optional<lanelet::Id>> & last_exited_inverted_lanelet_id)
+  const std::shared_ptr<std::optional<lanelet::Id>> & last_exited_inverted_lanelet_id,
+  const std::shared_ptr<TurnSpotRequestSubscriber> & turn_spot_request_subscriber)
 : SceneModuleInterface{
     name, node, rtc_interface_ptr_map, objects_of_interest_marker_interface_ptr_map,
     planning_factor_interface},
   parameters_{parameters},
   retrace_request_subscriber_{retrace_request_subscriber},
-  last_exited_inverted_lanelet_id_{last_exited_inverted_lanelet_id}
+  last_exited_inverted_lanelet_id_{last_exited_inverted_lanelet_id},
+  turn_spot_request_subscriber_{turn_spot_request_subscriber}
 {
+}
+
+std::optional<ReverseToTurnSpotRequest> ReverseLaneFollowModule::activeExternalRequest() const
+{
+  if (!turn_spot_request_subscriber_) {
+    return std::nullopt;
+  }
+  const auto msg = turn_spot_request_subscriber_->take_data();
+  if (!msg || !msg->active) {
+    return std::nullopt;
+  }
+  const double age = (clock_->now() - rclcpp::Time(msg->stamp)).seconds();
+  if (age > parameters_->external_request_timeout_sec) {
+    return std::nullopt;
+  }
+  return *msg;
 }
 
 void ReverseLaneFollowModule::updateRetraceRequest()
@@ -142,10 +160,29 @@ void ReverseLaneFollowModule::updateRouteReversedFollow()
   // param's own name/intent -- see capReverseFollowCruiseVelocity()'s doc comment in utils.hpp)
   // and goal_stop_decel_mps2 as the conservative goal-approach ramp magnitude (see
   // applyGoalDecelerationRamp()'s doc comment in utils.hpp).
+  // [TURN-IN-PLACE 2026-11-05] activation "external_request": drive backwards only while the
+  // turn-in-place supervisor asks for it, on any lanelet, stopping at its turn spot when it gives
+  // one (else at the route goal).
+  const bool external = parameters_->external_request_activation;
+  std::optional<geometry_msgs::msg::Pose> stop_pose;
+  if (external) {
+    const auto request = activeExternalRequest();
+    if (!request) {
+      if (was_active) {
+        RCLCPP_WARN(
+          getLogger(), "[TURN-IN-PLACE] reverse_lane_follow: back-up request withdrawn");
+      }
+      return;
+    }
+    if (request->has_stop_pose) {
+      stop_pose = request->stop_pose;
+    }
+  }
   const auto follow = buildRouteReversedFollowPath(
     planner_data_->route_handler, getEgoPose(), parameters_->route_reversed_backward_distance_m,
     parameters_->route_reversed_forward_distance_m, parameters_->retrace_velocity_mps,
-    parameters_->goal_stop_decel_mps2, parameters_->goal_decel_ramp_resample_interval_m);
+    parameters_->goal_stop_decel_mps2, parameters_->goal_decel_ramp_resample_interval_m,
+    !external, stop_pose);
 
   // [BIDIR-BUG-FIX] One-way latch: if `follow` succeeded for the same lanelet we most recently
   // recorded a true->false exit from, this is boundary-line noise re-arming the module, not a
@@ -156,16 +193,19 @@ void ReverseLaneFollowModule::updateRouteReversedFollow()
   // would drop the goal-stop entirely -- see shouldSuppressReversedFollowReactivation()'s doc
   // comment in utils.hpp for the full rationale (goals commonly sit right at a lanelet boundary,
   // exactly where this latch is most likely to have already fired spuriously).
-  const double distance_to_goal_m =
-    autoware_utils::calc_distance2d(getEgoPose(), planner_data_->route_handler->getGoalPose());
+  // [TURN-IN-PLACE 2026-11-05] with a requested stop, it is the "goal" of this back-up.
+  const double distance_to_goal_m = autoware_utils::calc_distance2d(
+    getEgoPose(), stop_pose ? *stop_pose : planner_data_->route_handler->getGoalPose());
+  // The latch guards against lanelet-boundary noise re-arming the inverted-lanelet trigger; an
+  // external request is explicit, so it never applies there.
   const bool follow_contains_latched_lanelet =
-    follow && last_exited_inverted_lanelet_id_->has_value() &&
+    !external && follow && last_exited_inverted_lanelet_id_->has_value() &&
     std::any_of(
       follow->lanelets.begin(), follow->lanelets.end(), [&](const auto & llt) {
         return llt.id() == last_exited_inverted_lanelet_id_->value();
       });
   const bool reactivation_suppressed =
-    follow && shouldSuppressReversedFollowReactivation(
+    !external && follow && shouldSuppressReversedFollowReactivation(
                 *last_exited_inverted_lanelet_id_, follow->lanelets, distance_to_goal_m,
                 parameters_->goal_reach_tolerance_m);
 
@@ -204,7 +244,7 @@ void ReverseLaneFollowModule::updateRouteReversedFollow()
             "true -- exempting the goal's own lanelet from the latch so a boundary-noise exit "
             "there can never permanently suppress the final approach's goal-stop",
             exited_lanelet.id());
-        } else {
+        } else if (!external) {
           *last_exited_inverted_lanelet_id_ = exited_lanelet.id();
         }
       }
@@ -239,8 +279,9 @@ void ReverseLaneFollowModule::updateRouteReversedFollow()
   // layer only ever engages in the same narrow, goal-scoped circumstances the rest of this
   // goal-approach logic already does -- it must never fire on an ordinary reversed stretch with no
   // goal anywhere nearby.
-  const bool goal_within_follow_window = std::any_of(
-    follow->lanelets.begin(), follow->lanelets.end(), [&](const auto & llt) {
+  const bool goal_within_follow_window =
+    stop_pose.has_value() ||
+    std::any_of(follow->lanelets.begin(), follow->lanelets.end(), [&](const auto & llt) {
       return planner_data_->route_handler->isInGoalRouteSection(llt);
     });
 

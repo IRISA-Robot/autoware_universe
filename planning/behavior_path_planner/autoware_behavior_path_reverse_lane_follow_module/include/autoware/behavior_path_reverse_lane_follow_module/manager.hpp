@@ -46,7 +46,7 @@ public:
     return std::make_unique<ReverseLaneFollowModule>(
       name_, *node_, parameters_, retrace_request_subscriber_, rtc_interface_ptr_map_,
       objects_of_interest_marker_interface_ptr_map_, planning_factor_interface_,
-      last_exited_inverted_lanelet_id_);
+      last_exited_inverted_lanelet_id_, turn_spot_request_subscriber_);
   }
 
   void updateModuleParams(const std::vector<rclcpp::Parameter> & parameters) override;
@@ -80,6 +80,8 @@ private:
   // anything -- confirmed live: the flip-flop was completely unaffected until this was moved here.
   // Owned by this always-alive manager and handed to every instance as a shared_ptr so it survives
   // across create/destroy cycles.
+  std::shared_ptr<TurnSpotRequestSubscriber> turn_spot_request_subscriber_;
+
   std::shared_ptr<std::optional<lanelet::Id>> last_exited_inverted_lanelet_id_ =
     std::make_shared<std::optional<lanelet::Id>>(std::nullopt);
 };

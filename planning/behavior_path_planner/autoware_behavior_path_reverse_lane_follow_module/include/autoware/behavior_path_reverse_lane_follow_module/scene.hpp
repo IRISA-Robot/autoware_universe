@@ -22,6 +22,7 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <autoware_internal_planning_msgs/msg/path_with_lane_id.hpp>
+#include <autoware_turn_in_place_msgs/msg/reverse_to_turn_spot_request.hpp>
 #include <std_msgs/msg/float64.hpp>
 
 #include <memory>
@@ -33,6 +34,9 @@
 namespace autoware::behavior_path_planner
 {
 using autoware_internal_planning_msgs::msg::PathWithLaneId;
+using autoware_turn_in_place_msgs::msg::ReverseToTurnSpotRequest;
+using TurnSpotRequestSubscriber =
+  autoware_utils::InterProcessPollingSubscriber<ReverseToTurnSpotRequest>;
 
 class ReverseLaneFollowModule : public SceneModuleInterface
 {
@@ -46,7 +50,8 @@ public:
     std::unordered_map<std::string, std::shared_ptr<ObjectsOfInterestMarkerInterface>> &
       objects_of_interest_marker_interface_ptr_map,
     const std::shared_ptr<PlanningFactorInterface> planning_factor_interface,
-    const std::shared_ptr<std::optional<lanelet::Id>> & last_exited_inverted_lanelet_id);
+    const std::shared_ptr<std::optional<lanelet::Id>> & last_exited_inverted_lanelet_id,
+    const std::shared_ptr<TurnSpotRequestSubscriber> & turn_spot_request_subscriber = nullptr);
 
   bool isExecutionRequested() const override;
   bool isExecutionReady() const override;
@@ -144,6 +149,11 @@ private:
   std::shared_ptr<ReverseLaneFollowParameters> parameters_;
   std::shared_ptr<autoware_utils::InterProcessPollingSubscriber<std_msgs::msg::Float64>>
     retrace_request_subscriber_;
+
+  // [TURN-IN-PLACE 2026-11-05] activation "external_request": the supervisor's latest request,
+  // when active and fresh.
+  std::shared_ptr<TurnSpotRequestSubscriber> turn_spot_request_subscriber_;
+  std::optional<ReverseToTurnSpotRequest> activeExternalRequest() const;
 
   ReverseLaneFollowStatus status_;
 

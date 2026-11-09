@@ -14,6 +14,8 @@
 
 #include "autoware/behavior_path_reverse_lane_follow_module/utils.hpp"
 
+#include "autoware/behavior_path_planner_common/utils/path_direction_utils.hpp"
+
 #include <autoware/motion_utils/trajectory/trajectory.hpp>
 #include <autoware_utils/geometry/geometry.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -27,58 +29,15 @@
 namespace autoware::behavior_path_planner::reverse_lane_follow_utils
 {
 
-namespace
-{
-// [BIDIR-BUG-FIX #2] Tangent direction (radians) of a lanelet's centerline at its very start/end,
-// walked in whatever point order this ConstLanelet's own .inverted() bit implies.
-// lanelet2_core's Lanelet::centerline() already returns an inverted (point-order-reversed) view
-// when .inverted() is true -- same mechanism route_handler.cpp documents for
-// leftBound()/rightBound() (Lanelet.h:164-175) -- so these tangents already point in the
-// lanelet's *route-consistent* direction of travel, regardless of its fwd/inv route label.
-double laneletEntryTangentRad(const lanelet::ConstLanelet & llt)
-{
-  const auto & centerline = llt.centerline();
-  if (centerline.size() < 2) {
-    return 0.0;
-  }
-  const auto & p0 = centerline[0];
-  const auto & p1 = centerline[1];
-  return std::atan2(p1.y() - p0.y(), p1.x() - p0.x());
-}
-
-double laneletExitTangentRad(const lanelet::ConstLanelet & llt)
-{
-  const auto & centerline = llt.centerline();
-  const size_t n = centerline.size();
-  if (n < 2) {
-    return 0.0;
-  }
-  const auto & p0 = centerline[n - 2];
-  const auto & p1 = centerline[n - 1];
-  return std::atan2(p1.y() - p0.y(), p1.x() - p0.x());
-}
-
-// A generous bound: allows the window-extension walk below to continue through even a fairly
-// sharp real-world curve/switchback while still catching a genuine ~180 degree reversal -- the
-// one case this vehicle (fixed heading, forward/backward translation only, never rotates in
-// place) truly cannot drive through without stopping and changing gear.
-constexpr double kMaxContinuousHeadingChangeRad = 100.0 * M_PI / 180.0;
-
-// [BIDIR-BUG-FIX #2] Replaces the old isLaneletInvertedInRoute()-based "same label" trim: two
-// adjacent-in-route lanelets are treated as one continuous physical maneuver based purely on
-// whether their shared boundary is a smooth direction of travel, independent of whether either
-// side is flagged inverted in the route. See buildRouteReversedFollowPath()'s doc comment in
-// utils.hpp for the full rationale and live evidence.
-bool isHeadingContinuousAcross(
-  const lanelet::ConstLanelet & from_llt, const lanelet::ConstLanelet & to_llt)
-{
-  const double exit_tangent = laneletExitTangentRad(from_llt);
-  const double entry_tangent = laneletEntryTangentRad(to_llt);
-  const double diff = std::abs(autoware_utils::normalize_radian(entry_tangent - exit_tangent));
-  return diff < kMaxContinuousHeadingChangeRad;
-}
-
-}  // namespace
+// [TURN-IN-PLACE 2026-11-05] isHeadingContinuousAcross() (+ its lanelet tangent helpers and the
+// 100 degree kMaxContinuousHeadingChangeRad bound) moved, unchanged, to
+// autoware_behavior_path_planner_common (utils/path_direction_utils.hpp) so the planner manager's
+// [PATH-FOLD] handling shares the same notion of a heading discontinuity. Behaviour here is
+// identical. [BIDIR-BUG-FIX #2] rationale: two adjacent-in-route lanelets are one continuous
+// physical maneuver when their shared boundary is a smooth direction of travel, independent of
+// whether either side is flagged inverted in the route; see buildRouteReversedFollowPath()'s doc
+// comment in utils.hpp.
+using autoware::behavior_path_planner::utils::isHeadingContinuousAcross;
 
 // [SEAM-FOLD 2026-09-17] Drop points that do not advance along the path.
 //
@@ -253,7 +212,8 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
   const std::shared_ptr<RouteHandler> & route_handler, const Pose & ego_pose,
   const double backward_distance_m, const double forward_distance_m,
   const double cruise_velocity_mps, const double goal_decel_mps2,
-  const double goal_decel_ramp_resample_interval_m)
+  const double goal_decel_ramp_resample_interval_m, const bool require_inverted_lanelet,
+  const std::optional<Pose> & stop_pose)
 {
   // [BIDIR-DEBUG] temporary diagnostic logging for the "trajectory doesn't follow reversed
   // lanelet / control goes the wrong way" investigation. Remove once root cause is confirmed
@@ -423,7 +383,7 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
       seq_str.c_str(), trimmed_str.c_str(), touches_inverted_lanelet);
   }
 
-  if (!touches_inverted_lanelet) {
+  if (!touches_inverted_lanelet && require_inverted_lanelet) {
     // No actual reverse-in-route segment anywhere in the continuous run touching ego -- this
     // activation trigger does not apply; the caller should fall back to the (still-supported
     // standalone) retrace-request trigger.
@@ -502,8 +462,19 @@ std::optional<RouteReversedFollow> buildRouteReversedFollowPath(
   const bool sequence_contains_goal = std::any_of(
     lanelet_sequence.begin(), lanelet_sequence.end(),
     [&route_handler](const auto & llt) { return route_handler->isInGoalRouteSection(llt); });
-  if (sequence_contains_goal) {
-    const auto goal_pose = route_handler->getGoalPose();
+  // [TURN-IN-PLACE 2026-11-05] A requested stop (the turn-in-place supervisor's turn spot) takes
+  // the goal's place when it lies on this path: same exact stop point and deceleration ramp.
+  const bool use_stop_pose = [&]() {
+    if (!stop_pose || path.points.size() < 2) {
+      return false;
+    }
+    constexpr double max_offset_m = 1.5;
+    const size_t i = autoware::motion_utils::findNearestIndex(path.points, stop_pose->position);
+    return autoware_utils::calc_distance2d(path.points.at(i).point.pose, *stop_pose) <
+           max_offset_m;
+  }();
+  if (use_stop_pose || sequence_contains_goal) {
+    const auto goal_pose = use_stop_pose ? *stop_pose : route_handler->getGoalPose();
     // [BIDIR-BUG-FIX #4] Inserts an exact point at goal_pose (interpolated via
     // insertTargetPoint()) instead of snapping to the nearest existing resampled point -- see
     // truncatePathAtGoal()'s doc comment in utils.hpp for why the old findNearestIndex()-only
