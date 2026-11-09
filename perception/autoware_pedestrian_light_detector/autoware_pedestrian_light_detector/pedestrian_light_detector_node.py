@@ -40,6 +40,7 @@ Service:
 """
 
 import collections
+import math
 
 import cv2
 import numpy as np
@@ -216,6 +217,9 @@ class PedestrianLightDetectorNode(Node):
         # punya tag height [meter], itu yg dipakai dan scale diabaikan.
         # Nilai di bawah 1.0 diabaikan (di-clamp ke 1.0).
         self.declare_parameter('tight_box_height_scale', 2.0)
+        # Ganti kamera hanya kalau kamera lain lebih dekat ke sumbu lebih dari ini (derajat);
+        # tag peta 'pedestrian_light_camera' pada way lampu mematok kamera sepenuhnya.
+        self.declare_parameter('camera_switch_hysteresis_deg', 15.0)
 
         # ---------- parameters: Autoware backend (backend='autoware') ----------
         # autoware_light_id: traffic_light_id yang dikirim ke classifier dan
@@ -1307,6 +1311,9 @@ class PedestrianLightDetectorNode(Node):
             self._roi_margin_px,
             self._light_radius_m,
             self._tight_box_height_scale,
+            current_cam=self._active_cam_name,
+            hysteresis_rad=math.radians(
+                float(self.get_parameter('camera_switch_hysteresis_deg').value)),
         )
 
         if result is None:

@@ -156,6 +156,9 @@
     # `cameras` di rotary_aimer.param.yaml dengan daftar ini.
     # Hanya kamera depan: ["front"]
     cameras: ["front", "right", "left", "rear"]   # rear = depan saat mundur (body tetap 0)
+    # Ganti kamera hanya kalau kamera lain lebih dekat ke sumbu > ini (derajat) -- anti ganti-ganti
+    # di batas dua kamera. Tag peta 'pedestrian_light_camera=<nama>' di way lampu mematok kameranya.
+    camera_switch_hysteresis_deg: 15.0
 
     # roi_margin_px: margin piksel yang ditambahkan ke setiap sisi bbox proyeksi
     # (padded bbox untuk crop ke classifier). Naikkan jika lampu terpotong.

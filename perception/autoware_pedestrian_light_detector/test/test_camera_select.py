@@ -89,3 +89,56 @@ def test_nearest_light_first_then_its_most_centred_camera():
 def test_no_camera_sees_the_light():
     # 40 deg FOV cameras leave 45 deg gaps
     assert rp.select([_light(45.0)], _cameras(40.0), _TfBuffer()) is None
+
+
+def _pinned_light(bearing_deg, camera):
+    lt = _light(bearing_deg)
+    lt.camera = camera
+    return lt
+
+
+def test_hysteresis_keeps_the_camera_in_use():
+    cams, tf = _cameras(120.0), _TfBuffer()
+    h = math.radians(15.0)
+    # light at 50 deg: left is 40 deg off, front 50 -- front in use stays (within 15 deg)
+    assert rp.select([_light(50.0)], cams, tf, current_cam='front', hysteresis_rad=h)[0] == 'front'
+    # light at 60 deg: left 30 off, front 60 -- beyond 15 deg, switch
+    assert rp.select([_light(60.0)], cams, tf, current_cam='front', hysteresis_rad=h)[0] == 'left'
+    # no camera in use yet / no hysteresis: the most centred one, as before
+    assert rp.select([_light(50.0)], cams, tf)[0] == 'left'
+    assert rp.select([_light(50.0)], cams, tf, current_cam='front')[0] == 'left'
+
+
+def test_hysteresis_stops_flip_flop_at_the_boundary():
+    # light wobbling around the front/left boundary (45 deg): the camera never changes
+    cams, tf = _cameras(120.0), _TfBuffer()
+    cur = 'front'
+    for b in (44.0, 46.0, 43.0, 47.5, 45.0, 48.0, 42.0):
+        cur = rp.select([_light(b)], cams, tf, current_cam=cur,
+                        hysteresis_rad=math.radians(15.0))[0]
+        assert cur == 'front', b
+
+
+def test_map_tag_pins_the_camera():
+    cams, tf = _cameras(120.0), _TfBuffer()
+    # pinned to front although left sees it more centred
+    assert rp.select([_pinned_light(50.0, 'front')], cams, tf)[0] == 'front'
+    # pin wins over the camera in use as well
+    assert rp.select([_pinned_light(50.0, 'front')], cams, tf, current_cam='left',
+                     hysteresis_rad=math.radians(15.0))[0] == 'front'
+    # pinned camera does not see the light: fall back to the automatic choice
+    assert rp.select([_pinned_light(50.0, 'rear')], cams, tf)[0] == 'left'
+
+
+def test_map_tag_is_parsed(tmp_path):
+    osm = tmp_path / 'm.osm'
+    osm.write_text(
+        '<osm>'
+        '<node id="1" lat="0" lon="0"><tag k="local_x" v="1"/><tag k="local_y" v="2"/></node>'
+        '<node id="2" lat="0" lon="0"><tag k="local_x" v="1"/><tag k="local_y" v="3"/></node>'
+        '<way id="10"><nd ref="1"/><nd ref="2"/><tag k="tf_pedestrian" v="true"/>'
+        '<tag k="pedestrian_light_camera" v="left"/></way>'
+        '<way id="11"><nd ref="1"/><nd ref="2"/><tag k="tf_pedestrian" v="true"/></way>'
+        '</osm>')
+    lights = {lt.way_id: lt for lt in rp.parse_tf_pedestrian_lights(str(osm))}
+    assert lights['10'].camera == 'left' and lights['11'].camera is None

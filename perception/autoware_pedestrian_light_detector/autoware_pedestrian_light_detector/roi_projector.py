@@ -71,6 +71,8 @@ class Light(NamedTuple):
     midpoint: Tuple[float, float, float]      # centroid semua titik
     height_m: Optional[float] = None    # tinggi fisik fixture (meter) dari tag OSM 'height';
                                         # None jika tag tidak ada — pakai tight_box_height_scale
+    camera: Optional[str] = None        # tag OSM 'pedestrian_light_camera': kamera yang dipatok
+                                        # untuk lampu ini (None = pilih otomatis)
 
 
 class CameraState(NamedTuple):
@@ -163,7 +165,12 @@ def parse_tf_pedestrian_lights(osm_path: str) -> List[Light]:
             except ValueError:
                 pass
 
-        lights.append(Light(way_id=wid, points=points, midpoint=mid, height_m=height_m))
+        # Tag 'pedestrian_light_camera' opsional: kamera yang SELALU dipakai untuk lampu ini
+        # (selama lampu masuk FOV-nya) -- tidak ada ganti-ganti kamera di batas dua kamera.
+        camera = tags.get('pedestrian_light_camera', '').strip() or None
+
+        lights.append(Light(way_id=wid, points=points, midpoint=mid, height_m=height_m,
+                            camera=camera))
 
     return lights
 
@@ -432,9 +439,16 @@ def select(
     margin_px: int = 40,
     light_radius_m: float = 0.15,
     tight_box_height_scale: float = 2.0,
+    current_cam: Optional[str] = None,
+    hysteresis_rad: float = 0.0,
 ) -> Optional[Tuple[str, Tuple[int, int, int, int], Optional[Tuple[int, int, int, int]], Light]]:
     """
     Pilih kamera + light terbaik dari semua kombinasi yang terlihat.
+
+    Kamera untuk light terpilih: (a) kamera yang dipatok tag peta light.camera, kalau ia melihat
+    light itu; (b) else kamera yang sedang dipakai (current_cam) selama ia tidak lebih dari
+    hysteresis_rad lebih jauh dari sumbu dibanding kamera terbaik -- anti ganti-ganti kamera
+    saat light di batas dua kamera; (c) else kamera paling tengah.
 
     1. Light: yang paling dekat (jarak midpoint ke kamera terdekat yang melihatnya).
     2. Kamera: dari kamera yang melihat light itu, yang paling TENGAH -- sudut horizontal
@@ -501,9 +515,22 @@ def select(
         key = id(light)
         nearest[key] = min(nearest.get(key, float('inf')), rng)
     best_light = min(seen, key=lambda e: nearest[id(e[5])])[5]
-    # ... lalu kamera yang melihatnya paling tengah.
-    _, _, cam_name, padded_bbox, tight_bbox, light = min(
-        (e for e in seen if e[5] is best_light), key=lambda e: e[1])
+    cands = [e for e in seen if e[5] is best_light]
+    # (a) kamera dipatok tag peta
+    pinned = getattr(best_light, 'camera', None)
+    if pinned:
+        for e in cands:
+            if e[2] == pinned:
+                return (e[2], e[3], e[4], e[5])
+    # (c) kamera paling tengah ...
+    best = min(cands, key=lambda e: e[1])
+    # (b) ... kecuali kamera yang sedang dipakai masih cukup dekat (histeresis)
+    if current_cam and hysteresis_rad > 0.0 and best[2] != current_cam:
+        for e in cands:
+            if e[2] == current_cam and e[1] <= best[1] + hysteresis_rad:
+                best = e
+                break
+    _, _, cam_name, padded_bbox, tight_bbox, light = best
     return (cam_name, padded_bbox, tight_bbox, light)
 
 
