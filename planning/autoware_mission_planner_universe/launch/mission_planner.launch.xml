@@ -20,6 +20,8 @@
       <param from="$(var mission_planner_param_path)"/>
       <param name="allow_reverse_route" value="$(var allow_reverse_route)"/>
       <param name="reverse_start_heading_check" value="$(var reverse_start_heading_check)"/>
+      <!-- [TURN-IN-PLACE 2026-11-09] the robot may reach a goal facing its opposite -->
+      <param name="arrival_check_accept_opposite_heading" value="$(var turn_in_place_mode)"/>
       <remap from="~/input/modified_goal" to="$(var modified_goal_topic_name)"/>
       <remap from="~/input/vector_map" to="$(var map_topic_name)"/>
       <remap from="~/input/odometry" to="/localization/kinematic_state"/>

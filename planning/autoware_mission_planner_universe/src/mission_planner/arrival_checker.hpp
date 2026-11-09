@@ -50,6 +50,9 @@ private:
   double arrival_check_longitudinal_overshoot_distance_;
   std::optional<PoseWithUuidStamped> goal_with_uuid_;
   bool is_reversed_goal_{false};
+  // [TURN-IN-PLACE 2026-11-09] A robot that turns around in place and drives inverted lanelets
+  // nose-first may reach a goal facing the opposite of its stored orientation; accept that too.
+  bool accept_opposite_heading_{false};
   rclcpp::Subscription<PoseWithUuidStamped>::SharedPtr sub_goal_;
   autoware::motion_utils::VehicleStopChecker vehicle_stop_checker_;
 };

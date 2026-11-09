@@ -19,6 +19,8 @@
 #include <autoware_utils/math/unit_conversion.hpp>
 #include <tf2/utils.hpp>
 
+#include <cmath>
+
 namespace autoware::mission_planner_universe
 {
 
@@ -33,6 +35,8 @@ ArrivalChecker::ArrivalChecker(rclcpp::Node * node) : vehicle_stop_checker_(node
   arrival_check_longitudinal_overshoot_distance_ =
     node->declare_parameter<double>("arrival_check_longitudinal_overshoot_distance");
   duration_ = node->declare_parameter<double>("arrival_check_duration");
+  accept_opposite_heading_ =
+    node->declare_parameter<bool>("arrival_check_accept_opposite_heading", false);
 }
 
 void ArrivalChecker::set_goal()
@@ -65,11 +69,21 @@ bool ArrivalChecker::is_arrived(const PoseStamped & pose) const
   const double dx = pose.pose.position.x - goal.pose.position.x;
   const double dy = pose.pose.position.y - goal.pose.position.y;
 
-  const double yaw_goal = tf2::getYaw(goal.pose.orientation);
+  const double yaw_pose = tf2::getYaw(pose.pose.orientation);
+  double yaw_goal = tf2::getYaw(goal.pose.orientation);
+  // [TURN-IN-PLACE 2026-11-09] arrival_check_accept_opposite_heading: when the vehicle faces the
+  // goal's opposite (within the angle threshold), judge it against that opposite heading --
+  // including the longitudinal axis, so undershoot/overshoot keep their meaning for a vehicle
+  // that arrived facing the other way.
+  if (
+    accept_opposite_heading_ &&
+    std::fabs(autoware_utils::normalize_radian(yaw_pose - yaw_goal)) > angle_ &&
+    std::fabs(autoware_utils::normalize_radian(yaw_pose - yaw_goal - M_PI)) <= angle_) {
+    yaw_goal = autoware_utils::normalize_radian(yaw_goal + M_PI);
+  }
   const double longitudinal_offset_to_goal = std::cos(yaw_goal) * dx + std::sin(yaw_goal) * dy;
   const double lateral_offset_to_goal = -std::sin(yaw_goal) * dx + std::cos(yaw_goal) * dy;
 
-  const double yaw_pose = tf2::getYaw(pose.pose.orientation);
   const double yaw_diff = autoware_utils::normalize_radian(yaw_pose - yaw_goal);
 
   // Check lateral distance.
