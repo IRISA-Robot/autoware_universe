@@ -138,6 +138,11 @@
     # Latch merah -> hijau hanya kalau merah terlihat >= ini sebelum hijau (merah kelap-kelip
     # sesaat bukan awal fase hijau) -> lebih pendek = latch biasa (cek merah / pola kedip).
     red_to_green_min_red_sec: 2.0       # [s]
+    # Wajib merah dulu: GO hanya dalam fase hijau yang dimulai setelah merah stabil >=
+    # red_to_green_min_red_sec, dan hanya dalam green_go_window_sec sejak hijau itu muncul. Hijau
+    # yang terlihat duluan / hijau kedip (merah palsu sesaat) -> tidak GO, tunggu siklus merah.
+    require_red_before_green: true
+    green_go_window_sec: 18.0          # [s] < durasi hijau solid terpendek di lokasi
     aim_only_if_light_unseen: true      # true: body baru noleh ke lampu kalau lampu TIDAK terdeteksi
                                         # (kamera mana pun) selama aim_unseen_grace_sec di WAIT_GREEN.
                                         # Sudah terlihat (merah/hijau) = tidak noleh, hemat motor.

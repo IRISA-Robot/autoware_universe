@@ -118,6 +118,8 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
   param_.latch_red_min_sec = declare_parameter<double>("latch_red_min_sec", 1.0);
   param_.latch_plain_red_min_sec = declare_parameter<double>("latch_plain_red_min_sec", 2.0);
   param_.red_to_green_min_red_sec = declare_parameter<double>("red_to_green_min_red_sec", 2.0);
+  param_.require_red_before_green = declare_parameter<bool>("require_red_before_green", true);
+  param_.green_go_window_sec = declare_parameter<double>("green_go_window_sec", 18.0);
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
   param_.aim_only_if_light_unseen = declare_parameter<bool>("aim_only_if_light_unseen", true);
@@ -712,6 +714,11 @@ void RoadCrossingFsmNode::onTimer()
       // -----------------------------------------------------------------------
       const bool at_pre = [&]() -> bool {
         if (active_pre_id_) {
+          // On the pre (base_link or leading bumper, as arming requires) = arrived, however deep
+          // into it: pre_dist is measured from the pre's START, so a robot started in auto in
+          // the stop zone of a long pre (6 m in on the 9 m pre 218) never "arrived" and the
+          // light detector was never enabled while the module held it in the zone.
+          if (egoOnPre(*active_pre_id_)) return true;
           const double d = distanceToPreEntry();
           return d >= 0.0 && d <= param_.pre_arrive_dist_m;
         } else {
@@ -2646,22 +2653,59 @@ void RoadCrossingFsmNode::updateLightInterlock(const char * where)
   }
 
   // Interlock
-  // Rule 1: merah lalu hijau → awal fase hijau, pasti bukan hijau kedip.  Di-latch selama
-  // hijau tetap terlihat tanpa putus, karena robot mungkin belum tiba di crossing saat
-  // transisinya terjadi.
-  if (il.prev_status == LightStatus::MERAH && il.status_now == LightStatus::HIJAU) {
-    il.red_to_green = true;
-    il.red_ticks_before_green = il.counter_merah_detected;
+  bool solid = false;
+  bool allows = false;
+  if (p.require_red_before_green) {
+    // Strict rule: GO only inside a green phase that began after a red held
+    // red_to_green_min_red_sec, within green_go_window_sec of that green's start.  A blinking
+    // green misread as a short red never arms it; a green seen first waits for the next red.
+    const int min_red_ticks =
+      static_cast<int>(std::ceil(p.red_to_green_min_red_sec * p.update_rate_hz));
+    const int window_ticks = static_cast<int>(std::ceil(p.green_go_window_sec * p.update_rate_hz));
+    if (il.status_now == LightStatus::MERAH) {
+      il.red_phase_ticks = std::max(il.red_phase_ticks, il.counter_merah_detected);
+      if (il.counter_merah_detected >= min_red_ticks) {
+        il.red_phase_ok = true;
+        il.green_phase_ticks = -1;  // a real red ends the previous green phase
+      }
+    }
+    if (il.status_now == LightStatus::HIJAU && il.red_phase_ok && il.green_phase_ticks < 0) {
+      il.green_phase_ticks = 0;
+      il.red_ticks_before_green = il.red_phase_ticks;
+      il.red_phase_ok = false;
+      il.red_phase_ticks = 0;
+      RCLCPP_INFO(
+        get_logger(), "%s interlock: fase hijau baru setelah merah %.1f s — GO boleh %.0f s", where,
+        il.red_ticks_before_green / p.update_rate_hz, p.green_go_window_sec);
+    }
+    if (il.green_phase_ticks >= 0 && il.green_phase_ticks <= window_ticks) ++il.green_phase_ticks;
+    const bool in_window = il.green_phase_ticks >= 0 && il.green_phase_ticks <= window_ticks;
+    il.red_to_green = in_window;
+    allows = il.status_now == LightStatus::HIJAU && in_window;
+    if (il.status_now == LightStatus::HIJAU && !in_window && std::string(where) == "WAIT_GREEN") {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "%s interlock: hijau tanpa merah >= %.1f s sebelumnya (atau di luar jendela %.0f s) — "
+        "tidak GO, menunggu siklus merah berikutnya",
+        where, p.red_to_green_min_red_sec, p.green_go_window_sec);
+    }
+  } else {
+    // Rule 1: merah lalu hijau → awal fase hijau, pasti bukan hijau kedip.  Di-latch selama
+    // hijau tetap terlihat tanpa putus, karena robot mungkin belum tiba di crossing saat
+    // transisinya terjadi.
+    if (il.prev_status == LightStatus::MERAH && il.status_now == LightStatus::HIJAU) {
+      il.red_to_green = true;
+      il.red_ticks_before_green = il.counter_merah_detected;
+    }
+    if (il.status_now != LightStatus::HIJAU) {
+      il.red_to_green = false;
+    }
+    // Rule 2: hijau tanpa merah sebelumnya — harus terlihat terus >= threshold solid, lebih
+    // lama dari satu nyala hijau kedip (kedip memutus counter lewat threshold_hijau_off).
+    solid = il.status_now == LightStatus::HIJAU &&
+            il.counter_hijau_detected >= p.threshold_interlock_hijau_solid;
+    allows = il.red_to_green || solid;
   }
-  if (il.status_now != LightStatus::HIJAU) {
-    il.red_to_green = false;
-  }
-  // Rule 2: hijau tanpa merah sebelumnya — harus terlihat terus >= threshold solid, lebih
-  // lama dari satu nyala hijau kedip (kedip memutus counter lewat threshold_hijau_off).
-  const bool solid =
-    il.status_now == LightStatus::HIJAU &&
-    il.counter_hijau_detected >= p.threshold_interlock_hijau_solid;
-  const bool allows = il.red_to_green || solid;
 
   const bool changed = il.status_now != il.prev_status || allows != il.allows_crossing;
   il.allows_crossing = allows;
@@ -2675,6 +2719,7 @@ void RoadCrossingFsmNode::updateLightInterlock(const char * where)
            " off=" + std::to_string(il.counter_hijau_not_detected) +
            " valid=" + std::to_string(il.status_hijau_valid) +
            "] merah->hijau=" + std::to_string(il.red_to_green) +
+           " fase_hijau=" + std::to_string(il.green_phase_ticks) +
            " solid=" + std::to_string(solid) + " boleh_nyebrang=" + std::to_string(allows);
   };
   if (changed) {

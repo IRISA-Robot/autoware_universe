@@ -191,6 +191,12 @@ private:
     // The red -> green latch needs a red seen this long before the green (a flicker is not the
     // start of a green phase); a shorter red arms the plain latch instead.
     double red_to_green_min_red_sec{2.0};
+    // true: GO only inside a green phase that began after a red held red_to_green_min_red_sec,
+    // and only within green_go_window_sec of that green's start.  A green seen first (no red
+    // before it) or a green after a short red (a blinking green misread) never gives GO: wait
+    // for the next red.  false: the old rules (red -> green edge, or a solid green).
+    bool require_red_before_green{true};
+    double green_go_window_sec{18.0};
     // true: only turn the body to the light when it is NOT detected from where the body
     // faces now (any camera) for aim_unseen_grace_sec in WAIT_GREEN; a light already seen
     // (red or green) needs no turn -- saves rotary motor work.  Once turned, the aimer stays
@@ -440,6 +446,11 @@ private:
     LightStatus prev_status{LightStatus::NONE};
     bool red_to_green{false};     // Rule 1, latched while green stays continuous
     uint16_t red_ticks_before_green{0};  // red detections before the last red -> green
+    // require_red_before_green: a red held long enough was seen (armed for the next green),
+    // its length in ticks, and ticks since the green phase after it began (-1 = none).
+    bool red_phase_ok{false};
+    uint16_t red_phase_ticks{0};
+    int green_phase_ticks{-1};
     bool allows_crossing{false};  // Rule 1 || Rule 2
   } interlock_;
 
