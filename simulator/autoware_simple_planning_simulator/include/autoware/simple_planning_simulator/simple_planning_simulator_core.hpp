@@ -15,6 +15,7 @@
 #ifndef AUTOWARE__SIMPLE_PLANNING_SIMULATOR__SIMPLE_PLANNING_SIMULATOR_CORE_HPP_
 #define AUTOWARE__SIMPLE_PLANNING_SIMULATOR__SIMPLE_PLANNING_SIMULATOR_CORE_HPP_
 
+#include "autoware/simple_planning_simulator/utils/steering_mode_mock.hpp"
 #include "autoware/simple_planning_simulator/vehicle_model/sim_model_interface.hpp"
 #include "autoware/simple_planning_simulator/visibility_control.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -24,6 +25,7 @@
 #include "autoware_map_msgs/msg/lanelet_map_bin.hpp"
 #include "autoware_planning_msgs/msg/lanelet_route.hpp"
 #include "autoware_planning_msgs/msg/trajectory.hpp"
+#include "autoware_turn_in_place_msgs/msg/steering_mode_feedback.hpp"
 #include "autoware_vehicle_msgs/msg/control_mode_report.hpp"
 #include "autoware_vehicle_msgs/msg/engage.hpp"
 #include "autoware_vehicle_msgs/msg/gear_command.hpp"
@@ -44,6 +46,7 @@
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "sensor_msgs/msg/imu.hpp"
+#include "std_msgs/msg/u_int8.hpp"
 #include "tier4_external_api_msgs/srv/initialize_pose.hpp"
 #include "tier4_vehicle_msgs/msg/actuation_command_stamped.hpp"
 #include "tier4_vehicle_msgs/msg/actuation_status_stamped.hpp"
@@ -53,6 +56,7 @@
 #include <tf2_ros/transform_listener.h>
 
 #include <memory>
+#include <optional>
 #include <set>
 #include <random>
 #include <string>
@@ -66,6 +70,7 @@ using autoware_control_msgs::msg::Control;
 using autoware_map_msgs::msg::LaneletMapBin;
 using autoware_planning_msgs::msg::LaneletRoute;
 using autoware_planning_msgs::msg::Trajectory;
+using autoware_turn_in_place_msgs::msg::SteeringModeFeedback;
 using autoware_vehicle_msgs::msg::ControlModeReport;
 using autoware_vehicle_msgs::msg::Engage;
 using autoware_vehicle_msgs::msg::GearCommand;
@@ -160,6 +165,15 @@ private:
   rclcpp::Subscription<ActuationCommandStamped>::SharedPtr sub_actuation_cmd_;
 
   rclcpp::Service<ControlModeCommand>::SharedPtr srv_mode_req_;
+
+  // [STEERING-MODE-MOCK 2026-11-05] Mock of the gama v2 steering-mode switch (FWS/RWS/4WCS/
+  // CRAB/HOLONOMIC).  Only created when steering_mode_mock.enable is true; when it is null the
+  // simulator behaves exactly as upstream.
+  std::unique_ptr<SteeringModeMock> steering_mode_mock_{};
+  std::optional<uint8_t> pending_steering_mode_{};  //!< request applied on the next on_timer()
+  rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr sub_steering_mode_;
+  rclcpp::Subscription<Twist>::SharedPtr sub_holonomic_twist_;
+  rclcpp::Publisher<SteeringModeFeedback>::SharedPtr pub_steering_mode_feedback_;
 
   rclcpp::CallbackGroup::SharedPtr group_api_service_;
   tier4_api_utils::Service<InitializePose>::SharedPtr srv_set_pose_;
@@ -333,6 +347,32 @@ private:
    * @brief timer callback for simulation with loop_rate
    */
   void on_timer();
+
+  /**
+   * @brief [STEERING-MODE-MOCK 2026-11-05] declare steering_mode_mock.* and, when enabled,
+   * create the mock with its topics
+   */
+  void initialize_steering_mode_mock();
+
+  /**
+   * @brief [STEERING-MODE-MOCK 2026-11-05] freeze the vehicle model at the mock's held pose
+   * with zero velocity, flushing its input delay queues with zero commands
+   * @param [in] dt time step [s]
+   */
+  void hold_vehicle_model_for_steering_mode(const double dt);
+
+  /**
+   * @brief [STEERING-MODE-MOCK 2026-11-05] true while the mock freezes the vehicle model
+   */
+  bool is_held_by_steering_mode_mock() const
+  {
+    return steering_mode_mock_ && steering_mode_mock_->holding();
+  }
+
+  /**
+   * @brief [STEERING-MODE-MOCK 2026-11-05] publish the mock's steering-mode feedback
+   */
+  void publish_steering_mode_feedback();
 
   /**
    * @brief initialize vehicle_model_ptr

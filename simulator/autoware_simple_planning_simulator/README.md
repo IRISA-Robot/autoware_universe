@@ -170,6 +170,37 @@ Ego vehicle pitch angle is calculated in the following manner.
 
 NOTE: driving against the line direction (as depicted in image's bottom row) is not supported and only shown for illustration purposes.
 
+### Steering mode mock (gama v2, off by default)
+
+<!-- [STEERING-MODE-MOCK 2026-11-05] -->
+
+The gama v2 chassis switches steering mode (`0`=FWS `1`=RWS `2`=4WCS `3`=CRAB `4`=HOLONOMIC) and,
+in HOLONOMIC, spins in place on a yaw-rate command. With `steering_mode_mock.enable: true` the
+simulator mocks this. With it `false` (default) nothing is subscribed or published and the
+simulator behaves exactly as before.
+
+| Name                                   | Type   | Description                                                                   | Default |
+| :------------------------------------- | :----- | :---------------------------------------------------------------------------- | :------ |
+| steering_mode_mock.enable              | bool   | enable the mock                                                               | false   |
+| steering_mode_mock.driving_mode        | int    | initial mode; any mode other than 4 runs the normal vehicle model             | 2       |
+| steering_mode_mock.mode_switch_time_s  | double | transition time [s]; the vehicle is held still and Control is ignored         | 1.5     |
+| steering_mode_mock.max_yaw_rate        | double | HOLONOMIC yaw-rate clamp [rad/s]                                              | 1.0     |
+| steering_mode_mock.max_yaw_acc         | double | HOLONOMIC yaw-rate slew limit [rad/s^2]                                       | 2.0     |
+| steering_mode_mock.fail_switch         | bool   | fault injection: transitions never complete (can be set at runtime)           | false   |
+
+Topics (only when enabled):
+
+- input/steering_mode [`std_msgs/msg/UInt8`] : requested mode (remap to `/gama/cmd/steering_mode`)
+- input/holonomic_twist [`geometry_msgs/msg/Twist`] : `angular.z` is the HOLONOMIC yaw rate; older than 0.5 s counts as zero
+- output/steering_mode_feedback [`autoware_turn_in_place_msgs/msg/SteeringModeFeedback`] : `mode` in force, `target_mode`, `switching`; published every tick
+
+Behaviour: a request for the current target is a no-op; any other request (also mid-transition)
+(re)starts a transition of `mode_switch_time_s`, during which the vehicle model is frozen at
+zero velocity. In HOLONOMIC the model stays frozen, the position is fixed and the yaw integrates
+the clamped, slew-limited yaw rate; odometry reports `linear.x = 0` and `angular.z` = that rate.
+When a transition into a driving mode completes, the vehicle model restarts from the held pose
+at standstill.
+
 ## Error detection and handling
 
 The only validation on inputs being done is testing for a valid vehicle model type.

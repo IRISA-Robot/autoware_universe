@@ -24,6 +24,8 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/simple_planning_simulator/vehicle_model/sim_model_actuation_cmd.cpp
   src/simple_planning_simulator/utils/csv_loader.cpp
   src/simple_planning_simulator/utils/mechanical_controller.cpp
+  # [STEERING-MODE-MOCK 2026-11-05] steering-mode switch mock (off by default)
+  src/simple_planning_simulator/utils/steering_mode_mock.cpp
 )
 target_include_directories(${PROJECT_NAME} PUBLIC ${Python3_INCLUDE_DIRS} ${autoware_learning_based_vehicle_model_INCLUDE_DIRS})
 # Node executable
@@ -39,6 +41,14 @@ if(BUILD_TESTING)
   )
 
   target_link_libraries(test_simple_planning_simulator
+    ${PROJECT_NAME}
+  )
+
+  # [STEERING-MODE-MOCK 2026-11-05] pure state-machine tests, no ROS timing involved
+  ament_add_ros_isolated_gtest(test_steering_mode_mock
+    test/test_steering_mode_mock.cpp
+  )
+  target_link_libraries(test_steering_mode_mock
     ${PROJECT_NAME}
   )
 endif()

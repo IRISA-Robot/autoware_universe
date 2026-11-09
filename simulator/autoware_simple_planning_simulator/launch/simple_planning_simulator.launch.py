@@ -64,6 +64,10 @@ def launch_setup(context, *args, **kwargs):
         ("output/hazard_lights_report", "/vehicle/status/hazard_lights_status"),
         ("output/control_mode_report", "/vehicle/status/control_mode"),
         ("output/actuation_status", "/vehicle/status/actuation_status"),
+        # [STEERING-MODE-MOCK 2026-11-05] only subscribed/published when the mock is enabled.
+        ("input/steering_mode", "/gama/cmd/steering_mode"),
+        ("input/holonomic_twist", "/control/turn_in_place/cmd_vel"),
+        ("output/steering_mode_feedback", "/gama/feedback/steering_mode"),
     ]
 
     # Additional remappings
@@ -98,6 +102,11 @@ def launch_setup(context, *args, **kwargs):
             simulator_model_param,
             {
                 "initial_engage_state": LaunchConfiguration("initial_engage_state"),
+                # [STEERING-MODE-MOCK 2026-11-05] overrides the simulator model param file.
+                "steering_mode_mock.enable": LaunchConfiguration("steering_mode_mock").perform(
+                    context
+                ).lower()
+                == "true",
             },
         ],
         remappings=remappings,
@@ -164,6 +173,12 @@ def generate_launch_description():
             "/param/simple_planning_simulator_default.param.yaml",
         ],
         "path to config file for simulator_model",
+    )
+
+    add_launch_arg(
+        "steering_mode_mock",
+        "false",
+        "mock the chassis' steering-mode switching and spin-in-place (turn-in-place)",
     )
 
     add_launch_arg(

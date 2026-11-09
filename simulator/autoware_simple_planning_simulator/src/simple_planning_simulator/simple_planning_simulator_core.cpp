@@ -238,6 +238,44 @@ SimplePlanningSimulator::SimplePlanningSimulator(const rclcpp::NodeOptions & opt
   // control mode
   current_control_mode_.mode = ControlModeReport::AUTONOMOUS;
   current_manual_gear_cmd_.command = GearCommand::PARK;
+
+  initialize_steering_mode_mock();
+}
+
+// [STEERING-MODE-MOCK 2026-11-05] The gama v2 chassis can spin in place after switching its
+// steering mode to HOLONOMIC (4).  The planning simulator mocks that switch so the turn-in-place
+// executor can be exercised in simulation.  Off by default: with enable=false nothing is
+// subscribed or published and the simulator behaves exactly as before.
+void SimplePlanningSimulator::initialize_steering_mode_mock()
+{
+  const bool enable = declare_parameter("steering_mode_mock.enable", false);
+  SteeringModeMockConfig config;
+  config.driving_mode =
+    static_cast<uint8_t>(declare_parameter<int64_t>("steering_mode_mock.driving_mode", 2));
+  config.mode_switch_time_s = declare_parameter("steering_mode_mock.mode_switch_time_s", 1.5);
+  config.max_yaw_rate = declare_parameter("steering_mode_mock.max_yaw_rate", 1.0);
+  config.max_yaw_acc = declare_parameter("steering_mode_mock.max_yaw_acc", 2.0);
+  config.fail_switch = declare_parameter("steering_mode_mock.fail_switch", false);
+  if (!enable) {
+    return;
+  }
+
+  steering_mode_mock_ = std::make_unique<SteeringModeMock>(config);
+  sub_steering_mode_ = create_subscription<std_msgs::msg::UInt8>(
+    "input/steering_mode", rclcpp::QoS{1},
+    [this](const std_msgs::msg::UInt8::ConstSharedPtr msg) { pending_steering_mode_ = msg->data; });
+  sub_holonomic_twist_ = create_subscription<Twist>(
+    "input/holonomic_twist", rclcpp::QoS{1}, [this](const Twist::ConstSharedPtr msg) {
+      steering_mode_mock_->set_yaw_rate_command(msg->angular.z, get_clock()->now().seconds());
+    });
+  pub_steering_mode_feedback_ =
+    create_publisher<SteeringModeFeedback>("output/steering_mode_feedback", rclcpp::QoS{1});
+  RCLCPP_INFO(
+    get_logger(),
+    "[STEERING-MODE-MOCK] enabled: driving_mode=%u switch_time=%.2fs max_yaw_rate=%.2f "
+    "max_yaw_acc=%.2f fail_switch=%s",
+    config.driving_mode, config.mode_switch_time_s, config.max_yaw_rate, config.max_yaw_acc,
+    config.fail_switch ? "true" : "false");
 }
 
 void SimplePlanningSimulator::initialize_vehicle_model(const std::string & vehicle_model_type_str)
@@ -418,6 +456,13 @@ rcl_interfaces::msg::SetParametersResult SimplePlanningSimulator::on_parameter(
   try {
     autoware_utils_rclcpp::update_param(parameters, "x_stddev", x_stddev_);
     autoware_utils_rclcpp::update_param(parameters, "y_stddev", y_stddev_);
+    // [STEERING-MODE-MOCK 2026-11-05] fault injection can be toggled at runtime.
+    bool fail_switch = false;
+    if (
+      steering_mode_mock_ && autoware_utils_rclcpp::update_param(
+                               parameters, "steering_mode_mock.fail_switch", fail_switch)) {
+      steering_mode_mock_->set_fail_switch(fail_switch);
+    }
   } catch (const rclcpp::exceptions::InvalidParameterTypeException & e) {
     result.successful = false;
     result.reason = e.what();
@@ -469,6 +514,7 @@ void SimplePlanningSimulator::on_timer()
 {
   if (!is_initialized_) {
     publish_control_mode_report();
+    publish_steering_mode_feedback();
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000, "waiting initialization...");
     return;
   }
@@ -483,16 +529,39 @@ void SimplePlanningSimulator::on_timer()
   {
     const double dt = delta_time_.get_dt(get_clock()->now());
 
-    if (current_control_mode_.mode == ControlModeReport::AUTONOMOUS) {
-      vehicle_model_ptr_->setGear(current_gear_cmd_.command);
-      set_input(current_input_command_, acc_by_slope);
-    } else {
-      vehicle_model_ptr_->setGear(current_manual_gear_cmd_.command);
-      set_input(current_manual_ackermann_cmd_, acc_by_slope);
+    // [STEERING-MODE-MOCK 2026-11-05] During a mode transition or in HOLONOMIC the Ackermann
+    // model is frozen and Control commands are ignored; the mock owns the pose.
+    auto mock_action = SteeringModeMock::Action::RUN_MODEL;
+    if (steering_mode_mock_) {
+      const double now_s = get_clock()->now().seconds();
+      if (pending_steering_mode_) {
+        const Pose2D current_pose{
+          vehicle_model_ptr_->getX(), vehicle_model_ptr_->getY(), vehicle_model_ptr_->getYaw()};
+        steering_mode_mock_->request_mode(*pending_steering_mode_, now_s, current_pose);
+        pending_steering_mode_.reset();
+      }
+      mock_action = steering_mode_mock_->step(now_s, simulate_motion_ ? dt : 0.0);
     }
 
-    if (simulate_motion_) {
-      vehicle_model_ptr_->update(dt);
+    if (mock_action == SteeringModeMock::Action::HOLD) {
+      hold_vehicle_model_for_steering_mode(dt);
+    } else {
+      if (mock_action == SteeringModeMock::Action::RESUME_FROM_HOLD) {
+        // Back in a driving mode: restart the model from the held pose at standstill.
+        hold_vehicle_model_for_steering_mode(0.0);
+      }
+
+      if (current_control_mode_.mode == ControlModeReport::AUTONOMOUS) {
+        vehicle_model_ptr_->setGear(current_gear_cmd_.command);
+        set_input(current_input_command_, acc_by_slope);
+      } else {
+        vehicle_model_ptr_->setGear(current_manual_gear_cmd_.command);
+        set_input(current_manual_ackermann_cmd_, acc_by_slope);
+      }
+
+      if (simulate_motion_) {
+        vehicle_model_ptr_->update(dt);
+      }
     }
   }
 
@@ -504,6 +573,14 @@ void SimplePlanningSimulator::on_timer()
 
   current_velocity_ = to_velocity_report(vehicle_model_ptr_);
   current_steer_ = to_steering_report(vehicle_model_ptr_);
+
+  // [STEERING-MODE-MOCK 2026-11-05] Held: no translation, yaw rate is the mock's spin rate.
+  if (is_held_by_steering_mode_mock()) {
+    current_odometry_.twist.twist.linear.x = 0.0;
+    current_odometry_.twist.twist.angular.z = steering_mode_mock_->yaw_rate();
+    current_velocity_.longitudinal_velocity = 0.0;
+    current_velocity_.heading_rate = static_cast<float>(steering_mode_mock_->yaw_rate());
+  }
 
   if (add_measurement_noise_) {
     add_measurement_noise(current_odometry_, current_velocity_, current_steer_);
@@ -536,6 +613,45 @@ void SimplePlanningSimulator::on_timer()
   if (vehicle_model_ptr_->shouldPublishActuationStatus()) {
     publish_actuation_status();
   }
+
+  publish_steering_mode_feedback();
+}
+
+void SimplePlanningSimulator::hold_vehicle_model_for_steering_mode(const double dt)
+{
+  // [STEERING-MODE-MOCK 2026-11-05]
+  const auto & held = steering_mode_mock_->held_pose();
+  Pose pose;
+  pose.position.x = held.x;
+  pose.position.y = held.y;
+  pose.orientation = autoware_utils_geometry::create_quaternion_from_yaw(held.yaw);
+
+  // Step the model with zero commands from standstill so its input delay queues hold zeros by
+  // the time driving resumes (otherwise pre-switch commands would replay), then pin it back.
+  if (simulate_motion_ && dt > 0.0) {
+    set_initial_state(pose, Twist{});
+    const InputCommand zero_cmd =
+      std::holds_alternative<ActuationCommandStamped>(current_input_command_)
+        ? InputCommand{ActuationCommandStamped{}}
+        : InputCommand{Control{}};
+    set_input(zero_cmd, 0.0);
+    vehicle_model_ptr_->update(dt);
+  }
+  set_initial_state(pose, Twist{});
+}
+
+void SimplePlanningSimulator::publish_steering_mode_feedback()
+{
+  // [STEERING-MODE-MOCK 2026-11-05]
+  if (!steering_mode_mock_) {
+    return;
+  }
+  SteeringModeFeedback msg;
+  msg.stamp = get_clock()->now();
+  msg.mode = steering_mode_mock_->mode();
+  msg.target_mode = steering_mode_mock_->target_mode();
+  msg.switching = steering_mode_mock_->switching();
+  pub_steering_mode_feedback_->publish(msg);
 }
 
 void SimplePlanningSimulator::on_map(const LaneletMapBin::ConstSharedPtr msg)
@@ -814,6 +930,11 @@ void SimplePlanningSimulator::set_initial_state_with_transform(
   pose.position.y = pose_stamped.pose.position.y + transform.transform.translation.y;
   pose.position.z = pose_stamped.pose.position.z + transform.transform.translation.z;
   pose.orientation = pose_stamped.pose.orientation;
+  // [STEERING-MODE-MOCK 2026-11-05] a teleport while held moves the held pose too.
+  if (is_held_by_steering_mode_mock()) {
+    steering_mode_mock_->set_held_pose(
+      Pose2D{pose.position.x, pose.position.y, tf2::getYaw(pose.orientation)});
+  }
   set_initial_state(pose, twist);
 }
 
@@ -953,7 +1074,8 @@ void SimplePlanningSimulator::publish_acceleration()
   AccelWithCovarianceStamped msg;
   msg.header.frame_id = "/base_link";
   msg.header.stamp = get_clock()->now();
-  msg.accel.accel.linear.x = vehicle_model_ptr_->getAx();
+  // [STEERING-MODE-MOCK 2026-11-05] the frozen model's last ax is meaningless while held.
+  msg.accel.accel.linear.x = is_held_by_steering_mode_mock() ? 0.0 : vehicle_model_ptr_->getAx();
   msg.accel.accel.linear.y = vehicle_model_ptr_->getWz() * vehicle_model_ptr_->getVx();
 
   using COV_IDX = autoware_utils_geometry::xyzrpy_covariance_index::XYZRPY_COV_IDX;
@@ -974,7 +1096,7 @@ void SimplePlanningSimulator::publish_imu()
   sensor_msgs::msg::Imu imu;
   imu.header.frame_id = "base_link";
   imu.header.stamp = now();
-  imu.linear_acceleration.x = vehicle_model_ptr_->getAx();
+  imu.linear_acceleration.x = is_held_by_steering_mode_mock() ? 0.0 : vehicle_model_ptr_->getAx();
   imu.linear_acceleration.y = vehicle_model_ptr_->getWz() * vehicle_model_ptr_->getVx();
   constexpr auto COV = 0.001;
   imu.linear_acceleration_covariance.at(COV_IDX::X_X) = COV;

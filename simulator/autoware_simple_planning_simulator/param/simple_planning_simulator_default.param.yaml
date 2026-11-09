@@ -18,6 +18,15 @@
     x_stddev: 0.0001 # x standard deviation for dummy covariance in map coordinate
     y_stddev: 0.0001 # y standard deviation for dummy covariance in map coordinate
     enable_road_slope_simulation: true # if true, slopes in the lanelet map are used to apply an extra acceleration to the ego vehicle
+    # [STEERING-MODE-MOCK 2026-11-05] mock of the gama v2 steering-mode switch (0=FWS 1=RWS
+    # 2=4WCS 3=CRAB 4=HOLONOMIC).  Off by default; see README "Steering mode mock".
+    steering_mode_mock:
+      enable: false
+      driving_mode: 2 # mode the Ackermann model runs in; any mode != 4 drives normally
+      mode_switch_time_s: 1.5 # transition time; vehicle held still, Control ignored
+      max_yaw_rate: 1.0 # [rad/s] HOLONOMIC yaw-rate clamp
+      max_yaw_acc: 2.0 # [rad/s^2] HOLONOMIC yaw-rate slew limit
+      fail_switch: false # fault injection: transitions never complete (runtime settable)
     # acceleration_map_path: $(var vehicle_model_pkg)/config/acceleration_map.csv  # only `DELAY_STEER_MAP_ACC_GEARED` needs this parameter
 
 # Note: vehicle characteristics parameters (e.g. wheelbase) are defined in a separate file.
