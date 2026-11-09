@@ -100,6 +100,10 @@ and `allow_reverse_route:=true`.
 
 ## Not done yet (hardware phase)
 
+See **[docs/hardware_integration.md](docs/hardware_integration.md)** for the full picture and the
+recommended way (master executes the turn).
+
+
 - On the real robot, multiplex `/control/turn_in_place/cmd_vel` into the middleware's `/cmd_vel`
   while the executor is active, and suppress Autoware's control command.
 - Have the middleware publish `SteeringModeFeedback`.
