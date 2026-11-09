@@ -28,6 +28,7 @@
 #include <lanelet2_routing/RoutingGraph.h>
 #include <lanelet2_traffic_rules/TrafficRulesFactory.h>
 
+#include <string>
 #include <vector>
 
 namespace autoware::mission_planner_universe::lanelet2
@@ -43,6 +44,8 @@ struct DefaultPlannerParameters
   // inverted lanelets at all. Defaults to false (backward compatible); see
   // bidirectional_plan/04-routing-foundation.md §4c. Wired via RouteHandler::setAllowReverseRoute().
   bool allow_reverse_route;
+  // [TURN-IN-PLACE 2026-11-05] "forward" | "any"; see RouteHandler::setReverseStartHeadingCheck().
+  std::string reverse_start_heading_check;
 };
 
 class DefaultPlanner : public mission_planner_universe::PlannerPlugin

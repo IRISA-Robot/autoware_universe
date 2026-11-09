@@ -95,6 +95,11 @@ void DefaultPlanner::initialize_common(rclcpp::Node * node)
   param_.allow_reverse_route =
     node_->declare_parameter<bool>("allow_reverse_route", false);
   route_handler_.setAllowReverseRoute(param_.allow_reverse_route);
+  // [TURN-IN-PLACE 2026-11-05] "forward" (default, legacy) or "any" (a robot that rotates in
+  // place before driving: ego's yaw no longer rejects a start lanelet / its inverted view).
+  param_.reverse_start_heading_check =
+    node_->declare_parameter<std::string>("reverse_start_heading_check", "forward");
+  route_handler_.setReverseStartHeadingCheck(param_.reverse_start_heading_check);
 }
 
 void DefaultPlanner::initialize(rclcpp::Node * node)

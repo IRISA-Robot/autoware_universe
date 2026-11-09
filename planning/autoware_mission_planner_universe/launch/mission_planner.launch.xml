@@ -9,11 +9,17 @@
   <arg name="visualization_topic_name" default="/planning/mission_planning/route_marker"/>
   <arg name="mission_planner_param_path" default="$(find-pkg-share autoware_mission_planner_universe)/config/mission_planner.param.yaml"/>
   <arg name="allow_reverse_route" default="false" description="Gates the bidirectional-driving reverse-route capability in mission_planner"/>
+  <!-- [TURN-IN-PLACE 2026-11-05] robot v2 turns around in place, so a route may start on a lanelet
+       the robot faces either way -->
+  <arg name="turn_in_place_mode" default="false"/>
+  <let name="reverse_start_heading_check" value="any" if="$(var turn_in_place_mode)"/>
+  <let name="reverse_start_heading_check" value="forward" unless="$(var turn_in_place_mode)"/>
 
   <node_container pkg="rclcpp_components" exec="component_container_mt" name="mission_planner_container" namespace="">
     <composable_node pkg="autoware_mission_planner_universe" plugin="autoware::mission_planner_universe::MissionPlanner" name="mission_planner" namespace="">
       <param from="$(var mission_planner_param_path)"/>
       <param name="allow_reverse_route" value="$(var allow_reverse_route)"/>
+      <param name="reverse_start_heading_check" value="$(var reverse_start_heading_check)"/>
       <remap from="~/input/modified_goal" to="$(var modified_goal_topic_name)"/>
       <remap from="~/input/vector_map" to="$(var map_topic_name)"/>
       <remap from="~/input/odometry" to="/localization/kinematic_state"/>
