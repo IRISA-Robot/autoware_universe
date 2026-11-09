@@ -70,17 +70,22 @@ bool point_in_any(const Point2d & p, const std::vector<Polygon2d> & polygons);
 /// interior grid of the same spacing (so a hole in the area under the body is caught too).
 std::vector<Point2d> footprint_samples(const Footprint & footprint, double margin, double spacing);
 
+/// Inside the area and outside every forbidden polygon (forbidden wins where they overlap).
+bool point_allowed(
+  const Point2d & p, const std::vector<Polygon2d> & area, const std::vector<Polygon2d> & forbidden);
+
 /// Whether the body stays inside the area (union of `area` polygons, given in the body frame at
-/// the start of the turn, origin = rotation centre) while it rotates by `rotation` [rad] (signed,
-/// CCW positive), sampled every `step` [rad].
+/// the start of the turn, origin = rotation centre) and out of every `forbidden` polygon while it
+/// rotates by `rotation` [rad] (signed, CCW positive), sampled every `step` [rad].
 bool sweep_inside_area(
   const std::vector<Polygon2d> & area, const Footprint & footprint, double margin, double rotation,
-  double step, double spacing);
+  double step, double spacing, const std::vector<Polygon2d> & forbidden = {});
 
 /// Whether a disk of `radius` around `centre` lies inside the area: its rim sampled every
 /// `angular_step` and its centre.  A body spinning a full turn about `centre` stays inside it.
 bool disk_inside_area(
-  const std::vector<Polygon2d> & area, const Point2d & centre, double radius, double angular_step);
+  const std::vector<Polygon2d> & area, const Point2d & centre, double radius, double angular_step,
+  const std::vector<Polygon2d> & forbidden = {});
 
 }  // namespace autoware::turn_in_place_supervisor
 

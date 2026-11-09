@@ -95,8 +95,11 @@ private:
   std::optional<double> route_heading_at_ego();
   std::optional<std::vector<Point2d>> obstacle_points_around_rotation_centre();
   void build_road_polygons();
+  static std::vector<Polygon2d> polygons_near(
+    const std::vector<RoadPolygon> & polygons, double x, double y, double radius);
   std::vector<Polygon2d> road_area_near(double x, double y, double radius) const;
-  std::vector<Polygon2d> road_area_in_body_frame(double radius) const;
+  std::vector<Polygon2d> no_turn_area_near(double x, double y, double radius) const;
+  std::vector<Polygon2d> to_body_frame(const std::vector<Polygon2d> & polygons) const;
   std::optional<TurnSpot> search_turn_spot();
   void publish_hold(bool hold);
   void publish_reverse_request(const DecisionOutput & out);
@@ -134,6 +137,10 @@ private:
   DecisionInput last_input_;
   bool holding_{false};
   std::vector<RoadPolygon> road_polygons_;
+  // [NO-TURN LANELETS 2026-11-09] lanelets tagged no_turn_lanelet_tag=yes: the body may not sweep
+  // into them while turning; the robot backs up until it is out of them.
+  std::vector<RoadPolygon> no_turn_polygons_;
+  std::string no_turn_lanelet_tag_{"disable_turn_in_place"};
   std::optional<TurnSpot> turn_spot_;
   double last_spot_search_time_{-1.0e9};
 

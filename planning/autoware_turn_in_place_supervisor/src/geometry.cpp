@@ -115,6 +115,12 @@ bool point_in_any(const Point2d & p, const std::vector<Polygon2d> & polygons)
   });
 }
 
+bool point_allowed(
+  const Point2d & p, const std::vector<Polygon2d> & area, const std::vector<Polygon2d> & forbidden)
+{
+  return point_in_any(p, area) && !point_in_any(p, forbidden);
+}
+
 std::vector<Point2d> footprint_samples(
   const Footprint & footprint, const double margin, const double spacing)
 {
@@ -139,7 +145,8 @@ std::vector<Point2d> footprint_samples(
 
 bool sweep_inside_area(
   const std::vector<Polygon2d> & area, const Footprint & footprint, const double margin,
-  const double rotation, const double step, const double spacing)
+  const double rotation, const double step, const double spacing,
+  const std::vector<Polygon2d> & forbidden)
 {
   if (area.empty()) {
     return false;
@@ -155,7 +162,7 @@ bool sweep_inside_area(
     for (const auto & p : samples) {
       // A body point, with the body rotated by theta, in the start frame.
       const Point2d q{c * p.x - s * p.y, s * p.x + c * p.y};
-      if (!point_in_any(q, area)) {
+      if (!point_allowed(q, area, forbidden)) {
         return false;
       }
     }
@@ -165,9 +172,9 @@ bool sweep_inside_area(
 
 bool disk_inside_area(
   const std::vector<Polygon2d> & area, const Point2d & centre, const double radius,
-  const double angular_step)
+  const double angular_step, const std::vector<Polygon2d> & forbidden)
 {
-  if (!point_in_any(centre, area)) {
+  if (!point_allowed(centre, area, forbidden)) {
     return false;
   }
   const double step = std::max(angular_step, 1e-3);
@@ -176,7 +183,8 @@ bool disk_inside_area(
   for (const double r : {radius, 0.5 * radius}) {
     for (size_t i = 0; i < n; ++i) {
       const double a = 2.0 * M_PI * static_cast<double>(i) / static_cast<double>(n);
-      if (!point_in_any(Point2d{centre.x + r * std::cos(a), centre.y + r * std::sin(a)}, area)) {
+      if (!point_allowed(
+            Point2d{centre.x + r * std::cos(a), centre.y + r * std::sin(a)}, area, forbidden)) {
         return false;
       }
     }

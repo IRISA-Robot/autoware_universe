@@ -21,6 +21,7 @@
 
 using autoware::turn_in_place_supervisor::disk_inside_area;
 using autoware::turn_in_place_supervisor::Footprint;
+using autoware::turn_in_place_supervisor::point_allowed;
 using autoware::turn_in_place_supervisor::point_in_any;
 using autoware::turn_in_place_supervisor::Polygon2d;
 using autoware::turn_in_place_supervisor::sweep_inside_area;
@@ -128,4 +129,21 @@ TEST(Geometry, DiskInsideTheUnionOfLanelets)
   EXPECT_TRUE(disk_inside_area(road, {2.5, 0.0}, 0.9, 10.0 * kDeg));
   EXPECT_FALSE(disk_inside_area(road, {2.5, 0.5}, 0.9, 10.0 * kDeg));
   EXPECT_FALSE(disk_inside_area(road, {0.5, 0.0}, 0.9, 10.0 * kDeg));
+}
+
+TEST(Geometry, NoTurnLaneletIsOffLimitsEvenWhereRoadOverlapsIt)
+{
+  // Wide road, but its upper half is also a no-turn lanelet.
+  const std::vector<Polygon2d> road{rect(-10.0, -1.2, 10.0, 1.2)};
+  const std::vector<Polygon2d> no_turn{rect(-10.0, 0.6, 10.0, 1.2)};
+  EXPECT_TRUE(point_allowed({0.0, 0.0}, road, no_turn));
+  EXPECT_FALSE(point_allowed({0.0, 0.9}, road, no_turn));
+  EXPECT_TRUE(sweep_inside_area(road, kBody, 0.1, M_PI, 5.0 * kDeg, 0.15));
+  EXPECT_FALSE(sweep_inside_area(road, kBody, 0.1, M_PI, 5.0 * kDeg, 0.15, no_turn));
+  EXPECT_TRUE(disk_inside_area(road, {0.0, 0.0}, 0.9, 10.0 * kDeg));
+  EXPECT_FALSE(disk_inside_area(road, {0.0, 0.0}, 0.9, 10.0 * kDeg, no_turn));
+  // Clear of it further along: allowed again.
+  const std::vector<Polygon2d> short_no_turn{rect(-10.0, -1.2, -2.0, 1.2)};
+  EXPECT_FALSE(disk_inside_area(road, {-1.5, 0.0}, 0.9, 10.0 * kDeg, short_no_turn));
+  EXPECT_TRUE(disk_inside_area(road, {0.0, 0.0}, 0.9, 10.0 * kDeg, short_no_turn));
 }

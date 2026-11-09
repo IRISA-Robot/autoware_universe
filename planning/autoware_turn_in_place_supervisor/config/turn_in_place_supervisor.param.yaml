@@ -27,6 +27,10 @@
     sweep_margin_m: 0.2
     road_margin_m: 0.1
     road_subtypes: ["road", "road_shoulder"]
+    # Lanelets tagged <no_turn_lanelet_tag>=yes (or true), any subtype, are off limits to the
+    # turning sweep -- even where another lanelet overlaps them. A robot that must turn while in
+    # (or next to) one backs up along the route until a spin fits clear of it, or to the goal.
+    no_turn_lanelet_tag: "disable_turn_in_place"
     sweep_step_deg: 5.0
     footprint_sample_spacing_m: 0.15
     # Spin centre along the body, relative to base_link [m] (the chassis spins about its centre).

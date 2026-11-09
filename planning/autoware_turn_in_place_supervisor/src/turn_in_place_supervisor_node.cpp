@@ -78,6 +78,7 @@ TurnInPlaceSupervisorNode::TurnInPlaceSupervisorNode(const rclcpp::NodeOptions &
   pointcloud_timeout_sec_ = declare_parameter<double>("pointcloud_timeout_sec");
   executor_status_timeout_sec_ = declare_parameter<double>("executor_status_timeout_sec");
   road_subtypes_ = declare_parameter<std::vector<std::string>>("road_subtypes");
+  no_turn_lanelet_tag_ = declare_parameter<std::string>("no_turn_lanelet_tag");
   spot_search_step_m_ = declare_parameter<double>("turn_spot.search_step_m");
   spot_search_max_m_ = declare_parameter<double>("turn_spot.search_max_m");
   spot_min_distance_m_ = declare_parameter<double>("turn_spot.min_distance_m");
@@ -160,13 +161,20 @@ void TurnInPlaceSupervisorNode::build_road_polygons()
   // Every road lanelet of the map counts as space the body may sweep while it turns -- the
   // neighbouring and opposite lanes and the shoulders too, not only the route.
   road_polygons_.clear();
+  no_turn_polygons_.clear();
   const auto map = route_handler_.getLaneletMapPtr();
   if (!map) {
     return;
   }
   for (const auto & llt : map->laneletLayer) {
+    // [NO-TURN LANELETS 2026-11-09] A lanelet tagged no_turn_lanelet_tag=yes (any subtype) is
+    // off limits to the turning sweep, even where another lanelet overlaps it.
+    const std::string no_turn = llt.attributeOr(no_turn_lanelet_tag_, "no");
+    const bool is_no_turn = no_turn == "yes" || no_turn == "true";
     const std::string subtype = llt.attributeOr(lanelet::AttributeName::Subtype, "");
-    if (std::find(road_subtypes_.begin(), road_subtypes_.end(), subtype) == road_subtypes_.end()) {
+    const bool is_road =
+      std::find(road_subtypes_.begin(), road_subtypes_.end(), subtype) != road_subtypes_.end();
+    if (!is_road && !is_no_turn) {
       continue;
     }
     RoadPolygon polygon;
@@ -180,18 +188,36 @@ void TurnInPlaceSupervisorNode::build_road_polygons()
       polygon.max_y = std::max(polygon.max_y, p.y());
     }
     if (polygon.points.size() >= 3) {
-      road_polygons_.push_back(std::move(polygon));
+      if (is_no_turn) {
+        no_turn_polygons_.push_back(polygon);
+      }
+      if (is_road) {
+        road_polygons_.push_back(std::move(polygon));
+      }
     }
   }
   RCLCPP_INFO(
-    get_logger(), "[TURN-IN-PLACE] road area: %zu lanelets", road_polygons_.size());
+    get_logger(), "[TURN-IN-PLACE] road area: %zu lanelets, no-turn (%s=yes): %zu lanelets",
+    road_polygons_.size(), no_turn_lanelet_tag_.c_str(), no_turn_polygons_.size());
 }
 
 std::vector<Polygon2d> TurnInPlaceSupervisorNode::road_area_near(
   const double x, const double y, const double radius) const
 {
+  return polygons_near(road_polygons_, x, y, radius);
+}
+
+std::vector<Polygon2d> TurnInPlaceSupervisorNode::no_turn_area_near(
+  const double x, const double y, const double radius) const
+{
+  return polygons_near(no_turn_polygons_, x, y, radius);
+}
+
+std::vector<Polygon2d> TurnInPlaceSupervisorNode::polygons_near(
+  const std::vector<RoadPolygon> & polygons, const double x, const double y, const double radius)
+{
   std::vector<Polygon2d> area;
-  for (const auto & polygon : road_polygons_) {
+  for (const auto & polygon : polygons) {
     if (
       polygon.max_x < x - radius || polygon.min_x > x + radius || polygon.max_y < y - radius ||
       polygon.min_y > y + radius) {
@@ -216,11 +242,11 @@ geometry_msgs::msg::Point TurnInPlaceSupervisorNode::rotation_centre_in_map() co
   return c;
 }
 
-std::vector<Polygon2d> TurnInPlaceSupervisorNode::road_area_in_body_frame(
-  const double radius) const
+std::vector<Polygon2d> TurnInPlaceSupervisorNode::to_body_frame(
+  const std::vector<Polygon2d> & polygons) const
 {
-  // Road polygons near the robot, in the frame the sweep is checked in: origin at the rotation
-  // centre, x along the body.
+  // Map-frame polygons in the frame the sweep is checked in: origin at the rotation centre, x
+  // along the body.
   std::vector<Polygon2d> area;
   if (!odom_) {
     return area;
@@ -229,7 +255,7 @@ std::vector<Polygon2d> TurnInPlaceSupervisorNode::road_area_in_body_frame(
   const double yaw = tf2::getYaw(odom_->pose.pose.orientation);
   const double cs = std::cos(-yaw);
   const double sn = std::sin(-yaw);
-  for (const auto & polygon : road_area_near(c.x, c.y, radius)) {
+  for (const auto & polygon : polygons) {
     Polygon2d local;
     local.reserve(polygon.size());
     for (const auto & p : polygon) {
@@ -392,7 +418,8 @@ std::optional<TurnInPlaceSupervisorNode::TurnSpot> TurnInPlaceSupervisorNode::se
   for (double si = s_ego + spot_min_distance_m_; si <= s_end; si += spot_search_step_m_) {
     const auto [c, yaw] = point_at(si);
     const auto area = road_area_near(c.x, c.y, radius + 0.5);
-    const bool fits = disk_inside_area(area, c, radius, 10.0 * kDegToRad);
+    const auto no_turn = no_turn_area_near(c.x, c.y, radius + 0.5);
+    const bool fits = disk_inside_area(area, c, radius, 10.0 * kDegToRad, no_turn);
     if (fits && !run_start) {
       run_start = si;
     }
@@ -490,11 +517,14 @@ void TurnInPlaceSupervisorNode::on_timer()
   if (in.route_valid && turn_relevant) {
     const double ccw = rotation_in_direction(ego_yaw, in.route_yaw, kDirectionCcw);
     const double cw = -rotation_in_direction(ego_yaw, in.route_yaw, kDirectionCw);
-    const auto road = road_area_in_body_frame(sweep_radius(footprint_, road_margin_) + 0.5);
+    const auto c = rotation_centre_in_map();
+    const double near_radius = sweep_radius(footprint_, road_margin_) + 0.5;
+    const auto road = to_body_frame(road_area_near(c.x, c.y, near_radius));
+    const auto no_turn = to_body_frame(no_turn_area_near(c.x, c.y, near_radius));
     ccw_inside_road = sweep_inside_area(
-      road, footprint_, road_margin_, ccw, sweep_step_rad_, footprint_sample_spacing_);
+      road, footprint_, road_margin_, ccw, sweep_step_rad_, footprint_sample_spacing_, no_turn);
     cw_inside_road = sweep_inside_area(
-      road, footprint_, road_margin_, cw, sweep_step_rad_, footprint_sample_spacing_);
+      road, footprint_, road_margin_, cw, sweep_step_rad_, footprint_sample_spacing_, no_turn);
     bool ccw_free = false;
     bool cw_free = false;
     if (const auto points = obstacle_points_around_rotation_centre()) {

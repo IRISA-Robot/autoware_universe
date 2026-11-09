@@ -26,6 +26,11 @@ direction, sampled every `sweep_step_deg`. A direction is safe only when the swe
 - touches no point of the no-ground pointcloud cropped around the robot, inflated by
   `sweep_margin_m`. If the cloud is missing or stale, both directions count as blocked.
 
+**No-turn lanelets.** A lanelet tagged `disable_turn_in_place=yes` (tag name:
+`no_turn_lanelet_tag`; any subtype) is off limits to the turning sweep, even where another
+lanelet overlaps it. A robot that has to turn while in or next to one does not turn there: it
+backs up along the route until a spin fits clear of it (or to the goal).
+
 **Turn spot.** When both sweeps leave the road lanelets, the route centreline ahead (towards the
 goal) is searched for the first place where a full spin (a disk of the body's corner radius +
 `road_margin_m`) fits in the lanelets. `reverse_lane_follow` is asked to back up to it
