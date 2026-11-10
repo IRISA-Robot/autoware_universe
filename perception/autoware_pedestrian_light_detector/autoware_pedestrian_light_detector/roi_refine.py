@@ -28,6 +28,12 @@ Region = Tuple[int, int, int, int]         # x1, y1, x2, y2
 Detection = Tuple[int, int, int, int, float]  # x, y, w, h, score
 
 
+def center_inside(box: Box, region: Region) -> bool:
+    x, y, w, h = box
+    cx, cy = x + w / 2.0, y + h / 2.0
+    return region[0] <= cx <= region[2] and region[1] <= cy <= region[3]
+
+
 def box_inside(box: Box, region: Region) -> bool:
     x, y, w, h = box
     return region[0] <= x and region[1] <= y and x + w <= region[2] and y + h <= region[3]
@@ -41,6 +47,7 @@ def select_detection(
     min_aspect: float = 1.0,
     min_h_ratio: float = 0.3,
     max_h_ratio: float = 3.0,
+    require_full_inside: bool = True,
 ) -> Optional[Box]:
     """Deteksi yang paling mungkin lampu pejalan kaki target, atau None.
 
@@ -56,7 +63,8 @@ def select_detection(
     for x, y, w, h, score in detections:
         if w <= 0 or h <= 0:
             continue
-        if not box_inside((x, y, w, h), rough):
+        inside = box_inside if require_full_inside else center_inside
+        if not inside((x, y, w, h), rough):
             continue
         if h / float(w) < min_aspect:
             continue
@@ -104,12 +112,14 @@ class DetectionHold:
             self._box = box
             self._t = now_sec
 
-    def get(self, now_sec: float, rough: Region) -> Optional[Box]:
+    def get(self, now_sec: float, rough: Region,
+            require_full_inside: bool = True) -> Optional[Box]:
         if self._box is None or self._t is None or self.hold_sec <= 0.0:
             return None
         if now_sec - self._t > self.hold_sec:
             return None
-        return self._box if box_inside(self._box, rough) else None
+        inside = box_inside if require_full_inside else center_inside
+        return self._box if inside(self._box, rough) else None
 
 
 def refine(
@@ -125,14 +135,18 @@ def refine(
     max_h_ratio: float = 3.0,
     fallback_scale_w: float = 2.0,
     fallback_scale_h: float = 2.0,
+    require_full_inside: bool = True,
 ) -> Tuple[Box, str]:
-    """ROI untuk classifier + sumbernya: 'detection' | 'hold' | 'fallback'."""
+    """ROI untuk classifier + sumbernya: 'detection' | 'hold' | 'fallback'.
+
+    require_full_inside=False: deteksi cukup PUSATNYA di ROI kasar (toleransi error
+    extrinsic/lokalisasi: lampu yang meleset ke tepi ROI tidak terbuang)."""
     det = select_detection(detections, rough, center, expect_wh_px[1],
-                           min_aspect, min_h_ratio, max_h_ratio)
+                           min_aspect, min_h_ratio, max_h_ratio, require_full_inside)
     if det is not None:
         hold.update(det, now_sec)
         return det, 'detection'
-    held = hold.get(now_sec, rough)
+    held = hold.get(now_sec, rough, require_full_inside)
     if held is not None:
         return held, 'hold'
     return fallback_box(center, expect_wh_px, img_wh, fallback_scale_w, fallback_scale_h), 'fallback'

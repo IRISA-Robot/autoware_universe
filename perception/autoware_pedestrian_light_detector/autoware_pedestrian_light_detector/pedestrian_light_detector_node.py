@@ -49,7 +49,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, PointCloud2, RegionOfInterest
 from std_msgs.msg import Float32
 from std_srvs.srv import SetBool
 
@@ -80,6 +80,9 @@ except ImportError:
 
 from autoware_pedestrian_light_detector.classifiers import make_classifier, geometric_gate
 from autoware_pedestrian_light_detector import roi_refine
+from autoware_pedestrian_light_detector import ae_feed
+from autoware_pedestrian_light_detector import lidar_check
+from autoware_pedestrian_light_detector import lens
 from autoware_pedestrian_light_detector.roi_projector import (
     parse_tf_pedestrian_lights,
     project_point,
@@ -220,6 +223,33 @@ class PedestrianLightDetectorNode(Node):
         # Ganti kamera hanya kalau kamera lain lebih dekat ke sumbu lebih dari ini (derajat);
         # tag peta 'pedestrian_light_camera' pada way lampu mematok kamera sepenuhnya.
         self.declare_parameter('camera_switch_hysteresis_deg', 15.0)
+        # ---------- leopard_cam_driver software AE (lihat ae_feed.py) ----------
+        # Kamera yang diklasifikasi dibaca dari /camera/<cam>/<camera_image_suffix>.
+        # "ae/image_raw" = salinan AE driver (ukuran + stamp sama dgn image_raw);
+        # "image_raw" = perilaku lama. Probe ukuran & debug_all_cameras tetap image_raw
+        # (supaya driver tidak memproses AE di semua kamera).
+        self.declare_parameter('camera_image_suffix', 'ae/image_raw')
+        # Topik itu diam selama ini [s] -> pindah ke fallback utk kamera itu sampai disable.
+        self.declare_parameter('camera_image_fallback_suffix', 'image_raw')
+        self.declare_parameter('camera_image_fallback_sec', 3.0)
+        # Kirim kotak padded (yang berwarna di debug image) kamera aktif ke driver sebagai
+        # ROI AE: /camera/<cam>/<ae_roi_topic_suffix>. Width 0 = tidak ada target.
+        self.declare_parameter('ae_roi_enable', True)
+        self.declare_parameter('ae_roi_topic_suffix', 'ae/roi')
+        # ---------- lidar check (lihat lidar_check.py) ----------
+        # Titik lidar di dalam kotak yang diklasifikasi (tidak di belakang lampu) -> map; jarak
+        # xy TERKECIL ke linestring lampu > max_dist -> kotak itu menunjukkan benda lain (orang
+        # baju hijau di depan kamera) -> hasil classifier frame itu = NONE (merah & hijau).
+        # Titik < min_points: tidak bisa menilai -> diterima. Hanya jalur fullframe.
+        # Proyeksi lampu (ROI) + lidar check memakai distorsi lensa camera_info.D (plumb_bob),
+        # karena yang dicrop adalah gambar RAW terdistorsi. false = pinhole K saja (perilaku lama).
+        self.declare_parameter('use_lens_distortion', True)
+        self.declare_parameter('lidar_check_enable', True)
+        self.declare_parameter('lidar_check_topic', '/perception/obstacle_segmentation/pointcloud')
+        self.declare_parameter('lidar_check_max_dist_m', 5.0)
+        self.declare_parameter('lidar_check_behind_margin_m', 1.0)
+        self.declare_parameter('lidar_check_min_points', 3)
+        self.declare_parameter('lidar_check_cloud_timeout_sec', 0.5)
 
         # ---------- parameters: Autoware backend (backend='autoware') ----------
         # autoware_light_id: traffic_light_id yang dikirim ke classifier dan
@@ -265,6 +295,11 @@ class PedestrianLightDetectorNode(Node):
         self.declare_parameter('autoware_ff_objects_topic', '~/ff/objects')
         # Filter deteksi full-frame (lihat roi_refine.select_detection)
         self.declare_parameter('autoware_ff_min_aspect', 1.0)
+        # false: deteksi YOLOX cukup PUSATNYA di ROI kasar (toleransi error extrinsic/lokalisasi)
+        self.declare_parameter('autoware_ff_require_full_inside', True)
+        # Gambar + ROI ke YOLOX/classifier maks segini [Hz]; state tetap publish_rate_hz dari
+        # hasil terakhir. 0 = tiap tick publish.
+        self.declare_parameter('autoware_clf_rate_hz', 0.0)
         self.declare_parameter('autoware_ff_min_h_ratio', 0.3)
         self.declare_parameter('autoware_ff_max_h_ratio', 3.0)
         # Kotak fallback peta = expect box (ukuran housing) x skala ini
@@ -344,6 +379,11 @@ class PedestrianLightDetectorNode(Node):
         self._autoware_ff_objects_topic = str(
             self.get_parameter('autoware_ff_objects_topic').value)
         self._ff_min_aspect = float(self.get_parameter('autoware_ff_min_aspect').value)
+        self._ff_require_full_inside = bool(
+            self.get_parameter('autoware_ff_require_full_inside').value)
+        self._clf_rate_hz = float(self.get_parameter('autoware_clf_rate_hz').value)
+        self._clf_last_send = None      # waktu [s] terakhir gambar dikirim ke YOLOX/classifier
+        self._clf_last_stamp = None     # stamp gambar terakhir yang dikirim
         self._ff_min_h_ratio = float(self.get_parameter('autoware_ff_min_h_ratio').value)
         self._ff_max_h_ratio = float(self.get_parameter('autoware_ff_max_h_ratio').value)
         self._fallback_scale_w = float(self.get_parameter('autoware_fallback_scale_w').value)
@@ -614,6 +654,34 @@ class PedestrianLightDetectorNode(Node):
         self._active_cam_name: str = ''
         # Subscription image_raw kamera aktif (Fase 2, untuk klasifikasi)
         self._active_image_sub = None
+        # Gambar AE driver + fallback ke image_raw (ae_feed.py)
+        self._image_source = ae_feed.ImageSourceFallback(
+            str(self.get_parameter('camera_image_suffix').value),
+            str(self.get_parameter('camera_image_fallback_suffix').value),
+            float(self.get_parameter('camera_image_fallback_sec').value))
+        self._active_image_suffix: str = ''
+        # Selama fallback: dengar topik AE kamera itu, balik ke AE begitu hidup lagi.
+        self._ae_probe_sub = None
+        self._ae_probe_cam: str = ''
+        # ROI AE ke driver: publisher per kamera, kamera yang terakhir dikirimi ROI non-nol
+        self._ae_roi_enable = bool(self.get_parameter('ae_roi_enable').value)
+        self._ae_roi_topic_suffix = str(self.get_parameter('ae_roi_topic_suffix').value)
+        self._ae_roi_pubs: dict = {}
+        self._ae_roi_cam: str = ''
+        # Lidar check
+        self._lidar_enable = bool(self.get_parameter('lidar_check_enable').value)
+        self._lidar_topic = str(self.get_parameter('lidar_check_topic').value)
+        self._lidar_max_dist = float(self.get_parameter('lidar_check_max_dist_m').value)
+        self._lidar_behind = float(self.get_parameter('lidar_check_behind_margin_m').value)
+        self._lidar_min_points = int(self.get_parameter('lidar_check_min_points').value)
+        self._lidar_timeout = float(self.get_parameter('lidar_check_cloud_timeout_sec').value)
+        self._lidar_sub = None
+        self._lidar_msg = None          # PointCloud2 terakhir (diparse lazily)
+        self._lidar_rx = None           # waktu terima [s]
+        self._lidar_pts = None          # (N,3) hasil parse _lidar_msg
+        self._lidar_pts_of = None       # msg yang sudah diparse
+        self._lidar_rejected = collections.OrderedDict()  # stamp -> Verdict (frame ditolak)
+        self._lidar_reject_count = 0    # per 100 frame, dilaporkan bersama sumber ROI
         # ROI bbox terakhir dari proyeksi map — padded (x1,y1,x2,y2)
         self._map_roi_bbox = None
         # Tight bbox terakhir dari proyeksi map (x1,y1,x2,y2) dalam koordinat image
@@ -751,6 +819,13 @@ class PedestrianLightDetectorNode(Node):
                 self._start_debug_timer()
             # Ukuran image_raw tiap kamera (untuk skala K) — kamera yang belum di-subscribe.
             self._subscribe_size_probes()
+            self._create_ae_roi_pubs()
+            if self._lidar_enable and self._lidar_sub is None:
+                self._lidar_sub = self.create_subscription(
+                    PointCloud2, self._lidar_topic, self._on_lidar_cloud, _SENSOR_QOS)
+                self.get_logger().info(
+                    f'[lidar] cek kotak vs lampu: {self._lidar_topic} '
+                    f'(jarak terkecil > {self._lidar_max_dist:.1f} m -> NONE)')
         else:
             # Fase 1: subscribe satu kamera tetap
             if self._cam_sub is None:
@@ -786,7 +861,21 @@ class PedestrianLightDetectorNode(Node):
             self.destroy_subscription(self._active_image_sub)
             self._active_image_sub = None
             self._active_cam_name = ''
+            self._active_image_suffix = ''
             self.get_logger().info('Active image subscription (Fase 2) dihancurkan.')
+        self._image_source.reset()   # episode berikutnya coba gambar AE lagi
+        self._drop_ae_probe()
+        self._clear_ae_roi()
+        for pub in self._ae_roi_pubs.values():
+            self.destroy_publisher(pub)
+        self._ae_roi_pubs.clear()
+        if self._lidar_sub is not None:
+            self.destroy_subscription(self._lidar_sub)
+            self._lidar_sub = None
+        self._lidar_msg = None
+        self._lidar_pts = None
+        self._lidar_pts_of = None
+        self._lidar_rejected.clear()
 
         # Hancurkan semua camera_info subscriptions
         for cam_name, sub in list(self._cam_info_subs.items()):
@@ -980,16 +1069,176 @@ class PedestrianLightDetectorNode(Node):
             self.get_logger().info(
                 f'[Fase 2] CameraInfo {cam_name}: '
                 f'frame={frame_id!r} {w}x{h} '
-                f'fx={K[0,0]:.1f} fy={K[1,1]:.1f}'
+                f'fx={K[0,0]:.1f} fy={K[1,1]:.1f} '
+                f'distorsi={msg.distortion_model or "-"} D={[round(v, 3) for v in msg.d]}'
             )
 
+        dist = None
+        if bool(self.get_parameter('use_lens_distortion').value):
+            dist = lens.Distortion.from_camera_info(msg.distortion_model, list(msg.d))
         self._cam_states[cam_name] = CameraState(
             name=cam_name,
             K=K,
             frame_id=frame_id,
             width=w,
             height=h,
+            dist=dist,
         )
+
+    def _now_sec(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    # ------------------------------------------------------------------
+    # Lidar check
+    # ------------------------------------------------------------------
+
+    def _on_lidar_cloud(self, msg: PointCloud2):
+        self._lidar_msg = msg
+        self._lidar_rx = self._now_sec()
+
+    def _lidar_points(self):
+        """(N,3) float64 of the latest fresh cloud, or None."""
+        msg = self._lidar_msg
+        if msg is None or self._lidar_rx is None:
+            return None
+        if self._now_sec() - self._lidar_rx > self._lidar_timeout:
+            return None
+        if self._lidar_pts_of is not msg:
+            try:
+                # read_points (structured), not read_points_numpy: the cloud carries fields
+                # of other types (intensity uint8, ...) and read_points_numpy refuses mixed
+                # datatypes even when only x/y/z are asked for.
+                from sensor_msgs_py import point_cloud2
+                rec = point_cloud2.read_points(
+                    msg, field_names=('x', 'y', 'z'), skip_nans=True)
+                self._lidar_pts = np.column_stack(
+                    [np.asarray(rec['x'], dtype=np.float64),
+                     np.asarray(rec['y'], dtype=np.float64),
+                     np.asarray(rec['z'], dtype=np.float64)]).reshape(-1, 3)
+            except Exception as e:  # noqa: BLE001
+                self.get_logger().warn(f'[lidar] parse cloud gagal: {e}',
+                                       throttle_duration_sec=10.0)
+                self._lidar_pts = None
+            self._lidar_pts_of = msg
+        return self._lidar_pts
+
+    def _lookup_T(self, target: str, source: str):
+        from rclpy.time import Time as RclpyTime
+        from autoware_pedestrian_light_detector.roi_projector import _quat_to_matrix
+        t = self._tf_buffer.lookup_transform(target, source, RclpyTime())
+        tr, ro = t.transform.translation, t.transform.rotation
+        return lidar_check.transform_matrix(
+            _quat_to_matrix(ro.x, ro.y, ro.z, ro.w), [tr.x, tr.y, tr.z])
+
+    def _lidar_verdict(self, box, cam_frame: str):
+        """lidar_check.Verdict untuk kotak (x,y,w,h) kamera aktif, atau None (tidak dicek)."""
+        if not self._lidar_enable or self._tf_buffer is None:
+            return None
+        light = self._active_light
+        cam_state = self._cam_states.get(self._active_cam_name)
+        if light is None or cam_state is None or cam_state.frame_id != cam_frame:
+            return None
+        pts = self._lidar_points()
+        if pts is None:
+            self.get_logger().warn(
+                f'[lidar] {self._lidar_topic} basi/tidak ada — kotak tidak dicek',
+                throttle_duration_sec=10.0)
+            return None
+        res = project_point(light.midpoint, cam_state.K, cam_state.frame_id,
+                            self._tf_buffer, stamp=None)
+        if res is None:
+            return None
+        try:
+            cloud_frame = self._lidar_msg.header.frame_id
+            T_cam = self._lookup_T(cam_state.frame_id, cloud_frame)
+            T_map = self._lookup_T('map', cloud_frame)
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warn(f'[lidar] tf gagal: {e}', throttle_duration_sec=10.0)
+            return None
+        return lidar_check.check(
+            pts, T_cam, T_map, cam_state.K, box, np.asarray(light.points, dtype=float), res[2],
+            max_dist_m=self._lidar_max_dist, behind_margin_m=self._lidar_behind,
+            min_points=self._lidar_min_points, dist=cam_state.dist)
+
+    def _drop_ae_probe(self):
+        if self._ae_probe_sub is not None:
+            self.destroy_subscription(self._ae_probe_sub)
+            self._ae_probe_sub = None
+            self._ae_probe_cam = ''
+
+    def _update_ae_probe(self, cam_name: str):
+        """Kamera aktif sedang fallback ke image_raw: dengar topik AE-nya; begitu AE kirim
+        frame lagi, kembali ke AE. Bukan fallback: probe tidak perlu."""
+        src = self._image_source
+        if src.should_return(cam_name):
+            self.get_logger().info(
+                f'[AE] {ae_feed.image_topic(cam_name, src.preferred)} hidup lagi — kembali '
+                'ke gambar AE')
+            self._drop_ae_probe()
+            self._ensure_image_sub(cam_name)
+            return
+        if not src.on_fallback(cam_name):
+            self._drop_ae_probe()
+            return
+        if self._ae_probe_sub is not None and self._ae_probe_cam == cam_name:
+            return
+        self._drop_ae_probe()
+
+        def probe_cb(_msg: Image, name=cam_name):
+            src.preferred_frame(self._now_sec(), name)
+
+        self._ae_probe_sub = self.create_subscription(
+            Image, ae_feed.image_topic(cam_name, src.preferred), probe_cb, _SENSOR_QOS)
+        self._ae_probe_cam = cam_name
+
+    # ------------------------------------------------------------------
+    # ROI AE ke leopard_cam_driver
+    # ------------------------------------------------------------------
+
+    def _create_ae_roi_pubs(self):
+        if not self._ae_roi_enable:
+            return
+        for cam_name in self._camera_names:
+            if cam_name in self._ae_roi_pubs:
+                continue
+            topic = ae_feed.image_topic(cam_name, self._ae_roi_topic_suffix)
+            # driver: QoS(1).best_effort()
+            self._ae_roi_pubs[cam_name] = self.create_publisher(
+                RegionOfInterest, topic, _SENSOR_QOS)
+        if self._ae_roi_pubs:
+            self.get_logger().info(
+                f'[AE] ROI ke driver: /camera/<cam>/{self._ae_roi_topic_suffix} '
+                f'untuk {sorted(self._ae_roi_pubs)}')
+
+    def _publish_ae_roi(self, cam_name: str, roi):
+        pub = self._ae_roi_pubs.get(cam_name)
+        if pub is None:
+            return
+        msg = RegionOfInterest()
+        if roi is not None:
+            msg.x_offset, msg.y_offset, msg.width, msg.height = (int(v) for v in roi)
+        msg.do_rectify = False   # piksel image yang dipublish (sama dgn crop classifier)
+        pub.publish(msg)
+
+    def _send_ae_roi(self, cam_name: str, padded_bbox):
+        """Kotak padded kamera aktif ke driver; kamera lama yang tadinya diberi ROI -> 0."""
+        if not self._ae_roi_enable:
+            return
+        if self._ae_roi_cam and self._ae_roi_cam != cam_name:
+            self._publish_ae_roi(self._ae_roi_cam, None)
+            self._ae_roi_cam = ''
+        cam_state = self._cam_states.get(cam_name)
+        roi = None
+        if cam_state is not None:
+            roi = ae_feed.bbox_to_roi(padded_bbox, cam_state.width, cam_state.height)
+        self._publish_ae_roi(cam_name, roi)
+        self._ae_roi_cam = cam_name if roi is not None else ''
+
+    def _clear_ae_roi(self):
+        """Tidak ada target: driver langsung kembali ke default ROI."""
+        if self._ae_roi_cam:
+            self._publish_ae_roi(self._ae_roi_cam, None)
+            self._ae_roi_cam = ''
 
     def _ensure_image_sub(self, cam_name: str):
         """
@@ -997,7 +1246,9 @@ class PedestrianLightDetectorNode(Node):
 
         Jika kamera berubah: destroy lama, buat baru.
         """
-        if cam_name == self._active_cam_name and self._active_image_sub is not None:
+        suffix = self._image_source.suffix_for(cam_name)
+        if (cam_name == self._active_cam_name and self._active_image_sub is not None and
+                suffix == self._active_image_suffix):
             return  # sudah benar
 
         # Hancurkan subscription lama jika berbeda kamera
@@ -1009,7 +1260,7 @@ class PedestrianLightDetectorNode(Node):
             )
 
         # Buat subscription baru
-        topic = f'/camera/{cam_name}/image_raw'
+        topic = ae_feed.image_topic(cam_name, suffix)
         self._active_image_sub = self.create_subscription(
             Image,
             topic,
@@ -1017,8 +1268,11 @@ class PedestrianLightDetectorNode(Node):
             _SENSOR_QOS,
         )
         self._active_cam_name = cam_name
+        self._active_image_suffix = suffix
+        self._image_source.subscribed(self._now_sec(), cam_name)
         self._last_frame = None        # reset frame saat ganti kamera
         self._last_raw_image = None    # reset raw image (autoware backend) saat ganti kamera
+        self._clf_last_stamp = None
         self._last_image_rx_time = None
         self._reset_fine_hold()        # bbox kamera lama tidak berlaku di kamera baru
         self.get_logger().info(
@@ -1037,6 +1291,7 @@ class PedestrianLightDetectorNode(Node):
         # (direpublish ke ~/clf/image dengan stamp asli)
         self._last_raw_image = msg
         self._last_image_rx_time = self.get_clock().now()
+        self._image_source.image(self._now_sec())
         if self._active_cam_name:
             self._note_image_size(self._active_cam_name, msg)
         try:
@@ -1163,6 +1418,10 @@ class PedestrianLightDetectorNode(Node):
 
         element = first_signal.elements[0]
 
+        # Frame yang kotaknya ditolak lidar check (benda dekat robot, bukan lampu) -> NONE.
+        rejected = self._lidar_rejected.pop(
+            (msg.header.stamp.sec, msg.header.stamp.nanosec), None)
+
         # TrafficLightElement.color: RED=1, GREEN=3 (dari .msg file)
         color = element.color
         if color == 1:    # RED
@@ -1172,6 +1431,8 @@ class PedestrianLightDetectorNode(Node):
         else:
             state = STATE_NONE
         if float(element.confidence) < self._autoware_min_confidence:
+            state = STATE_NONE
+        if rejected is not None:
             state = STATE_NONE
 
         now_sec = self.get_clock().now().nanoseconds * 1e-9
@@ -1299,6 +1560,7 @@ class PedestrianLightDetectorNode(Node):
         if not candidates:
             # Tidak ada lampu di peta, atau crossing aktif tidak punya lampu
             self._active_light = None
+            self._clear_ae_roi()
             self._publish_state(STATE_NONE, 0.0)
             return
 
@@ -1325,13 +1587,24 @@ class PedestrianLightDetectorNode(Node):
             self._map_roi_bbox = None
             self._map_tight_bbox = None
             self._active_light = None
+            self._clear_ae_roi()
             self._publish_state(STATE_NONE, 0.0)
             return
 
         sel_cam_name, sel_padded_bbox, sel_tight_bbox, sel_light = result
 
-        # Pastikan image_raw kamera terpilih di-subscribe
+        # Pastikan image kamera terpilih di-subscribe (gambar AE, atau image_raw kalau fallback)
         self._ensure_image_sub(sel_cam_name)
+        if self._image_source.check(self._now_sec()):
+            self.get_logger().warn(
+                f'[AE] {ae_feed.image_topic(sel_cam_name, self._active_image_suffix)} diam '
+                f'>= {self._image_source.fallback_sec:.1f} s — pindah ke '
+                f'{ae_feed.image_topic(sel_cam_name, self._image_source.fallback)} '
+                'sampai detector di-disable')
+            self._ensure_image_sub(sel_cam_name)
+        self._update_ae_probe(sel_cam_name)
+        # Kotak padded (berwarna di debug image) -> ROI AE driver kamera ini
+        self._send_ae_roi(sel_cam_name, sel_padded_bbox)
 
         # Simpan bbox + light untuk debug image
         self._map_roi_bbox = sel_padded_bbox
@@ -1444,9 +1717,22 @@ class PedestrianLightDetectorNode(Node):
         box, source = roi_refine.refine(
             dets, rough, center, expect_wh, img_wh, self._ff_hold, now_sec,
             self._ff_min_aspect, self._ff_min_h_ratio, self._ff_max_h_ratio,
-            self._fallback_scale_w, self._fallback_scale_h)
+            self._fallback_scale_w, self._fallback_scale_h,
+            require_full_inside=self._ff_require_full_inside)
         self._ff_source_count[source] += 1
         x, y, w, h = box
+        verdict = self._lidar_verdict(box, frame_id)
+        if verdict is not None and not verdict.ok:
+            key = (msg.header.stamp.sec, msg.header.stamp.nanosec)
+            self._lidar_rejected[key] = verdict
+            while len(self._lidar_rejected) > 50:
+                self._lidar_rejected.popitem(last=False)
+            self._lidar_reject_count += 1
+            self.get_logger().warn(
+                f'[lidar] kotak {source} ditolak: {verdict.n_front} titik di depan kamera, '
+                f'terdekat {verdict.min_dist_m:.1f} m dari lampu '
+                f'(> {self._lidar_max_dist:.1f} m) -> NONE',
+                throttle_duration_sec=1.0)
         self._final_rois_pub.publish(
             self._make_rois_msg((x, y, x + w, y + h), msg.header.stamp, frame_id))
         self._publish_roi_offset(x + w / 2.0, img_wh[0])
@@ -1454,8 +1740,10 @@ class PedestrianLightDetectorNode(Node):
         if total >= 100:
             self.get_logger().info(
                 '[fullframe] sumber ROI 100 frame terakhir: '
-                + ' '.join(f'{k}={v}' for k, v in sorted(self._ff_source_count.items())))
+                + ' '.join(f'{k}={v}' for k, v in sorted(self._ff_source_count.items()))
+                + (f' lidar_reject={self._lidar_reject_count}' if self._lidar_reject_count else ''))
             self._ff_source_count.clear()
+            self._lidar_reject_count = 0
 
     def _on_fine_rois(self, msg: 'TrafficLightRoiArray'):
         """Output fine detector -> classifier, isi frame yang miss dengan bbox terakhir.
@@ -1540,6 +1828,23 @@ class PedestrianLightDetectorNode(Node):
         # Stamp dari raw image (akan dipakai untuk KEDUA pesan: image + rois)
         img_stamp = raw_img.header.stamp
 
+        # Rate ke YOLOX/classifier dibatasi autoware_clf_rate_hz (hemat CPU); gambar yang sama
+        # tidak dikirim dua kali. Di tick yang dilewati state tetap dari hasil classifier terakhir.
+        now_s = self._now_sec()
+        stamp_key = (img_stamp.sec, img_stamp.nanosec)
+        send = stamp_key != self._clf_last_stamp and (
+            self._clf_rate_hz <= 0.0 or self._clf_last_send is None or
+            now_s - self._clf_last_send >= 1.0 / self._clf_rate_hz - 1e-3)
+        if send:
+            self._clf_last_send = now_s
+            self._clf_last_stamp = stamp_key
+            self._send_to_classifier(raw_img, img_stamp, sel_padded_bbox, sel_tight_bbox,
+                                     sel_cam_name)
+        self._finish_cb_map_autoware(sel_padded_bbox, sel_tight_bbox, sel_cam_name)
+
+    def _send_to_classifier(self, raw_img, img_stamp, sel_padded_bbox, sel_tight_bbox,
+                            sel_cam_name: str):
+        """Gambar + ROI (kasar / fine / langsung) ke YOLOX & classifier, stamp sama."""
         # --- Republish raw image (unchanged) ---
         self._clf_image_pub.publish(raw_img)
 
@@ -1596,6 +1901,8 @@ class PedestrianLightDetectorNode(Node):
             # fullframe: offset dari ROI final di _on_ff_objects
             self._publish_roi_offset((x1 + x2) / 2.0, int(raw_img.width))
 
+    def _finish_cb_map_autoware(self, sel_padded_bbox, sel_tight_bbox, sel_cam_name: str):
+        """State dari hasil classifier terakhir + debug image (tiap tick)."""
         # --- Ambil state dari cache (dengan staleness check) ---
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         raw_state, raw_conf = self._classifier.classify_cached(now_sec)
@@ -2084,6 +2391,7 @@ class PedestrianLightDetectorNode(Node):
             cam_state.frame_id,
             self._tf_buffer,
             stamp=None,
+            dist=cam_state.dist,
         )
 
         if mid_result is None:
@@ -2113,6 +2421,7 @@ class PedestrianLightDetectorNode(Node):
             self._roi_margin_px,
             self._light_radius_m,
             self._tight_box_height_scale,
+            dist=cam_state.dist,
         )
 
         label = (

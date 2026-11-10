@@ -155,10 +155,46 @@
     # aimer memutar body supaya kamera dengan error terkecil menghadap lampu -- samakan
     # `cameras` di rotary_aimer.param.yaml dengan daftar ini.
     # Hanya kamera depan: ["front"]
-    cameras: ["front", "right", "left", "rear"]   # rear = depan saat mundur (body tetap 0)
+    cameras: ["front", "right", "left"]   # 2026-11-10: rear dilepas dari detector (tidak dipakai, driver-nya berat)
     # Ganti kamera hanya kalau kamera lain lebih dekat ke sumbu > ini (derajat) -- anti ganti-ganti
     # di batas dua kamera. Tag peta 'pedestrian_light_camera=<nama>' di way lampu mematok kameranya.
     camera_switch_hysteresis_deg: 15.0
+    # 2026-11-10 toleransi error extrinsic/lokalisasi: deteksi YOLOX cukup PUSATNYA di ROI kasar
+    # (sebelumnya harus seluruhnya), dan ROI kasar lebih lebar.
+    autoware_ff_require_full_inside: true   # 2026-11-10: kembali seperti 6 Nov (deteksi harus seluruhnya di ROI)
+    # Gambar ke YOLOX + classifier maks segini [Hz] (hemat CPU); state tetap 10 Hz dari hasil
+    # classifier terakhir. 0 = tiap tick.
+    autoware_clf_rate_hz: 6.0
+    # ---- leopard_cam_driver software AE ----
+    # Kamera yang diklasifikasi (YOLOX + CNN) dibaca dari /camera/<cam>/<camera_image_suffix>.
+    # "ae/image_raw" = salinan AE driver (ukuran & stamp sama dgn image_raw); "image_raw" =
+    # perilaku lama. Probe ukuran & debug_all_cameras tetap pakai image_raw.
+    camera_image_suffix: "image_raw"   # 2026-11-10: kembali ke frame raw (AE belum terbukti lebih baik; ganti "ae/image_raw" utk A/B)
+    # Gambar AE diam selama ini [s] -> kamera itu pindah ke fallback; topik AE tetap didengar dan
+    # begitu kirim frame lagi (3 frame berturut) langsung kembali ke AE.
+    camera_image_fallback_suffix: "image_raw"
+    camera_image_fallback_sec: 3.0
+    # Kotak padded (yang berwarna di debug image) kamera aktif dikirim ke driver sebagai ROI AE
+    # (/camera/<cam>/<ae_roi_topic_suffix>, RegionOfInterest piksel image, do_rectify=false).
+    # Width 0 = tidak ada target (ganti kamera / lampu keluar FOV / disable) -> default_roi driver.
+    ae_roi_enable: false
+    ae_roi_topic_suffix: "ae/roi"
+    # ---- lidar check: kotak yang diklasifikasi benar-benar lampu dari peta? ----
+    # Titik lidar (tanpa tanah) yang jatuh di kotak final classifier (YOLOX / hold / kotak peta),
+    # kecuali yang di belakang lampu (> kedalaman lampu + behind_margin), diubah ke map; jarak xy
+    # TERKECIL ke linestring lampu > max_dist -> kotak itu menunjukkan benda lain di depan kamera
+    # (orang baju hijau) -> hasil frame itu NONE, merah maupun hijau. Titik < min_points = tidak
+    # bisa menilai -> diterima. Cloud basi (> timeout) -> tidak dicek (warn). Jalur fullframe.
+    # Proyeksi lampu (ROI) + lidar check memakai distorsi lensa camera_info.D (plumb_bob): yang
+    # dicrop adalah gambar RAW terdistorsi; tanpa ini ROI di pinggir gambar meleset ~40 px
+    # (k1 ~ -0.29). Hasilnya sebaik kalibrasi intrinsic kamera (kamera samping: cek kalibrasinya).
+    use_lens_distortion: true
+    lidar_check_enable: true
+    lidar_check_topic: "/perception/obstacle_segmentation/pointcloud"
+    lidar_check_max_dist_m: 5.0
+    lidar_check_behind_margin_m: 1.0
+    lidar_check_min_points: 3
+    lidar_check_cloud_timeout_sec: 0.5
 
     # roi_margin_px: margin piksel yang ditambahkan ke setiap sisi bbox proyeksi
     # (padded bbox untuk crop ke classifier). Naikkan jika lampu terpotong.

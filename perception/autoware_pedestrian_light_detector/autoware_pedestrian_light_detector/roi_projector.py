@@ -52,6 +52,8 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
+from autoware_pedestrian_light_detector import lens
+
 # tf2 imports — digunakan untuk lookup transform map->camera
 try:
     import tf2_ros
@@ -76,12 +78,13 @@ class Light(NamedTuple):
 
 
 class CameraState(NamedTuple):
-    """State satu kamera: intrinsic K + frame_id + resolusi."""
+    """State satu kamera: intrinsic K + distorsi + frame_id + resolusi."""
     name: str                 # nama kamera, mis. 'front'
     K: np.ndarray             # 3x3 intrinsic matrix
     frame_id: str             # optical frame dari camera_info.header.frame_id
     width: int                # lebar image (piksel)
     height: int               # tinggi image (piksel)
+    dist: Optional[object] = None  # lens.Distortion (camera_info.D) — None = pinhole murni
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +188,7 @@ def project_point(
     cam_frame: str,
     tf_buffer,
     stamp,
+    dist=None,
 ) -> Optional[Tuple[float, float, float]]:
     """
     Proyeksikan titik 3D dalam frame map ke piksel kamera.
@@ -250,16 +254,11 @@ def project_point(
     if Z <= 0.0:
         return None
 
-    # Proyeksi pinhole
-    fx = K[0, 0]
-    fy = K[1, 1]
-    cx = K[0, 2]
-    cy = K[1, 2]
-
-    u = fx * X / Z + cx
-    v = fy * Y / Z + cy
-
-    return (u, v, Z)
+    # Proyeksi pinhole + distorsi lensa (gambar yang dicrop adalah gambar RAW terdistorsi)
+    uv = lens.project_camera_point(X, Y, Z, K, dist)
+    if uv is None:
+        return None
+    return (uv[0], uv[1], Z)
 
 
 def light_roi_in_camera(
@@ -272,6 +271,7 @@ def light_roi_in_camera(
     margin_px: int = 40,
     light_radius_m: float = 0.15,
     tight_box_height_scale: float = 2.0,
+    dist=None,
 ) -> Tuple[Optional[Tuple[int, int, int, int]], Optional[Tuple[int, int, int, int]]]:
     """
     Hitung bounding box piksel dari satu light dalam satu kamera.
@@ -324,7 +324,7 @@ def light_roi_in_camera(
     in_fov_depths: List[float] = []
 
     for pt in light.points:
-        result = project_point(pt, K, cam_frame, tf_buffer, stamp=None)
+        result = project_point(pt, K, cam_frame, tf_buffer, stamp=None, dist=dist)
         if result is None:
             continue
         u, v, depth = result
@@ -483,6 +483,7 @@ def select(
                 cam.width, cam.height,
                 tf_buffer, margin_px, light_radius_m,
                 tight_box_height_scale,
+                dist=getattr(cam, 'dist', None),
             )
             if padded_bbox is None:
                 continue

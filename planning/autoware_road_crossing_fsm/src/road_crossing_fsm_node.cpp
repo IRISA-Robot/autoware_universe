@@ -120,6 +120,8 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
   param_.red_to_green_min_red_sec = declare_parameter<double>("red_to_green_min_red_sec", 2.0);
   param_.require_red_before_green = declare_parameter<bool>("require_red_before_green", true);
   param_.green_go_window_sec = declare_parameter<double>("green_go_window_sec", 18.0);
+  param_.green_min_on_before_go_sec =
+    declare_parameter<double>("green_min_on_before_go_sec", 1.0);
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
   param_.aim_only_if_light_unseen = declare_parameter<bool>("aim_only_if_light_unseen", true);
@@ -2662,15 +2664,43 @@ void RoadCrossingFsmNode::updateLightInterlock(const char * where)
     const int min_red_ticks =
       static_cast<int>(std::ceil(p.red_to_green_min_red_sec * p.update_rate_hz));
     const int window_ticks = static_cast<int>(std::ceil(p.green_go_window_sec * p.update_rate_hz));
+    const int min_on_ticks =
+      static_cast<int>(std::ceil(p.green_min_on_before_go_sec * p.update_rate_hz));
+    if (il.status_now == LightStatus::HIJAU) {
+      il.green_stable_ticks = std::min(il.green_stable_ticks + 1, 1 << 20);
+    } else {
+      il.green_stable_ticks = 0;
+    }
+    // Red is counted from the last green on: the detection counter would still include the red
+    // seen BEFORE a green blip (it only resets after merah_off ticks), so a 0.4 s red after a
+    // blip counted as 2.6 s (2026-11-10).
+    if (il.status_now == LightStatus::HIJAU) {
+      il.red_run_ticks = 0;
+    } else if (il.status_now == LightStatus::MERAH) {
+      il.red_run_ticks = std::min(il.red_run_ticks + 1, 1 << 20);
+    }
     if (il.status_now == LightStatus::MERAH) {
-      il.red_phase_ticks = std::max(il.red_phase_ticks, il.counter_merah_detected);
-      if (il.counter_merah_detected >= min_red_ticks) {
+      il.red_phase_ticks = static_cast<uint16_t>(std::min(il.red_run_ticks, 65535));
+      if (il.red_run_ticks >= min_red_ticks) {
         il.red_phase_ok = true;
         il.green_phase_ticks = -1;  // a real red ends the previous green phase
+        il.green_go_reached = false;
       }
+    }
+    // A green phase whose green breaks (NONE or red) BEFORE it was stable long enough is not a
+    // green phase: cancel it, and a new one needs a red held red_to_green_min_red_sec again.
+    // (2026-11-10: green blips interrupted by NONE kept one phase alive for 18 s until one blip
+    // lasted 2 s -> GO on a red light.)
+    if (il.green_phase_ticks >= 0 && !il.green_go_reached && il.status_now != LightStatus::HIJAU) {
+      il.green_phase_ticks = -1;
+      RCLCPP_WARN(
+        get_logger(),
+        "%s interlock: hijau putus sebelum stabil %.1f s — fase hijau batal, tunggu merah >= %.1f s "
+        "lagi", where, p.green_min_on_before_go_sec, p.red_to_green_min_red_sec);
     }
     if (il.status_now == LightStatus::HIJAU && il.red_phase_ok && il.green_phase_ticks < 0) {
       il.green_phase_ticks = 0;
+      il.green_go_reached = false;
       il.red_ticks_before_green = il.red_phase_ticks;
       il.red_phase_ok = false;
       il.red_phase_ticks = 0;
@@ -2680,8 +2710,15 @@ void RoadCrossingFsmNode::updateLightInterlock(const char * where)
     }
     if (il.green_phase_ticks >= 0 && il.green_phase_ticks <= window_ticks) ++il.green_phase_ticks;
     const bool in_window = il.green_phase_ticks >= 0 && il.green_phase_ticks <= window_ticks;
-    il.red_to_green = in_window;
-    allows = il.status_now == LightStatus::HIJAU && in_window;
+    const bool stable = il.green_stable_ticks >= min_on_ticks;
+    if (in_window && stable && il.status_now == LightStatus::HIJAU) il.green_go_reached = true;
+    if (in_window && il.status_now == LightStatus::HIJAU && il.green_stable_ticks == min_on_ticks) {
+      RCLCPP_INFO(
+        get_logger(), "%s interlock: hijau stabil %.1f s setelah merah — GO boleh", where,
+        il.green_stable_ticks / p.update_rate_hz);
+    }
+    il.red_to_green = in_window && stable;
+    allows = il.status_now == LightStatus::HIJAU && in_window && stable;
     if (il.status_now == LightStatus::HIJAU && !in_window && std::string(where) == "WAIT_GREEN") {
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 3000,
@@ -2720,6 +2757,7 @@ void RoadCrossingFsmNode::updateLightInterlock(const char * where)
            " valid=" + std::to_string(il.status_hijau_valid) +
            "] merah->hijau=" + std::to_string(il.red_to_green) +
            " fase_hijau=" + std::to_string(il.green_phase_ticks) +
+           " stabil=" + std::to_string(il.green_stable_ticks) +
            " solid=" + std::to_string(solid) + " boleh_nyebrang=" + std::to_string(allows);
   };
   if (changed) {

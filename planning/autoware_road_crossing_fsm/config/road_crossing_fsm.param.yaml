@@ -143,6 +143,10 @@
     # yang terlihat duluan / hijau kedip (merah palsu sesaat) -> tidak GO, tunggu siklus merah.
     require_red_before_green: true
     green_go_window_sec: 18.0          # [s] < durasi hijau solid terpendek di lokasi
+    # Hijau itu juga harus terlihat terus (status HIJAU tanpa putus, tanpa merah) minimal ini
+    # sebelum GO: kedipan hijau palsu 0.3 s setelah merah jelas bukan fase hijau (2026-11-10,
+    # lampu 889: 3x GO dari blip 0.3-0.6 s). GO jadi terlambat ~ini dari awal hijau.
+    green_min_on_before_go_sec: 2.0    # [s]
     aim_only_if_light_unseen: true      # true: body baru noleh ke lampu kalau lampu TIDAK terdeteksi
                                         # (kamera mana pun) selama aim_unseen_grace_sec di WAIT_GREEN.
                                         # Sudah terlihat (merah/hijau) = tidak noleh, hemat motor.

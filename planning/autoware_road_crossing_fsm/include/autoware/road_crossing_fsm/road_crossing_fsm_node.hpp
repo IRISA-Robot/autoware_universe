@@ -197,6 +197,10 @@ private:
     // for the next red.  false: the old rules (red -> green edge, or a solid green).
     bool require_red_before_green{true};
     double green_go_window_sec{18.0};
+    // ... and that green must be seen continuously (no red, status never left HIJAU) at least
+    // this long before it gives GO: a misread green blip of a few ticks after a red is not a
+    // green phase (2026-11-10: 0.3 s blips after a clear red gave GO three times).
+    double green_min_on_before_go_sec{1.0};
     // true: only turn the body to the light when it is NOT detected from where the body
     // faces now (any camera) for aim_unseen_grace_sec in WAIT_GREEN; a light already seen
     // (red or green) needs no turn -- saves rotary motor work.  Once turned, the aimer stays
@@ -451,6 +455,9 @@ private:
     bool red_phase_ok{false};
     uint16_t red_phase_ticks{0};
     int green_phase_ticks{-1};
+    int green_stable_ticks{0};    // consecutive ticks with status HIJAU (reset on anything else)
+    bool green_go_reached{false}; // this green phase reached green_min_on_before_go_sec
+    int red_run_ticks{0};         // MERAH ticks since the last HIJAU (NONE pauses, HIJAU resets)
     bool allows_crossing{false};  // Rule 1 || Rule 2
   } interlock_;
 
