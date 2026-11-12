@@ -164,6 +164,7 @@ private:
   double score_thresh_;
   std::vector<int> tlr_label_id_;
   bool match_detection_type_;
+  bool match_nearest_to_expect_;
   int car_label_id_{-1};
   int pedestrian_label_id_{-1};
 

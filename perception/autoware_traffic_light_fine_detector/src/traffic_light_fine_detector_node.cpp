@@ -25,6 +25,7 @@ namespace fs = ::std::experimental::filesystem;
 #endif
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -53,6 +54,11 @@ TrafficLightFineDetectorNode::TrafficLightFineDetectorNode(const rclcpp::NodeOpt
   // Keep only detections whose class matches the rough ROI's traffic_light_type (a car light
   // inside a pedestrian light's search ROI must not be matched to it). Off = upstream behaviour.
   match_detection_type_ = this->declare_parameter<bool>("match_detection_type", false);
+  // Pick, per light, the detection whose centre is NEAREST to the expect ROI centre (the map
+  // projection) instead of upstream's best score x size-IoU after shifting the expect ROI onto
+  // each detection (which ignores where the detection is, and so can take another lamp in a wide
+  // search ROI). IRISA road crossing, as traffic_light_infer.py --roi (d3 note). Off = upstream.
+  match_nearest_to_expect_ = this->declare_parameter<bool>("match_nearest_to_expect", false);
 
   int num_class;
   if (!readLabelFile(label_path, tlr_label_id_, num_class)) {
@@ -238,7 +244,23 @@ void TrafficLightFineDetectorNode::detectionMatch(
 {
   float max_score = 0.0f;
   std::map<int, autoware::tensorrt_yolox::Object> bestDetections;
+  if (match_nearest_to_expect_) {
+    for (const auto & [tlr_id, expect] : id2expectRoi) {
+      const double ecx = expect.roi.x_offset + expect.roi.width / 2.0;
+      const double ecy = expect.roi.y_offset + expect.roi.height / 2.0;
+      double best_d2 = std::numeric_limits<double>::max();
+      for (const autoware::tensorrt_yolox::Object & det : id2detections[tlr_id]) {
+        const double dx = det.x_offset + det.width / 2.0 - ecx;
+        const double dy = det.y_offset + det.height / 2.0 - ecy;
+        if (dx * dx + dy * dy < best_d2) {
+          best_d2 = dx * dx + dy * dy;
+          bestDetections[tlr_id] = det;
+        }
+      }
+    }
+  }
   for (const auto & roi_pair : id2expectRoi) {
+    if (match_nearest_to_expect_) break;
     int tlr_id = roi_pair.first;
     // the expected roi calculated from tf information
     const sensor_msgs::msg::RegionOfInterest & expect_roi = roi_pair.second.roi;

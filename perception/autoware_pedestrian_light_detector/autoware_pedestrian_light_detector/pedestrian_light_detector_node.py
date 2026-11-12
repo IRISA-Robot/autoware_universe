@@ -318,6 +318,19 @@ class PedestrianLightDetectorNode(Node):
         # pad_box: TensorRT boxes are ~1 px tighter than the ONNX reference, enough to turn a
         # small green lamp UNKNOWN).  Lidar / colour check keep the unpadded box.
         self.declare_parameter('autoware_clf_box_pad_px', 2)
+        # Then grown by [left, top, right, bottom] px (roi_refine.grow_box). [0, 0, 1, 1] with
+        # pad 0 = the reference crop of traffic_light_infer.py (TensorRT box is 1 px short).
+        self.declare_parameter('autoware_clf_box_grow_px', [0, 0, 0, 0])
+        # fine: search ROI of this fixed size [w, h] at a 640 px wide image (scaled with the
+        # width), centred on the projected light and shifted inside the image, as the d3 model
+        # was evaluated (traffic_light_infer.py --roi --roi-size 120,96). [0, 0] = old behaviour
+        # (map box + autoware_rough_margin_px).
+        self.declare_parameter('autoware_rough_size_px', [0, 0])
+        # GREEN below this classifier confidence -> NONE (d3 note: --green-min-conf 0.85 makes
+        # red->green 0 on Mapillary while real greens pass). 0 = off.
+        self.declare_parameter('autoware_green_min_confidence', 0.0)
+        # Output = majority (> half) of the last N classifier results, else NONE. 1 = off.
+        self.declare_parameter('autoware_majority_window', 1)
         self.declare_parameter('autoware_ff_min_h_ratio', 0.3)
         self.declare_parameter('autoware_ff_max_h_ratio', 3.0)
         # Kotak fallback peta = expect box (ukuran housing) x skala ini
@@ -402,6 +415,11 @@ class PedestrianLightDetectorNode(Node):
         self._ff_ped_only = bool(self.get_parameter('autoware_ff_pedestrian_class_only').value)
         self._clf_box_pad = int(self.get_parameter('autoware_clf_box_pad_px').value)
         self._clf_img_wh = None   # (w, h) of the last image sent to YOLOX / classifier
+        self._clf_box_grow = [int(v) for v in self.get_parameter('autoware_clf_box_grow_px').value]
+        self._rough_size = [int(v) for v in self.get_parameter('autoware_rough_size_px').value]
+        self._green_min_conf = float(self.get_parameter('autoware_green_min_confidence').value)
+        self._majority_window = max(1, int(self.get_parameter('autoware_majority_window').value))
+        self._clf_state_hist = collections.deque(maxlen=self._majority_window)
         self._clf_rate_hz = float(self.get_parameter('autoware_clf_rate_hz').value)
         self._clf_last_send = None      # waktu [s] terakhir gambar dikirim ke YOLOX/classifier
         self._clf_last_stamp = None     # stamp gambar terakhir yang dikirim
@@ -907,6 +925,7 @@ class PedestrianLightDetectorNode(Node):
         self._lidar_pts = None
         self._lidar_pts_of = None
         self._lidar_rejected.clear()
+        self._clf_state_hist.clear()
         self._clf_sent_imgs.clear()
         self._clf_final_boxes.clear()
 
@@ -1484,8 +1503,12 @@ class PedestrianLightDetectorNode(Node):
                 self._color_count.clear()
         if not overridden and conf < self._autoware_min_confidence:
             state = STATE_NONE
+        if state == STATE_GREEN and conf < self._green_min_conf:
+            state = STATE_NONE   # unsure green -> never a GO
         if rejected is not None:
             state = STATE_NONE
+        self._clf_state_hist.append(state)
+        state = roi_refine.majority(self._clf_state_hist, self._majority_window, STATE_NONE)
 
         now_sec = self.get_clock().now().nanoseconds * 1e-9
 
@@ -1790,7 +1813,9 @@ class PedestrianLightDetectorNode(Node):
                 f'terdekat {verdict.min_dist_m:.1f} m dari lampu '
                 f'(> {self._lidar_max_dist:.1f} m) -> NONE',
                 throttle_duration_sec=1.0)
-        px, py, pw, ph = roi_refine.pad_box(box, self._clf_box_pad, img_wh[0], img_wh[1])
+        px, py, pw, ph = roi_refine.grow_box(
+            roi_refine.pad_box(box, self._clf_box_pad, img_wh[0], img_wh[1]),
+            self._clf_box_grow, img_wh[0], img_wh[1])
         self._final_rois_pub.publish(
             self._make_rois_msg((px, py, px + pw, py + ph), msg.header.stamp, frame_id))
         if self._color_check_enable:
@@ -1835,8 +1860,9 @@ class PedestrianLightDetectorNode(Node):
                                        (msg.header.stamp.sec, msg.header.stamp.nanosec), box)
                     if self._clf_img_wh is not None:
                         (tl_roi.roi.x_offset, tl_roi.roi.y_offset, tl_roi.roi.width,
-                         tl_roi.roi.height) = roi_refine.pad_box(
-                            box, self._clf_box_pad, *self._clf_img_wh)
+                         tl_roi.roi.height) = roi_refine.grow_box(
+                            roi_refine.pad_box(box, self._clf_box_pad, *self._clf_img_wh),
+                            self._clf_box_grow, *self._clf_img_wh)
             out.rois.append(tl_roi)
         self._final_rois_pub.publish(out)
 
@@ -1976,8 +2002,13 @@ class PedestrianLightDetectorNode(Node):
             m = self._autoware_rough_margin_px
             img_w = int(raw_img.width)
             img_h = int(raw_img.height)
-            rough = (max(0, int(x1) - m), max(0, int(y1) - m),
-                     min(img_w, int(x2) + m), min(img_h, int(y2) + m))
+            if self._rough_size[0] > 0 and self._rough_size[1] > 0:
+                k = img_w / 640.0
+                rough = roi_refine.centered_roi(cx, cy, round(self._rough_size[0] * k),
+                                                round(self._rough_size[1] * k), img_w, img_h)
+            else:
+                rough = (max(0, int(x1) - m), max(0, int(y1) - m),
+                         min(img_w, int(x2) + m), min(img_h, int(y2) + m))
             ew, eh = self._expect_size_px(cam_state, x2 - x1, y2 - y1)
             expect = (max(0, int(round(cx - ew / 2.0))), max(0, int(round(cy - eh / 2.0))),
                       min(img_w, int(round(cx + ew / 2.0))), min(img_h, int(round(cy + eh / 2.0))))

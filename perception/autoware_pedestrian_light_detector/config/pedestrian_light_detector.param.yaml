@@ -170,6 +170,10 @@
     # classifier terakhir. 0 = tiap tick.
     autoware_clf_rate_hz: 6.0
     autoware_clf_box_pad_px: 2         # fullframe/fine: YOLOX box +2 px/sisi ke classifier (TRT box ~1 px lebih ketat dari ONNX; hijau 160/313 -> 310/313 di bag 14_11_46)
+    autoware_clf_box_grow_px: [0, 0, 0, 0]  # then grown [left, top, right, bottom] px
+    autoware_rough_size_px: [0, 0]     # [w, h] at 640 px wide; [0, 0] = map box + autoware_rough_margin_px
+    autoware_green_min_confidence: 0.0 # GREEN conf below -> NONE; 0 = off
+    autoware_majority_window: 1        # majority (> half) of the last N classifier results, else NONE; 1 = off
     # ---- leopard_cam_driver software AE ----
     # Kamera yang diklasifikasi (YOLOX + CNN) dibaca dari /camera/<cam>/<camera_image_suffix>.
     # "ae/image_raw" = salinan AE driver (ukuran & stamp sama dgn image_raw); "image_raw" =

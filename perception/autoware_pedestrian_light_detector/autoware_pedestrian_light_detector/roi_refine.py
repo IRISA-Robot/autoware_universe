@@ -166,3 +166,42 @@ def pad_box(box, pad: int, img_w: int, img_h: int):
     x0, y0 = max(0, x - pad), max(0, y - pad)
     x1, y1 = min(int(img_w), x + w + pad), min(int(img_h), y + h + pad)
     return x0, y0, max(0, x1 - x0), max(0, y1 - y0)
+
+
+def centered_roi(cx: float, cy: float, rw: int, rh: int, img_w: int, img_h: int):
+    """(x1, y1, x2, y2) of a rw x rh search ROI centred on (cx, cy), SHIFTED (not clipped) to
+    stay inside the image, exactly as traffic_light_infer.py --roi (d3 note: 120x96 at 640x480).
+    A ROI larger than the image is clipped to it."""
+    rw, rh = min(int(rw), int(img_w)), min(int(rh), int(img_h))
+    x0 = int(min(max(cx - rw / 2.0, 0), max(0, img_w - rw)))
+    y0 = int(min(max(cy - rh / 2.0, 0), max(0, img_h - rh)))
+    return x0, y0, x0 + rw, y0 + rh
+
+
+def majority(states, window: int, none_state):
+    """State held by MORE than half of the last ``window`` results, else ``none_state``.
+
+    d3 note: smooth the classifier output by majority over the last 5 results (at >= 15 Hz)
+    instead of re-classifying an old box: a single-frame false green (leaves next to an
+    occluded lamp, bag 2026-11-11 13:37:05) never reaches 3 of 5.
+    """
+    recent = list(states)[-int(window):] if window > 0 else list(states)
+    if not recent:
+        return none_state
+    best = max(set(recent), key=recent.count)
+    return best if recent.count(best) * 2 > len(recent) else none_state
+
+
+def grow_box(box, grow, img_w: int, img_h: int):
+    """(x, y, w, h) grown by ``grow`` = (left, top, right, bottom) px, clipped to the image.
+
+    TensorRT YOLOX boxes come out 1 px short on the right / bottom against the ONNX reference
+    (traffic_light_infer.py crops frame[int(y1):int(y2), int(x1):int(x2)]). (0, 0, 1, 1) gives
+    the reference crop: d3 classifier agreement 100% (bag 13_37_05) and 86.6% (13_35_36, a lamp
+    on the RED/UNKNOWN edge) vs 99.9% / 73.4% with a 2 px pad on every side.
+    """
+    x, y, w, h = (int(v) for v in box)
+    gl, gt, gr, gb = (int(v) for v in grow)
+    x0, y0 = max(0, x - gl), max(0, y - gt)
+    x1, y1 = min(int(img_w), x + w + gr), min(int(img_h), y + h + gb)
+    return x0, y0, max(0, x1 - x0), max(0, y1 - y0)
