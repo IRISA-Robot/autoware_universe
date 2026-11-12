@@ -68,3 +68,18 @@ def test_crop_image_msg_bgr_and_rgb_with_padding():
     assert color_check.crop_image_msg(buf.tobytes(), w, h, step, 'bgr8', (3, 4, 9, 9)).shape == (2, 2, 3)
     assert color_check.crop_image_msg(buf.tobytes(), w, h, step, 'mono8', (0, 0, 2, 2)) is None
     assert color_check.crop_image_msg(buf.tobytes(), w, h, step, 'bgr8', (9, 9, 2, 2)) is None
+
+
+def test_max_redness_and_full_lamp_gate_640():
+    p = color_check.Params(red_min=55, red_sat_min=0, green_max=45, green_sat_max=255,
+                           min_box_h=10, use_max=True, min_aspect=1.7)
+    # one lit red pixel in a washed-out top window (640x480 lamp, ~5x11 box)
+    img = np.full((11, 6, 3), (200, 205, 210), np.uint8)
+    img[2, 3] = (120, 130, 200)                        # R - max(G,B) = 70
+    assert color_check.judge(color_check.top_window_features(img), p) == 'red'
+    img[2, 3] = (200, 205, 210)                        # not lit
+    assert color_check.judge(color_check.top_window_features(img), p) == 'green'
+    # full lamp 6x11 judges; half a lamp (5x7) or a short box does not
+    assert color_check.full_lamp_box(6, 11, p)
+    assert not color_check.full_lamp_box(5, 7, p)
+    assert not color_check.full_lamp_box(6, 9, p)

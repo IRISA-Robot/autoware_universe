@@ -31,11 +31,18 @@ class Params(NamedTuple):
     green_max: float = 65.0
     green_sat_max: float = 70.0
     min_box_h: int = 8
+    # 2026-11-12, 640x480: the lamp window is 1-2 px, so the MAX redness (the lit pixel) is the
+    # feature; saturation does not separate across lamps (set the sat limits to 0 / 255).
+    use_max: bool = False
+    # Only a FULL lamp box may judge: a box on half a lamp (4x6 instead of 5x11, person or truck
+    # in front) has no red window in its top half and would read "not red" on a red lamp.
+    min_aspect: float = 0.0
 
 
 class Features(NamedTuple):
     redness_p90: float
     sat_mean: float
+    redness_max: float = 0.0
 
 
 def top_window_features(box_bgr: np.ndarray) -> Optional[Features]:
@@ -46,15 +53,22 @@ def top_window_features(box_bgr: np.ndarray) -> Optional[Features]:
     t = top.astype(np.float32)
     redness = t[..., 2] - np.maximum(t[..., 1], t[..., 0])
     sat = cv2.cvtColor(np.ascontiguousarray(top), cv2.COLOR_BGR2HSV)[..., 1]
-    return Features(float(np.percentile(redness, 90)), float(sat.astype(np.float32).mean()))
+    return Features(float(np.percentile(redness, 90)), float(sat.astype(np.float32).mean()),
+                    float(redness.max()))
+
+
+def full_lamp_box(w: int, h: int, p: Params = Params()) -> bool:
+    """Box big and tall enough to hold both windows (see Params.min_aspect)."""
+    return h >= p.min_box_h and w > 0 and h >= p.min_aspect * w
 
 
 def judge(feat: Optional[Features], p: Params = Params()) -> Optional[str]:
     if feat is None:
         return None
-    if feat.redness_p90 > p.red_min and feat.sat_mean > p.red_sat_min:
+    redness = feat.redness_max if p.use_max else feat.redness_p90
+    if redness > p.red_min and feat.sat_mean > p.red_sat_min:
         return 'red'
-    if feat.redness_p90 < p.green_max and feat.sat_mean < p.green_sat_max:
+    if redness < p.green_max and feat.sat_mean < p.green_sat_max:
         return 'green'
     return None
 

@@ -260,6 +260,8 @@ class PedestrianLightDetectorNode(Node):
         self.declare_parameter('color_check_green_max', 65.0)
         self.declare_parameter('color_check_green_sat_max', 70.0)
         self.declare_parameter('color_check_min_box_h', 8)
+        self.declare_parameter('color_check_use_max', False)
+        self.declare_parameter('color_check_min_aspect', 0.0)
 
         # ---------- parameters: Autoware backend (backend='autoware') ----------
         # autoware_light_id: traffic_light_id yang dikirim ke classifier dan
@@ -727,7 +729,9 @@ class PedestrianLightDetectorNode(Node):
             red_sat_min=float(self.get_parameter('color_check_red_sat_min').value),
             green_max=float(self.get_parameter('color_check_green_max').value),
             green_sat_max=float(self.get_parameter('color_check_green_sat_max').value),
-            min_box_h=int(self.get_parameter('color_check_min_box_h').value))
+            min_box_h=int(self.get_parameter('color_check_min_box_h').value),
+            use_max=bool(self.get_parameter('color_check_use_max').value),
+            min_aspect=float(self.get_parameter('color_check_min_aspect').value))
         self._clf_sent_imgs = collections.OrderedDict()   # stamp -> Image sent to classifier
         self._clf_final_boxes = collections.OrderedDict()  # stamp -> (x, y, w, h) classifier box
         self._color_count = collections.Counter()          # per 100 classifier results
@@ -1855,14 +1859,16 @@ class PedestrianLightDetectorNode(Node):
                 if tl_roi.roi.width > 0 and tl_roi.roi.height > 0:
                     box = (tl_roi.roi.x_offset, tl_roi.roi.y_offset,
                            tl_roi.roi.width, tl_roi.roi.height)
-                    if self._color_check_enable:
-                        self._remember(self._clf_final_boxes,
-                                       (msg.header.stamp.sec, msg.header.stamp.nanosec), box)
                     if self._clf_img_wh is not None:
-                        (tl_roi.roi.x_offset, tl_roi.roi.y_offset, tl_roi.roi.width,
-                         tl_roi.roi.height) = roi_refine.grow_box(
+                        box = roi_refine.grow_box(
                             roi_refine.pad_box(box, self._clf_box_pad, *self._clf_img_wh),
                             self._clf_box_grow, *self._clf_img_wh)
+                        (tl_roi.roi.x_offset, tl_roi.roi.y_offset, tl_roi.roi.width,
+                         tl_roi.roi.height) = box
+                    if self._color_check_enable:
+                        # the crop the classifier gets (padded / grown)
+                        self._remember(self._clf_final_boxes,
+                                       (msg.header.stamp.sec, msg.header.stamp.nanosec), box)
             out.rois.append(tl_roi)
         self._final_rois_pub.publish(out)
 
@@ -1876,7 +1882,8 @@ class PedestrianLightDetectorNode(Node):
         """(verdict 'red'|'green'|None, Features|None) for the frame the classifier just did."""
         img = self._clf_sent_imgs.pop(stamp_key, None)
         box = self._clf_final_boxes.pop(stamp_key, None)
-        if img is None or box is None or int(box[3]) < self._color_params.min_box_h:
+        if img is None or box is None or not color_check.full_lamp_box(
+                int(box[2]), int(box[3]), self._color_params):
             return None, None
         crop = color_check.crop_image_msg(img.data, img.width, img.height, img.step,
                                           img.encoding, box)

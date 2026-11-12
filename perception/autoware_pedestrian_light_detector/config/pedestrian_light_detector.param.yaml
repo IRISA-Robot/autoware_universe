@@ -215,6 +215,8 @@
     color_check_green_max: 65.0
     color_check_green_sat_max: 70.0
     color_check_min_box_h: 8
+    color_check_use_max: false        # true: max redness (lit pixel) instead of p90 (640x480 lamps)
+    color_check_min_aspect: 0.0       # only judge boxes with h >= min_aspect * w (full lamp)
 
     # roi_margin_px: margin piksel yang ditambahkan ke setiap sisi bbox proyeksi
     # (padded bbox untuk crop ke classifier). Naikkan jika lampu terpotong.
