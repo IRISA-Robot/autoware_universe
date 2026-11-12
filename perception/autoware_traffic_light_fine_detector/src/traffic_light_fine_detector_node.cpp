@@ -59,7 +59,11 @@ TrafficLightFineDetectorNode::TrafficLightFineDetectorNode(const rclcpp::NodeOpt
     RCLCPP_ERROR(this->get_logger(), "Could not find tlr id");
   }
 
-  const bool cuda_preprocess = true;
+  // true (upstream default): crop + bilinear letterbox on the GPU. false: crop + INTER_CUBIC
+  // letterbox on the CPU (TrtYoloX::multiScalePreprocess), the same as YOLOX training/eval.
+  // 2026-11-11 road crossing: with the GPU path the fine-tuned model found nothing in crops on
+  // which the same ONNX with the CPU letterbox found the light in 14/20 frames.
+  const bool cuda_preprocess = this->declare_parameter<bool>("cuda_preprocess", true);
   const std::string calib_image_list = "";
   const double scale = 1.0;
   const std::string cache_dir = "";

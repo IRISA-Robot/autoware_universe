@@ -150,3 +150,19 @@ def refine(
     if held is not None:
         return held, 'hold'
     return fallback_box(center, expect_wh_px, img_wh, fallback_scale_w, fallback_scale_h), 'fallback'
+
+
+def pad_box(box, pad: int, img_w: int, img_h: int):
+    """(x, y, w, h) grown by ``pad`` px per side, clipped to the image.
+
+    TensorRT YOLOX boxes come out ~1 px tighter than the ONNX reference
+    (traffic_light_infer.py).  On a 5x10 px pedestrian lamp the classifier then sees part of the
+    lit window cut off: on bag 2026-11-10 14:11:46 green frames went 160/313 GREEN with the raw
+    box, 310/313 with +2 px (red 636/636 either way).
+    """
+    x, y, w, h = (int(v) for v in box)
+    if pad <= 0:
+        return x, y, w, h
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(int(img_w), x + w + pad), min(int(img_h), y + h + pad)
+    return x0, y0, max(0, x1 - x0), max(0, y1 - y0)

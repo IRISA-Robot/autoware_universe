@@ -83,6 +83,7 @@ from autoware_pedestrian_light_detector import roi_refine
 from autoware_pedestrian_light_detector import ae_feed
 from autoware_pedestrian_light_detector import lidar_check
 from autoware_pedestrian_light_detector import lens
+from autoware_pedestrian_light_detector import color_check
 from autoware_pedestrian_light_detector.roi_projector import (
     parse_tf_pedestrian_lights,
     project_point,
@@ -250,6 +251,15 @@ class PedestrianLightDetectorNode(Node):
         self.declare_parameter('lidar_check_behind_margin_m', 1.0)
         self.declare_parameter('lidar_check_min_points', 3)
         self.declare_parameter('lidar_check_cloud_timeout_sec', 0.5)
+        # Colour check of the lamp's top window (color_check.py): under glare the CNN reads a
+        # green lamp as RED; when the check has an opinion (red man clearly lit / clearly not)
+        # it overrides the classifier's RED/GREEN.  Off by default.
+        self.declare_parameter('color_check_enable', False)
+        self.declare_parameter('color_check_red_min', 80.0)
+        self.declare_parameter('color_check_red_sat_min', 72.0)
+        self.declare_parameter('color_check_green_max', 65.0)
+        self.declare_parameter('color_check_green_sat_max', 70.0)
+        self.declare_parameter('color_check_min_box_h', 8)
 
         # ---------- parameters: Autoware backend (backend='autoware') ----------
         # autoware_light_id: traffic_light_id yang dikirim ke classifier dan
@@ -297,9 +307,17 @@ class PedestrianLightDetectorNode(Node):
         self.declare_parameter('autoware_ff_min_aspect', 1.0)
         # false: deteksi YOLOX cukup PUSATNYA di ROI kasar (toleransi error extrinsic/lokalisasi)
         self.declare_parameter('autoware_ff_require_full_inside', True)
+        # true: hanya deteksi YOLOX berkelas PEDESTRIAN (lampu pejalan kaki) yang dipakai. Butuh
+        # label file yang mempertahankan kelas (config/road_crossing/ped_yolox_labels.txt:
+        # BACKGROUND, CAR, PEDESTRIAN); dengan label lama semua jadi UNKNOWN -> set false.
+        self.declare_parameter('autoware_ff_pedestrian_class_only', True)
         # Gambar + ROI ke YOLOX/classifier maks segini [Hz]; state tetap publish_rate_hz dari
         # hasil terakhir. 0 = tiap tick publish.
         self.declare_parameter('autoware_clf_rate_hz', 0.0)
+        # fullframe / fine: YOLOX box grown by this many px per side before the classifier (roi_refine.
+        # pad_box: TensorRT boxes are ~1 px tighter than the ONNX reference, enough to turn a
+        # small green lamp UNKNOWN).  Lidar / colour check keep the unpadded box.
+        self.declare_parameter('autoware_clf_box_pad_px', 2)
         self.declare_parameter('autoware_ff_min_h_ratio', 0.3)
         self.declare_parameter('autoware_ff_max_h_ratio', 3.0)
         # Kotak fallback peta = expect box (ukuran housing) x skala ini
@@ -381,6 +399,9 @@ class PedestrianLightDetectorNode(Node):
         self._ff_min_aspect = float(self.get_parameter('autoware_ff_min_aspect').value)
         self._ff_require_full_inside = bool(
             self.get_parameter('autoware_ff_require_full_inside').value)
+        self._ff_ped_only = bool(self.get_parameter('autoware_ff_pedestrian_class_only').value)
+        self._clf_box_pad = int(self.get_parameter('autoware_clf_box_pad_px').value)
+        self._clf_img_wh = None   # (w, h) of the last image sent to YOLOX / classifier
         self._clf_rate_hz = float(self.get_parameter('autoware_clf_rate_hz').value)
         self._clf_last_send = None      # waktu [s] terakhir gambar dikirim ke YOLOX/classifier
         self._clf_last_stamp = None     # stamp gambar terakhir yang dikirim
@@ -682,6 +703,16 @@ class PedestrianLightDetectorNode(Node):
         self._lidar_pts_of = None       # msg yang sudah diparse
         self._lidar_rejected = collections.OrderedDict()  # stamp -> Verdict (frame ditolak)
         self._lidar_reject_count = 0    # per 100 frame, dilaporkan bersama sumber ROI
+        self._color_check_enable = bool(self.get_parameter('color_check_enable').value)
+        self._color_params = color_check.Params(
+            red_min=float(self.get_parameter('color_check_red_min').value),
+            red_sat_min=float(self.get_parameter('color_check_red_sat_min').value),
+            green_max=float(self.get_parameter('color_check_green_max').value),
+            green_sat_max=float(self.get_parameter('color_check_green_sat_max').value),
+            min_box_h=int(self.get_parameter('color_check_min_box_h').value))
+        self._clf_sent_imgs = collections.OrderedDict()   # stamp -> Image sent to classifier
+        self._clf_final_boxes = collections.OrderedDict()  # stamp -> (x, y, w, h) classifier box
+        self._color_count = collections.Counter()          # per 100 classifier results
         # ROI bbox terakhir dari proyeksi map — padded (x1,y1,x2,y2)
         self._map_roi_bbox = None
         # Tight bbox terakhir dari proyeksi map (x1,y1,x2,y2) dalam koordinat image
@@ -876,6 +907,8 @@ class PedestrianLightDetectorNode(Node):
         self._lidar_pts = None
         self._lidar_pts_of = None
         self._lidar_rejected.clear()
+        self._clf_sent_imgs.clear()
+        self._clf_final_boxes.clear()
 
         # Hancurkan semua camera_info subscriptions
         for cam_name, sub in list(self._cam_info_subs.items()):
@@ -1430,7 +1463,26 @@ class PedestrianLightDetectorNode(Node):
             state = STATE_GREEN
         else:
             state = STATE_NONE
-        if float(element.confidence) < self._autoware_min_confidence:
+        conf = float(element.confidence)
+        overridden = False
+        if self._color_check_enable:
+            verdict, feat = self._color_verdict((msg.header.stamp.sec, msg.header.stamp.nanosec))
+            clf_name = {STATE_RED: 'red', STATE_GREEN: 'green'}.get(state, 'none')
+            result = color_check.override(clf_name, verdict)
+            self._color_count[f'{clf_name}->{result}'] += 1
+            if result != clf_name:
+                overridden = True
+                state = STATE_RED if result == 'red' else STATE_GREEN
+                conf = max(conf, self._autoware_min_confidence)
+                self.get_logger().info(
+                    f'[color] classifier {clf_name.upper()} ({float(element.confidence):.2f}) '
+                    f'-> {result.upper()} (jendela atas: merah p90={feat.redness_p90:.0f} '
+                    f'sat={feat.sat_mean:.0f})', throttle_duration_sec=1.0)
+            if sum(self._color_count.values()) >= 100:
+                self.get_logger().info('[color] 100 hasil terakhir: ' + ' '.join(
+                    f'{k}={v}' for k, v in sorted(self._color_count.items())))
+                self._color_count.clear()
+        if not overridden and conf < self._autoware_min_confidence:
             state = STATE_NONE
         if rejected is not None:
             state = STATE_NONE
@@ -1439,7 +1491,7 @@ class PedestrianLightDetectorNode(Node):
 
         # update_result hanya ada di AutowareClassifier; guard type untuk keamanan
         if hasattr(self._classifier, 'update_result'):
-            self._classifier.update_result(state, float(element.confidence), now_sec)
+            self._classifier.update_result(state, conf, now_sec)
 
     # ------------------------------------------------------------------
     # Publish callback (timer utama — publish_rate_hz)
@@ -1710,6 +1762,11 @@ class PedestrianLightDetectorNode(Node):
         rough, center, expect_wh, img_wh, frame_id = pending
         dets = []
         for obj in msg.feature_objects:
+            if self._ff_ped_only:
+                cls = obj.object.classification
+                # autoware_perception_msgs ObjectClassification.PEDESTRIAN = 7
+                if not cls or max(cls, key=lambda c: c.probability).label != 7:
+                    continue
             r = obj.feature.roi
             dets.append((int(r.x_offset), int(r.y_offset), int(r.width), int(r.height),
                          float(obj.object.existence_probability)))
@@ -1733,8 +1790,12 @@ class PedestrianLightDetectorNode(Node):
                 f'terdekat {verdict.min_dist_m:.1f} m dari lampu '
                 f'(> {self._lidar_max_dist:.1f} m) -> NONE',
                 throttle_duration_sec=1.0)
+        px, py, pw, ph = roi_refine.pad_box(box, self._clf_box_pad, img_wh[0], img_wh[1])
         self._final_rois_pub.publish(
-            self._make_rois_msg((x, y, x + w, y + h), msg.header.stamp, frame_id))
+            self._make_rois_msg((px, py, px + pw, py + ph), msg.header.stamp, frame_id))
+        if self._color_check_enable:
+            self._remember(self._clf_final_boxes,
+                           (msg.header.stamp.sec, msg.header.stamp.nanosec), (x, y, w, h))
         self._publish_roi_offset(x + w / 2.0, img_wh[0])
         total = sum(self._ff_source_count.values())
         if total >= 100:
@@ -1766,8 +1827,35 @@ class PedestrianLightDetectorNode(Node):
                     x, y, w, h = self._fine_last_box
                     tl_roi.roi.x_offset, tl_roi.roi.y_offset = x, y
                     tl_roi.roi.width, tl_roi.roi.height = w, h
+                if tl_roi.roi.width > 0 and tl_roi.roi.height > 0:
+                    box = (tl_roi.roi.x_offset, tl_roi.roi.y_offset,
+                           tl_roi.roi.width, tl_roi.roi.height)
+                    if self._color_check_enable:
+                        self._remember(self._clf_final_boxes,
+                                       (msg.header.stamp.sec, msg.header.stamp.nanosec), box)
+                    if self._clf_img_wh is not None:
+                        (tl_roi.roi.x_offset, tl_roi.roi.y_offset, tl_roi.roi.width,
+                         tl_roi.roi.height) = roi_refine.pad_box(
+                            box, self._clf_box_pad, *self._clf_img_wh)
             out.rois.append(tl_roi)
         self._final_rois_pub.publish(out)
+
+    @staticmethod
+    def _remember(store: 'collections.OrderedDict', key, value, limit: int = 30):
+        store[key] = value
+        while len(store) > limit:
+            store.popitem(last=False)
+
+    def _color_verdict(self, stamp_key) -> tuple:
+        """(verdict 'red'|'green'|None, Features|None) for the frame the classifier just did."""
+        img = self._clf_sent_imgs.pop(stamp_key, None)
+        box = self._clf_final_boxes.pop(stamp_key, None)
+        if img is None or box is None or int(box[3]) < self._color_params.min_box_h:
+            return None, None
+        crop = color_check.crop_image_msg(img.data, img.width, img.height, img.step,
+                                          img.encoding, box)
+        feat = color_check.top_window_features(crop)
+        return color_check.judge(feat, self._color_params), feat
 
     def _fine_hold_valid(self, now) -> bool:
         """bbox terakhir masih boleh dipakai: belum basi dan masih di dalam ROI kasar sekarang."""
@@ -1847,6 +1935,9 @@ class PedestrianLightDetectorNode(Node):
         """Gambar + ROI (kasar / fine / langsung) ke YOLOX & classifier, stamp sama."""
         # --- Republish raw image (unchanged) ---
         self._clf_image_pub.publish(raw_img)
+        self._clf_img_wh = (int(raw_img.width), int(raw_img.height))
+        if self._color_check_enable:
+            self._remember(self._clf_sent_imgs, (img_stamp.sec, img_stamp.nanosec), raw_img)
 
         # --- Bangun TrafficLightRoiArray ---
         # Pakai TIGHT bbox (proyeksi 3D lampu — sama dgn yang dipakai geometric gate HSV),

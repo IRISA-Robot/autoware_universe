@@ -45,3 +45,10 @@ def test_refine_and_hold_follow_the_rule():
     assert src == 'hold' and box == (190, 150, 16, 30)
     box, src = rr.refine([], ROUGH, CENTER, (14.0, 30.0), (640, 480), hold, 0.6)
     assert src == 'fallback'          # full-inside rule: the held box is outside
+
+
+def test_pad_box_grows_and_clips():
+    assert rr.pad_box((100, 50, 5, 10), 2, 640, 480) == (98, 48, 9, 14)
+    assert rr.pad_box((0, 1, 5, 10), 2, 640, 480) == (0, 0, 7, 13)
+    assert rr.pad_box((636, 470, 4, 10), 2, 640, 480) == (634, 468, 6, 12)
+    assert rr.pad_box((10, 10, 5, 10), 0, 640, 480) == (10, 10, 5, 10)

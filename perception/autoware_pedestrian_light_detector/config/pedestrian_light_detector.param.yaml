@@ -162,9 +162,14 @@
     # 2026-11-10 toleransi error extrinsic/lokalisasi: deteksi YOLOX cukup PUSATNYA di ROI kasar
     # (sebelumnya harus seluruhnya), dan ROI kasar lebih lebar.
     autoware_ff_require_full_inside: true   # 2026-11-10: kembali seperti 6 Nov (deteksi harus seluruhnya di ROI)
+    # Hanya deteksi YOLOX berkelas PEDESTRIAN (lampu pejalan kaki) yang dipakai -- seperti
+    # traffic_light_infer.py. Butuh label file config/road_crossing/ped_yolox_labels.txt
+    # (BACKGROUND, CAR, PEDESTRIAN); dengan label asli semua UNKNOWN -> set false.
+    autoware_ff_pedestrian_class_only: true
     # Gambar ke YOLOX + classifier maks segini [Hz] (hemat CPU); state tetap 10 Hz dari hasil
     # classifier terakhir. 0 = tiap tick.
     autoware_clf_rate_hz: 6.0
+    autoware_clf_box_pad_px: 2         # fullframe/fine: YOLOX box +2 px/sisi ke classifier (TRT box ~1 px lebih ketat dari ONNX; hijau 160/313 -> 310/313 di bag 14_11_46)
     # ---- leopard_cam_driver software AE ----
     # Kamera yang diklasifikasi (YOLOX + CNN) dibaca dari /camera/<cam>/<camera_image_suffix>.
     # "ae/image_raw" = salinan AE driver (ukuran & stamp sama dgn image_raw); "image_raw" =
@@ -195,6 +200,17 @@
     lidar_check_behind_margin_m: 1.0
     lidar_check_min_points: 3
     lidar_check_cloud_timeout_sec: 0.5
+    # Colour check of the lamp's top window (red man), overrides the CNN's RED/GREEN when it
+    # has an opinion: under glare (lamp 892, 2026-11-11) the CNN read 295/298 green frames as
+    # RED; this check: red phase 531 red / 0 green, green phase 294 green / 1 red.
+    #   red   : redness p90 (R-max(G,B)) > red_min  AND  saturation mean > red_sat_min
+    #   green : redness p90 < green_max AND saturation mean < green_sat_max
+    color_check_enable: false
+    color_check_red_min: 80.0
+    color_check_red_sat_min: 72.0
+    color_check_green_max: 65.0
+    color_check_green_sat_max: 70.0
+    color_check_min_box_h: 8
 
     # roi_margin_px: margin piksel yang ditambahkan ke setiap sisi bbox proyeksi
     # (padded bbox untuk crop ke classifier). Naikkan jika lampu terpotong.
