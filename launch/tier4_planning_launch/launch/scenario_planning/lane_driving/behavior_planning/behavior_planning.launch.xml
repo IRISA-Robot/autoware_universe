@@ -42,6 +42,7 @@
   <arg name="launch_blind_spot_module" default="true"/>
   <arg name="launch_detection_area_module" default="true"/>
   <arg name="launch_road_crossing_module" default="true"/>
+  <arg name="launch_common_crossing_module" default="true"/>
   <arg name="launch_virtual_traffic_light_module" default="true"/>
   <arg name="launch_no_stopping_area_module" default="true"/>
   <arg name="launch_stop_line_module" default="true"/>
@@ -169,6 +170,11 @@
   />
   <let
     name="behavior_velocity_planner_launch_modules"
+    value="$(eval &quot;'$(var behavior_velocity_planner_launch_modules)' + 'autoware::behavior_velocity_planner::experimental::CommonCrossingModulePlugin, '&quot;)"
+    if="$(var launch_common_crossing_module)"
+  />
+  <let
+    name="behavior_velocity_planner_launch_modules"
     value="$(eval &quot;'$(var behavior_velocity_planner_launch_modules)' + 'autoware::behavior_velocity_planner::experimental::VirtualTrafficLightModulePlugin, '&quot;)"
     if="$(var launch_virtual_traffic_light_module)"
   />
@@ -240,6 +246,7 @@
       <param from="$(var behavior_velocity_planner_walkway_module_param_path)"/>
       <param from="$(var behavior_velocity_planner_detection_area_module_param_path)"/>
       <param from="$(var behavior_velocity_planner_road_crossing_module_param_path)"/>
+      <param from="$(var behavior_velocity_planner_common_crossing_module_param_path)"/>
       <param from="$(var behavior_velocity_planner_intersection_module_param_path)"/>
       <param from="$(var behavior_velocity_planner_roundabout_module_param_path)"/>
       <param from="$(var behavior_velocity_planner_stop_line_module_param_path)"/>

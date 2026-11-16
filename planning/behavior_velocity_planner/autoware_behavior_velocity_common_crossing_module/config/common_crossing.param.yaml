@@ -1,0 +1,46 @@
+/**:
+  ros__parameters:
+    common_crossing:
+      # Lanelet / map tags.
+      #   pre_common_crossing=true : route lanelet right before the crossing (robot stops on it)
+      #   common_crossing=true     : route lanelet of the robot over the car lane (module instance)
+      #   common_crossing_area_id  : on the common_crossing lanelet, id(s) of the check area(s),
+      #                              comma separated: closed ways tagged area=yes, e.g.
+      #                              type=detection_area (any type works: found by id).  A plain
+      #                              polygon only -- NOT a detection_area regulatory element, or
+      #                              the detection_area module would stop for it too.  Missing ->
+      #                              the crossing lanelet itself is checked (WARN: a car still in
+      #                              the lot is not seen).
+      tags:
+        crossing: "common_crossing"
+        pre: "pre_common_crossing"
+        area_id: "common_crossing_area_id"
+
+      # State machine
+      stop_distance_threshold: 5.0   # [m] APPROACHING -> STOPPING when the stop point is this close
+      stop_arrival_threshold: 0.2    # [m] STOPPING -> CHECKING when this close and stopped
+      stop_state_speed: 0.05         # [m/s] slower = standing still (stop zone)
+      sustained_clear_sec: 1.5       # [s] area clear this long without interruption -> GO
+      wait_warn_sec: 120.0           # [s] waiting longer only logs WARN; the robot never goes by itself
+      always_stop_at_pre: true       # true: always stop and check. false: clear while approaching -> go on
+
+      # Object labels that block the crossing (highest-probability label of each object).
+      block_on:
+        car: true
+        truck: true
+        bus: true
+        trailer: true
+        motorcycle: true
+        bicycle: false
+        pedestrian: false
+        unknown: false
+
+      # Stop position (same scheme as road_crossing, see stop_zone.hpp)
+      stop_margin: 0.5               # [m] front bumper to the crossing entry at the stop line
+      stop_zone:
+        enable: true
+        length: 2.0                  # [m] front bumper to the crossing entry at the barrier
+        hold_tolerance: 1.5          # [m] stopped this close before the barrier = in the zone
+        decel: 1.0                   # [m/s^2] braking of a robot entering the zone while moving
+        pre_margin: 0.5              # [m] barrier at least this far (front bumper) into the pre
+        min_departure_dist: 1.5      # [m] robot standing off the pre is moved at least this far

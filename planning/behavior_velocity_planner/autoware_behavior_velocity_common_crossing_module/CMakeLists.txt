@@ -1,0 +1,26 @@
+cmake_minimum_required(VERSION 3.14)
+project(autoware_behavior_velocity_common_crossing_module)
+
+find_package(autoware_cmake REQUIRED)
+autoware_package()
+pluginlib_export_plugin_description_file(autoware_behavior_velocity_planner plugins.xml)
+
+ament_auto_add_library(${PROJECT_NAME} SHARED
+  src/manager.cpp
+  src/scene.cpp
+)
+
+if(BUILD_TESTING)
+  ament_add_ros_isolated_gtest(test_${PROJECT_NAME}_stop_zone
+    test/test_stop_zone.cpp
+  )
+  ament_add_ros_isolated_gtest(test_${PROJECT_NAME}_direction
+    test/test_direction.cpp
+  )
+  ament_add_ros_isolated_gtest(test_${PROJECT_NAME}_area_check
+    test/test_area_check.cpp
+  )
+  target_link_libraries(test_${PROJECT_NAME}_area_check ${PROJECT_NAME})
+endif()
+
+ament_auto_package(INSTALL_TO_SHARE config)
