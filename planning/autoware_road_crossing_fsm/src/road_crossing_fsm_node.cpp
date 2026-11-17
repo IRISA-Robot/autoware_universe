@@ -122,6 +122,9 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
   param_.green_go_window_sec = declare_parameter<double>("green_go_window_sec", 18.0);
   param_.green_min_on_before_go_sec =
     declare_parameter<double>("green_min_on_before_go_sec", 1.0);
+  param_.crossing_none_tolerance_sec =
+    declare_parameter<double>("crossing_none_tolerance_sec", 1.0);
+  param_.red_to_green_max_gap_sec = declare_parameter<double>("red_to_green_max_gap_sec", 1.0);
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
   param_.aim_only_if_light_unseen = declare_parameter<bool>("aim_only_if_light_unseen", true);
@@ -1343,8 +1346,40 @@ void RoadCrossingFsmNode::onTimer()
       // e.g. when ego was stopped on the pre after the GO and the light has changed since.
       // Only while ego can still stop before the crossing: closer than its stopping distance
       // it keeps going.  Once base_link is on the crossing there is no way back either.
+      // 2026-11-17: the light only has to STILL allow it (crossing_light_rule.hpp): red revokes
+      // at once, a NONE only after crossing_none_tolerance_sec, a green back after a dropout
+      // does not need the GO stable time again.
+      if (interlock_.status_now == LightStatus::NONE) {
+        if (!crossing_none_since_) crossing_none_since_ = now;
+      } else {
+        crossing_none_since_.reset();
+      }
+      const double none_for =
+        crossing_none_since_ ? (now - *crossing_none_since_).seconds() : 0.0;
+      bool green_phase_open = true;
+      if (param_.require_red_before_green) {
+        const int window_ticks = static_cast<int>(
+          std::ceil(param_.green_go_window_sec * param_.update_rate_hz));
+        green_phase_open =
+          interlock_.green_phase_ticks >= 0 && interlock_.green_phase_ticks <= window_ticks;
+      }
+      const auto cl_status = interlock_.status_now == LightStatus::MERAH
+                               ? crossing_light::Status::MERAH
+                             : interlock_.status_now == LightStatus::HIJAU
+                               ? crossing_light::Status::HIJAU
+                               : crossing_light::Status::NONE;
+      const bool light_ok = crossing_light::lightStillAllowsCrossing(
+        interlock_.allows_crossing, cl_status, green_phase_open, none_for,
+        param_.crossing_none_tolerance_sec);
+      if (!interlock_.allows_crossing && light_ok && road_cross_is_green_) {
+        RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 500,
+          "CROSSING: lampu %s status=%s (NONE %.1f s < %.1f s toleransi) — lanjut",
+          lightIdsText().c_str(), lightStatusName(interlock_.status_now), none_for,
+          param_.crossing_none_tolerance_sec);
+      }
       const bool light_revoked =
-        road_cross_is_green_ && !interlock_.allows_crossing && !green_latched && active_pre_id_ &&
+        road_cross_is_green_ && !light_ok && !green_latched && active_pre_id_ &&
         active_crossing_id_ && egoOnPre(*active_pre_id_) && !egoOnLanelet(*active_crossing_id_);
       bool can_stop = true;
       if (light_revoked) {
@@ -2590,6 +2625,7 @@ void RoadCrossingFsmNode::transitionTo(FsmState new_state)
     get_logger(), "FSM: %s → %s",
     state_name(state_), state_name(new_state));
   state_ = new_state;
+  crossing_none_since_.reset();
 }
 
 namespace
@@ -2698,6 +2734,22 @@ void RoadCrossingFsmNode::updateLightInterlock(const char * where)
         "%s interlock: hijau putus sebelum stabil %.1f s — fase hijau batal, tunggu merah >= %.1f s "
         "lagi", where, p.green_min_on_before_go_sec, p.red_to_green_min_red_sec);
     }
+    const int max_gap_ticks = p.red_to_green_max_gap_sec < 0.0
+                                ? -1
+                                : static_cast<int>(std::ceil(p.red_to_green_max_gap_sec * p.update_rate_hz));
+    if (
+      il.status_now == LightStatus::HIJAU && il.red_phase_ok && il.green_phase_ticks < 0 &&
+      !crossing_light::greenFollowsRed(il.ticks_since_red, max_gap_ticks)) {
+      // Red, then the light unseen (covered / NONE) for a while, then green: maybe the middle of
+      // the green phase or its blinking end -- not a sure start.  Wait for the next red.
+      RCLCPP_WARN(
+        get_logger(),
+        "%s interlock: hijau muncul %.1f s setelah merah terakhir terlihat (> %.1f s, lampu "
+        "tertutup / tidak terlihat?) — bukan awal fase hijau yang pasti, tunggu merah lagi",
+        where, il.ticks_since_red / p.update_rate_hz, p.red_to_green_max_gap_sec);
+      il.red_phase_ok = false;
+      il.red_phase_ticks = 0;
+    }
     if (il.status_now == LightStatus::HIJAU && il.red_phase_ok && il.green_phase_ticks < 0) {
       il.green_phase_ticks = 0;
       il.green_go_reached = false;
@@ -2719,6 +2771,8 @@ void RoadCrossingFsmNode::updateLightInterlock(const char * where)
     }
     il.red_to_green = in_window && stable;
     allows = il.status_now == LightStatus::HIJAU && in_window && stable;
+    il.ticks_since_red =
+      il.status_now == LightStatus::MERAH ? 0 : std::min(il.ticks_since_red + 1, 1 << 20);
     if (il.status_now == LightStatus::HIJAU && !in_window && std::string(where) == "WAIT_GREEN") {
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 3000,

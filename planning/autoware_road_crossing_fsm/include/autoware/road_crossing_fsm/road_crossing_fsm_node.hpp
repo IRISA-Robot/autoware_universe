@@ -40,6 +40,7 @@
 #include <std_msgs/msg/float32.hpp>
 #include <std_srvs/srv/set_bool.hpp>
 
+#include "autoware/road_crossing_fsm/crossing_light_rule.hpp"
 #include "autoware/road_crossing_fsm/direction_utils.hpp"
 
 #include <autoware/route_handler/route_handler.hpp>
@@ -201,6 +202,13 @@ private:
     // this long before it gives GO: a misread green blip of a few ticks after a red is not a
     // green phase (2026-11-10: 0.3 s blips after a clear red gave GO three times).
     double green_min_on_before_go_sec{1.0};
+    // After GO_GREEN while ego is still on the pre: a NONE shorter than this does not send ego
+    // back to WAIT_GREEN (red does at once).  See crossing_light_rule.hpp.  0 = old behaviour.
+    double crossing_none_tolerance_sec{1.0};
+    // require_red_before_green: the green must appear at most this long after the last tick
+    // with status MERAH, else it is not a sure phase start (view covered through the solid
+    // green, opened in the blinking green): wait for the next red.  < 0 = off.
+    double red_to_green_max_gap_sec{1.0};
     // true: only turn the body to the light when it is NOT detected from where the body
     // faces now (any camera) for aim_unseen_grace_sec in WAIT_GREEN; a light already seen
     // (red or green) needs no turn -- saves rotary motor work.  Once turned, the aimer stays
@@ -399,6 +407,8 @@ private:
 
   // Set on the first ARMED_LIGHT tick (entry-action guard); cleared when the episode crosses.
   std::optional<rclcpp::Time> light_timeout_start_;
+  // CROSSING: since when the interlock status is NONE (reset on every state change).
+  std::optional<rclcpp::Time> crossing_none_since_;
 
   // CROSSING safety-timeout timer (defensive watchdog #1).
   // Set once at each WAIT_GREEN -> CROSSING transition (green / bypass / timeout-fallback).
@@ -458,6 +468,7 @@ private:
     int green_stable_ticks{0};    // consecutive ticks with status HIJAU (reset on anything else)
     bool green_go_reached{false}; // this green phase reached green_min_on_before_go_sec
     int red_run_ticks{0};         // MERAH ticks since the last HIJAU (NONE pauses, HIJAU resets)
+    int ticks_since_red{1 << 20};  // ticks since the last tick with status MERAH
     bool allows_crossing{false};  // Rule 1 || Rule 2
   } interlock_;
 

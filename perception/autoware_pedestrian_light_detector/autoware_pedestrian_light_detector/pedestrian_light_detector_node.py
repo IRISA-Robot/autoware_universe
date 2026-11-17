@@ -40,13 +40,15 @@ Service:
 """
 
 import collections
-import math
 
 import cv2
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from nav_msgs.msg import Odometry
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
 from sensor_msgs.msg import Image, CameraInfo, PointCloud2, RegionOfInterest
@@ -88,7 +90,8 @@ from autoware_pedestrian_light_detector.roi_projector import (
     parse_tf_pedestrian_lights,
     project_point,
     light_roi_in_camera,
-    select as projector_select,
+    CameraLiveness,
+    select_sticky,
     CameraState,
 )
 
@@ -138,6 +141,12 @@ _INFO_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
     depth=1,
 )
+
+
+def _calib_key(msg) -> tuple:
+    """Isi camera_info yang menentukan CameraState (stamp diabaikan)."""
+    return (tuple(msg.k), tuple(msg.d), msg.distortion_model, int(msg.width), int(msg.height),
+            msg.header.frame_id)
 
 
 class PedestrianLightDetectorNode(Node):
@@ -224,6 +233,18 @@ class PedestrianLightDetectorNode(Node):
         # Ganti kamera hanya kalau kamera lain lebih dekat ke sumbu lebih dari ini (derajat);
         # tag peta 'pedestrian_light_camera' pada way lampu mematok kamera sepenuhnya.
         self.declare_parameter('camera_switch_hysteresis_deg', 15.0)
+        # Kamera yang camera_info-nya (dikirim driver bersama tiap frame) tidak datang selama ini
+        # dianggap mati dan tidak boleh dipilih -> lampu dibaca dari kamera lain yang melihatnya.
+        # <= 0 = filter mati.
+        self.declare_parameter('camera_alive_timeout_sec', 2.0)
+        # Kamera yang tadi mati baru boleh dipilih lagi setelah datanya datang terus selama ini.
+        self.declare_parameter('camera_revive_sec', 0.5)
+        # Kamera "lengket" (roi_projector.select_sticky): pindah ke kamera lain yang melihat lampu
+        # kalau hasilnya NONE selama >= ini SAMBIL robot bergerak (> camera_switch_min_speed_mps).
+        # Robot diam: tidak pernah pindah karena NONE (kamera ditutup = NONE, bukan ganti kamera).
+        self.declare_parameter('camera_switch_none_sec', 1.5)
+        self.declare_parameter('camera_switch_min_speed_mps', 0.05)
+        self.declare_parameter('odometry_topic', '/localization/kinematic_state')
         # ---------- leopard_cam_driver software AE (lihat ae_feed.py) ----------
         # Kamera yang diklasifikasi dibaca dari /camera/<cam>/<camera_image_suffix>.
         # "ae/image_raw" = salinan AE driver (ukuran + stamp sama dgn image_raw);
@@ -438,6 +459,20 @@ class PedestrianLightDetectorNode(Node):
 
         self._stable_frames = max(1, int(self.get_parameter('stable_frames').value))
         self._max_image_age_sec = float(self.get_parameter('max_image_age_sec').value)
+        self._camera_alive_timeout_sec = float(
+            self.get_parameter('camera_alive_timeout_sec').value)
+        self._liveness = CameraLiveness(
+            self._camera_alive_timeout_sec, float(self.get_parameter('camera_revive_sec').value))
+        self._dead_cams = frozenset()   # kamera yang terakhir dilaporkan mati (log saat berubah)
+        self._switch_none_sec = float(self.get_parameter('camera_switch_none_sec').value)
+        self._switch_min_speed = float(self.get_parameter('camera_switch_min_speed_mps').value)
+        self._none_since = None         # waktu [s] state yang dipublish mulai NONE
+        self._speed = None              # (|v| m/s, waktu terima [s]) dari odometry
+        # camera_info di callback group sendiri (executor multi-thread di main()): tidak tertahan
+        # oleh callback gambar yang berat (2026-11-16: jeda ~1.5 s di kamera tidak aktif).
+        self._info_cb_group = MutuallyExclusiveCallbackGroup()
+        self.create_subscription(
+            Odometry, str(self.get_parameter('odometry_topic').value), self._on_odom, _SENSOR_QOS)
         self._min_confidence = float(self.get_parameter('min_confidence').value)
         self._enable_debug_image = bool(self.get_parameter('enable_debug_image').value)
 
@@ -937,6 +972,9 @@ class PedestrianLightDetectorNode(Node):
         for cam_name, sub in list(self._cam_info_subs.items()):
             self.destroy_subscription(sub)
         self._cam_info_subs.clear()
+        self._liveness.clear()
+        self._dead_cams = frozenset()
+        self._none_since = None
         for cam_name, sub in list(self._size_probe_subs.items()):
             self.destroy_subscription(sub)
         self._size_probe_subs.clear()
@@ -1008,6 +1046,7 @@ class PedestrianLightDetectorNode(Node):
                 topic,
                 make_cb(cam_name),
                 _INFO_QOS,
+                callback_group=self._info_cb_group,
             )
             self._cam_info_subs[cam_name] = sub
             self.get_logger().info(f'[Fase 2] Camera info sub: {topic}')
@@ -1089,8 +1128,12 @@ class PedestrianLightDetectorNode(Node):
 
     def _camera_info_cb(self, cam_name: str, msg: CameraInfo):
         """Simpan intrinsic + frame_id dari camera_info."""
+        self._liveness.rx(cam_name, self._now_sec())
+        prev = self._cam_calib.get(cam_name)
         self._cam_calib[cam_name] = msg
-        self._rebuild_cam_state(cam_name)
+        # Rebuild hanya kalau kalibrasi berubah (dulu tiap pesan: 30 Hz x 3 kamera kerja Python)
+        if prev is None or cam_name not in self._cam_states or _calib_key(prev) != _calib_key(msg):
+            self._rebuild_cam_state(cam_name)
 
     def _rebuild_cam_state(self, cam_name: str):
         """CameraState dari camera_info, K di-skala ke ukuran image_raw sebenarnya."""
@@ -1143,6 +1186,16 @@ class PedestrianLightDetectorNode(Node):
 
     def _now_sec(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
+
+    def _on_odom(self, msg: 'Odometry'):
+        self._speed = (abs(float(msg.twist.twist.linear.x)), self._now_sec())
+
+    def _is_moving(self, now_s: float) -> bool:
+        """|v| > camera_switch_min_speed_mps dari odometry segar (<= 0.5 s); tanpa odometry = diam."""
+        if self._speed is None:
+            return False
+        v, t = self._speed
+        return now_s - t <= 0.5 and v > self._switch_min_speed
 
     # ------------------------------------------------------------------
     # Lidar check
@@ -1331,6 +1384,7 @@ class PedestrianLightDetectorNode(Node):
         self._clf_last_stamp = None
         self._last_image_rx_time = None
         self._reset_fine_hold()        # bbox kamera lama tidak berlaku di kamera baru
+        self._none_since = None        # kamera baru dapat waktu penuh sebelum boleh pindah lagi
         self.get_logger().info(
             f'[Fase 2] Image sub baru: {topic}'
         )
@@ -1644,18 +1698,49 @@ class PedestrianLightDetectorNode(Node):
             return
 
         self._drop_finished_size_probes()
-        cameras_list = list(self._cam_states.values())
-        result = projector_select(
+        now_s = self._now_sec()
+        cams_all = list(self._cam_states.values())
+        alive = self._liveness.alive(cams_all, now_s)
+        alive_names = {c.name for c in alive}
+        dead = frozenset(c.name for c in cams_all) - alive_names
+        if dead != self._dead_cams:
+            revived = sorted(self._dead_cams - dead)
+            if revived:
+                self.get_logger().info(
+                    f'[Fase 2] Kamera {revived} mengirim data lagi (>= '
+                    f'{self._liveness.revive_sec:.1f} s) — boleh dipakai kalau perlu ganti kamera')
+            if dead:
+                self.get_logger().warn(
+                    f'[Fase 2] Kamera tanpa data > {self._camera_alive_timeout_sec:.1f} s: '
+                    f'{sorted(dead)} — tidak dipilih; pakai {sorted(alive_names)}')
+            self._dead_cams = dead
+        if not alive:
+            self.get_logger().warn(
+                '[Fase 2] Tidak ada kamera yang mengirim data — publish NONE.',
+                throttle_duration_sec=3.0,
+            )
+            self._map_roi_bbox = None
+            self._map_tight_bbox = None
+            self._active_light = None
+            self._clear_ae_roi()
+            self._publish_state(STATE_NONE, 0.0)
+            return
+        none_for = now_s - self._none_since if self._none_since is not None else 0.0
+        moving = self._is_moving(now_s)
+        result, why = select_sticky(
             candidates,
-            cameras_list,
+            alive,
             self._tf_buffer,
-            self._roi_margin_px,
-            self._light_radius_m,
-            self._tight_box_height_scale,
             current_cam=self._active_cam_name,
-            hysteresis_rad=math.radians(
-                float(self.get_parameter('camera_switch_hysteresis_deg').value)),
+            switch_away=moving and none_for >= self._switch_none_sec,
+            margin_px=self._roi_margin_px,
+            light_radius_m=self._light_radius_m,
+            tight_box_height_scale=self._tight_box_height_scale,
         )
+        if result is not None and self._active_cam_name and result[0] != self._active_cam_name:
+            self.get_logger().warn(
+                f'[Fase 2] Ganti kamera {self._active_cam_name} -> {result[0]}: {why} '
+                f'(NONE {none_for:.1f} s, bergerak={moving})')
 
         if result is None:
             # Tidak ada lampu dalam FOV kamera mana pun
@@ -2190,6 +2275,11 @@ class PedestrianLightDetectorNode(Node):
             msg.header.frame_id = 'camera_front'
         msg.state = state
         msg.confidence = confidence
+        if state == STATE_NONE:
+            if self._none_since is None:
+                self._none_since = self._now_sec()
+        else:
+            self._none_since = None
         msg.blocked = False
         msg.light_id = 0 if state == STATE_NONE else self._reported_light_id()
         self._pub.publish(msg)
@@ -2642,8 +2732,12 @@ class PedestrianLightDetectorNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = PedestrianLightDetectorNode()
+    # 2 thread: camera_info (callback group sendiri) jalan walau callback gambar/timer sibuk.
+    # Callback lain tetap di default group (mutually exclusive) = urutan sama seperti dulu.
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

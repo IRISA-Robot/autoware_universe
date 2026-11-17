@@ -142,3 +142,140 @@ def test_map_tag_is_parsed(tmp_path):
         '</osm>')
     lights = {lt.way_id: lt for lt in rp.parse_tf_pedestrian_lights(str(osm))}
     assert lights['10'].camera == 'left' and lights['11'].camera is None
+
+
+
+# ---- 2026-11-17: liveness + sticky camera -------------------------------------------------
+
+def test_liveness_dead_after_timeout_and_revive_delay():
+    lv = rp.CameraLiveness(dead_sec=2.0, revive_sec=0.5)
+    lv.rx('left', 0.0)
+    assert lv.is_alive('left', 0.0)              # never dead: alive from the first message
+    assert lv.is_alive('left', 1.9)              # gap 1.9 s < 2 s: still alive
+    assert not lv.is_alive('left', 2.1)          # gap > 2 s: dead
+    lv.rx('left', 3.0)                           # first message after the gap
+    assert not lv.is_alive('left', 3.0)          # not before 0.5 s of data
+    lv.rx('left', 3.3)
+    lv.rx('left', 3.5)
+    assert lv.is_alive('left', 3.5)
+    assert not lv.is_alive('front', 3.5)         # never received
+
+
+def test_liveness_short_gaps_of_2026_11_16_do_not_kill():
+    # inactive camera_info gaps of ~1.5 s (detector log 2026-11-16) must not count as dead
+    lv = rp.CameraLiveness(dead_sec=2.0, revive_sec=0.5)
+    t = 0.0
+    for gap in (0.033, 1.5, 0.033, 1.4, 0.033, 1.6):
+        t += gap
+        lv.rx('right', t)
+        assert lv.is_alive('right', t + 0.3)
+
+
+def test_liveness_off():
+    lv = rp.CameraLiveness(dead_sec=0.0)
+    assert lv.is_alive('front', 100.0)
+
+
+def test_sticky_keeps_current_camera_while_it_sees_the_light():
+    # light 40 deg left: front 40 off-axis, left 50 -> best is front; left in use stays
+    cams, tf = _cameras(120.0), _TfBuffer()
+    res, why = rp.select_sticky([_light(40.0)], cams, tf, current_cam='left')
+    assert res[0] == 'left' and why == 'tetap'
+    # even when another camera is much more centred (light 55 deg: left 35, front 55 -- beyond
+    # the old 15 deg hysteresis)
+    res, _ = rp.select_sticky([_light(55.0)], cams, tf, current_cam='front')
+    assert res[0] == 'front'
+
+
+def test_sticky_initial_pick_is_the_best_or_pinned():
+    cams, tf = _cameras(120.0), _TfBuffer()
+    assert rp.select_sticky([_light(40.0)], cams, tf)[0][0] == 'front'
+    assert rp.select_sticky([_pinned_light(40.0, 'left')], cams, tf)[0][0] == 'left'
+
+
+def test_sticky_switches_when_current_dead():
+    cams, tf = _cameras(120.0), _TfBuffer()
+    alive = [c for c in cams if c.name != 'front']
+    res, why = rp.select_sticky([_light(40.0)], alive, tf, current_cam='front')
+    assert res[0] == 'left' and 'mati' in why
+
+
+def test_sticky_switches_when_light_leaves_the_fov():
+    # 40 deg FOV cameras: a light at 30 deg is outside front (half-FOV 20) but... left is 60 off,
+    # also outside -> nobody; use 120 deg: light at 70 deg is outside front (60) -> left
+    cams, tf = _cameras(120.0), _TfBuffer()
+    res, why = rp.select_sticky([_light(70.0)], cams, tf, current_cam='front')
+    assert res[0] == 'left' and 'keluar' in why
+
+
+def test_sticky_switch_away_only_when_asked_and_another_camera_sees_it():
+    cams, tf = _cameras(120.0), _TfBuffer()
+    res, why = rp.select_sticky([_light(40.0)], cams, tf, current_cam='front', switch_away=True)
+    assert res[0] == 'left' and 'NONE' in why
+    # light at 0 deg: only front sees it (left 90 off) -> stays
+    res, why = rp.select_sticky([_light(0.0)], cams, tf, current_cam='front', switch_away=True)
+    assert res[0] == 'front' and why.startswith('tetap')
+
+
+def _run(lights, alive_at, none_at=lambda t: False, moving_at=lambda t: False,
+         none_sec=1.5, dt=0.1, n=120):
+    """Node loop: liveness + sticky + NONE timer (reset on a camera change)."""
+    cams, tf = _cameras(120.0), _TfBuffer()
+    lv = rp.CameraLiveness(2.0, 0.5)
+    cur, none_since, out = '', None, []
+    for i in range(n):
+        t = round(i * dt, 6)
+        for name in alive_at(t):
+            lv.rx(name, t)
+        none_for = t - none_since if none_since is not None else 0.0
+        res, _ = rp.select_sticky(lights, lv.alive(cams, t), tf, current_cam=cur,
+                                  switch_away=moving_at(t) and none_for >= none_sec)
+        new = res[0] if res else cur
+        if new != cur:
+            none_since = None
+        cur = new
+        if none_at(t):
+            none_since = t if none_since is None else none_since
+        else:
+            none_since = None
+        out.append((t, cur))
+    return out
+
+
+def _cam(out, t):
+    return next(c for tt, c in out if tt >= t - 1e-9)
+
+
+ALL = ['front', 'left', 'right', 'rear']
+
+
+def test_stationary_covered_camera_never_switches():
+    # all cameras normal, robot stands still, the camera in use is covered (NONE) for 8 s
+    out = _run([_light(40.0)], lambda t: ALL, none_at=lambda t: 2.0 <= t < 10.0)
+    assert {c for _, c in out} == {'front'}
+
+
+def test_moving_none_switches_after_none_sec():
+    out = _run([_light(40.0)], lambda t: ALL, none_at=lambda t: t >= 2.0,
+               moving_at=lambda t: True)
+    assert _cam(out, 3.4) == 'front' and _cam(out, 3.6) == 'left'
+
+
+def test_front_dies_left_then_front_back_is_not_taken_back():
+    # front dead 3..6 s: left after 2 s without data; front back -> sticky stays on left
+    out = _run([_light(40.0)], lambda t: ALL if not 3.0 <= t < 6.0 else ['left', 'right', 'rear'])
+    assert _cam(out, 2.9) == 'front'
+    assert _cam(out, 4.8) == 'front'     # last front frame 2.9 s: gap 1.9 s, not dead yet
+    assert _cam(out, 5.0) == 'left'      # gap 2.1 s > 2.0 s
+    assert _cam(out, 11.9) == 'left'
+
+
+def test_flapping_inactive_cameras_cause_no_switch():
+    # 2026-11-16: left/right camera_info gaps ~1.5 s while right is in use
+    def alive_at(t):
+        names = ['right', 'rear']
+        if (t % 3.0) < 1.5:
+            names.append('left')
+        return names
+    out = _run([_light(-40.0)], alive_at)
+    assert {c for _, c in out} == {'right'}

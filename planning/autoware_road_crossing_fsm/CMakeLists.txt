@@ -18,6 +18,10 @@ if(BUILD_TESTING)
     test/test_direction_utils.cpp
   )
   target_link_libraries(test_${PROJECT_NAME}_direction ${PROJECT_NAME})
+  ament_add_ros_isolated_gtest(test_${PROJECT_NAME}_crossing_light
+    test/test_crossing_light_rule.cpp
+  )
+  target_include_directories(test_${PROJECT_NAME}_crossing_light PRIVATE include)
 endif()
 
 ament_auto_package(INSTALL_TO_SHARE

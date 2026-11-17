@@ -432,6 +432,88 @@ def light_roi_in_camera(
 # Camera selector
 # ---------------------------------------------------------------------------
 
+class CameraLiveness:
+    """
+    Kamera mana yang masih mengirim gambar, dari waktu terima camera_info (leopard_cam_driver
+    mengirimnya bersama SETIAP frame, image_transport CameraPublisher).
+
+    * mati: tidak ada camera_info selama > dead_sec.
+    * hidup lagi: setelah mati, baru dianggap hidup kalau datanya datang terus (tanpa jeda >
+      dead_sec) selama >= revive_sec -- satu-dua pesan yang lolos tidak membuatnya dipilih.
+    * kamera yang belum pernah mati: hidup sejak pesan pertama.
+    dead_sec <= 0 = filter mati (semua kamera hidup).
+
+    2026-11-16: kamera depan macet (USB / stall) tapi tetap dipilih -> NONE, robot tidak jalan.
+    2026-11-17: dead_sec 1.0 terlalu sensitif -- kamera kiri/kanan yang tidak aktif sempat
+    "mati" 23x selama 0.4-0.5 s (jeda camera_info ~1.5 s) dan memicu ganti kamera.
+    """
+
+    def __init__(self, dead_sec: float, revive_sec: float = 0.0):
+        self.dead_sec = float(dead_sec)
+        self.revive_sec = max(0.0, float(revive_sec))
+        self._last = {}    # nama -> waktu camera_info terakhir
+        self._since = {}   # nama -> awal data tanpa jeda > dead_sec
+
+    def clear(self):
+        self._last.clear()
+        self._since.clear()
+
+    def rx(self, name: str, t: float):
+        last = self._last.get(name)
+        if last is None:
+            self._since[name] = t - self.revive_sec      # belum pernah mati: langsung hidup
+        elif t - last > self.dead_sec:
+            self._since[name] = t                        # hidup lagi setelah mati
+        self._last[name] = t
+
+    def is_alive(self, name: str, t: float) -> bool:
+        if self.dead_sec <= 0.0:
+            return True
+        last = self._last.get(name)
+        if last is None or t - last > self.dead_sec:
+            return False
+        return t - self._since[name] >= self.revive_sec - 1e-9
+
+    def alive(self, cameras_state, t: float) -> list:
+        return [c for c in cameras_state if self.is_alive(c.name, t)]
+
+
+def select_sticky(lights, cameras_alive, tf_buffer, current_cam: Optional[str] = None,
+                  switch_away: bool = False, **select_kwargs):
+    """
+    Kamera "lengket" (2026-11-17): kamera yang sedang dipakai TIDAK diganti selama ia hidup
+    (ada di cameras_alive) dan lampu terpilih masih di gambarnya -- tidak ada lagi pindah karena
+    kamera lain lebih tengah (tiap pindah = NONE beberapa ratus ms = robot berhenti saat hijau).
+
+    Pindah hanya kalau:
+      * belum ada kamera (awal crossing): kamera terbaik -- yang dipatok tag peta, else paling
+        tengah (select());
+      * kamera sekarang mati, atau lampu terpilih keluar dari gambarnya;
+      * switch_away=True (node: NONE >= camera_switch_none_sec SAMBIL robot bergerak): kamera
+        lain yang melihat lampu itu; tidak ada -> tetap.
+    Robot diam + kamera ditutup: kamera tetap hidup, lampu tetap di FOV, switch_away False ->
+    tidak pindah, NONE.
+
+    Returns (hasil select() atau None, alasan).
+    """
+    best = select(lights, cameras_alive, tf_buffer, **select_kwargs)
+    if best is None:
+        return None, 'tidak ada kamera hidup yang melihat lampu'
+    cur = next((c for c in cameras_alive if c.name == current_cam), None) if current_cam else None
+    if cur is None:
+        return best, ('awal' if not current_cam else f'kamera {current_cam} mati')
+    own = select(lights, [cur], tf_buffer, **select_kwargs)
+    if own is None or own[3] is not best[3]:
+        return best, f'lampu keluar dari gambar kamera {current_cam}'
+    if not switch_away:
+        return own, 'tetap'
+    others = [c for c in cameras_alive if c.name != current_cam]
+    alt = select(lights, others, tf_buffer, **select_kwargs) if others else None
+    if alt is not None and alt[3] is best[3]:
+        return alt, f'NONE lama di kamera {current_cam} sambil bergerak'
+    return own, 'tetap (tidak ada kamera lain yang melihat lampu)'
+
+
 def select(
     lights: List[Light],
     cameras_state: List[CameraState],
