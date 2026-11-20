@@ -547,9 +547,12 @@ class PedestrianLightDetectorNode(Node):
             self._parse_map()
 
         # ---------- publisher utama (absolut) ----------
+        # 2026-11-17: with pedestrian_light_arbiter (operator override) the detector publishes
+        # to .../pedestrian_light_auto and the arbiter forwards it to the FSM's topic.
         self._pub = self.create_publisher(
             PedestrianLightState,
-            '/perception/road_crossing/pedestrian_light',
+            self.declare_parameter(
+                'output_topic', '/perception/road_crossing/pedestrian_light').value,
             10,
         )
         # Posisi horizontal pusat ROI lampu terhadap tengah gambar kamera terpilih:

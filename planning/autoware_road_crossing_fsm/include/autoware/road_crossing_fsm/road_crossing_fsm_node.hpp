@@ -209,6 +209,10 @@ private:
     // with status MERAH, else it is not a sure phase start (view covered through the solid
     // green, opened in the blinking green): wait for the next red.  < 0 = off.
     double red_to_green_max_gap_sec{1.0};
+    // Operator override (PedestrianLightState.source == SOURCE_MANUAL, from
+    // pedestrian_light_arbiter): valid while the last manual message is younger than this.
+    // The arbiter re-sends it at 10 Hz; older = the override is gone, back to the detector.
+    double manual_light_timeout_sec{0.5};
     // true: only turn the body to the light when it is NOT detected from where the body
     // faces now (any camera) for aim_unseen_grace_sec in WAIT_GREEN; a light already seen
     // (red or green) needs no turn -- saves rotary motor work.  Once turned, the aimer stays
@@ -409,6 +413,10 @@ private:
   std::optional<rclcpp::Time> light_timeout_start_;
   // CROSSING: since when the interlock status is NONE (reset on every state change).
   std::optional<rclcpp::Time> crossing_none_since_;
+  // Last operator override message (source MANUAL): when, and whether it said GREEN.
+  std::optional<rclcpp::Time> manual_stamp_;
+  bool manual_green_{false};
+  crossing_light::Manual manual_logged_{crossing_light::Manual::NONE};
 
   // CROSSING safety-timeout timer (defensive watchdog #1).
   // Set once at each WAIT_GREEN -> CROSSING transition (green / bypass / timeout-fallback).
@@ -588,6 +596,8 @@ private:
   // Callbacks
   void onPedLight(
     const autoware_road_crossing_msgs::msg::PedestrianLightState::SharedPtr msg);
+  // Operator override in force now (NONE = follow the detector); logs every change.
+  crossing_light::Manual manualNow(const rclcpp::Time & now);
   void onRoute(const autoware_planning_msgs::msg::LaneletRoute::SharedPtr msg);
   void onMap(const autoware_map_msgs::msg::LaneletMapBin::SharedPtr msg);
   void onOdom(const nav_msgs::msg::Odometry::SharedPtr msg);

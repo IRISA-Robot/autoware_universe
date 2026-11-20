@@ -23,6 +23,8 @@ find_package(geometry_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CrosswalkDetection.msg"
+  "msg/PedestrianLightOverride.msg"
+  "msg/PedestrianLightOverrideStatus.msg"
   "msg/PedestrianLightState.msg"
   "msg/PedestrianLightTarget.msg"
   "msg/RoadCrossingGate.msg"

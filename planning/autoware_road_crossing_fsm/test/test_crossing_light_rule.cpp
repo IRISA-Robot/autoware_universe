@@ -74,3 +74,34 @@ TEST(CrossingLightRule, ZeroToleranceIsTheOldBehaviourForNone)
 {
   EXPECT_FALSE(lightStillAllowsCrossing(false, Status::NONE, true, 0.0, 0.0));
 }
+
+using autoware::road_crossing_fsm::crossing_light::applyManual;
+using autoware::road_crossing_fsm::crossing_light::Manual;
+using autoware::road_crossing_fsm::crossing_light::manualOverride;
+
+TEST(CrossingLightRule, NoManualMessageFollowsTheDetector)
+{
+  EXPECT_EQ(manualOverride(false, true, 0.0, 0.5), Manual::NONE);
+  EXPECT_TRUE(applyManual(Manual::NONE, true));
+  EXPECT_FALSE(applyManual(Manual::NONE, false));
+}
+
+TEST(CrossingLightRule, FreshManualGreenGoesWithoutTheLightRules)
+{
+  // operator GREEN: go even though the interlock (no red seen first) says no
+  EXPECT_EQ(manualOverride(true, true, 0.1, 0.5), Manual::GREEN);
+  EXPECT_TRUE(applyManual(Manual::GREEN, false));
+}
+
+TEST(CrossingLightRule, FreshManualRedWaitsEvenOnAGreenLight)
+{
+  EXPECT_EQ(manualOverride(true, false, 0.1, 0.5), Manual::RED);
+  EXPECT_FALSE(applyManual(Manual::RED, true));
+}
+
+TEST(CrossingLightRule, StaleManualFallsBackToTheDetector)
+{
+  // arbiter gone / lease over: no more manual messages -> the detector decides again
+  EXPECT_EQ(manualOverride(true, true, 0.6, 0.5), Manual::NONE);
+  EXPECT_EQ(manualOverride(true, true, 0.1, 0.0), Manual::NONE);  // overrides off
+}

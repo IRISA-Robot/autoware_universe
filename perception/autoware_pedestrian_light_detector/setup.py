@@ -42,6 +42,8 @@ setup(
         'console_scripts': [
             'pedestrian_light_detector_node = '
             'autoware_pedestrian_light_detector.pedestrian_light_detector_node:main',
+            'pedestrian_light_arbiter_node = '
+            'autoware_pedestrian_light_detector.light_arbiter_node:main',
         ],
     },
 )

@@ -125,6 +125,7 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
   param_.crossing_none_tolerance_sec =
     declare_parameter<double>("crossing_none_tolerance_sec", 1.0);
   param_.red_to_green_max_gap_sec = declare_parameter<double>("red_to_green_max_gap_sec", 1.0);
+  param_.manual_light_timeout_sec = declare_parameter<double>("manual_light_timeout_sec", 0.5);
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
   param_.aim_only_if_light_unseen = declare_parameter<bool>("aim_only_if_light_unseen", true);
@@ -271,6 +272,16 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
 void RoadCrossingFsmNode::onPedLight(
   const autoware_road_crossing_msgs::msg::PedestrianLightState::SharedPtr msg)
 {
+  using PLS = autoware_road_crossing_msgs::msg::PedestrianLightState;
+  // Operator override (pedestrian_light_arbiter): no light pairing, no interlock input -- the
+  // decision is the operator's (manualNow()).  An AUTO message means the arbiter is back on
+  // the detector: the override ends at once.
+  if (msg->source == PLS::SOURCE_MANUAL) {
+    manual_green_ = msg->state == PLS::GREEN || msg->state == PLS::COUNTDOWN_GREEN;
+    manual_stamp_ = now();
+    return;
+  }
+  manual_stamp_.reset();
   // A light state only counts when it comes from a light paired with the active crossing;
   // anything else is some other crossing's light that happens to be in view.  NONE carries
   // no light and is always taken (it drives the no-detect counter).
@@ -286,7 +297,6 @@ void RoadCrossingFsmNode::onPedLight(
     return;
   }
   // Interlock input: what the paired light showed since the last FSM tick.
-  using PLS = autoware_road_crossing_msgs::msg::PedestrianLightState;
   if (msg->state == PLS::RED) {
     interlock_.merah_seen = true;
   } else if (msg->state == PLS::GREEN || msg->state == PLS::COUNTDOWN_GREEN) {
@@ -1234,6 +1244,7 @@ void RoadCrossingFsmNode::onTimer()
       // termasuk saat robot masih mendekat — supaya transisi merah → hijau tidak terlewat.
       updateLightInterlock("WAIT_GREEN");
       const bool green_latched = greenLatched(now);
+      const auto manual = manualNow(now);
       updateAimNeed(now);
 
       // No position gate: ego is on this crossing's pre (the membership check guarantees it),
@@ -1262,7 +1273,10 @@ void RoadCrossingFsmNode::onTimer()
       // is tagged disable_tf_light_check.
       // This is NOT a green-light cross — use plain GO so the module's trust-light shortcut
       // does NOT fire; vehicle-scan (isPredictedBlocked) governs the crossing.
-      if (active_light_ids_.empty() || crossingHasTag("disable_tf_light_check")) {
+      // An operator RED holds these too (handled below with the light).
+      if (
+        (active_light_ids_.empty() || crossingHasTag("disable_tf_light_check")) &&
+        manual != crossing_light::Manual::RED) {
         RCLCPP_INFO_THROTTLE(
           get_logger(), *get_clock(), 3000,
           "WAIT_GREEN: crossing %ld %s — skip lampu, GO (vehicle-scan governs)",
@@ -1287,7 +1301,9 @@ void RoadCrossingFsmNode::onTimer()
       if (interlock_.allows_crossing && !green_latch_since_) {
         armGreenLatch(now);
       }
-      const bool go_ok = interlock_.allows_crossing || green_latched;
+      // Operator override (arbiter): GREEN = go, RED = wait, whatever the light rules say.
+      const bool go_ok =
+        crossing_light::applyManual(manual, interlock_.allows_crossing || green_latched);
 
       // Tidak ada timeout di sini: tanpa izin interlock robot HOLD, berapapun lamanya
       // (merah bisa ~60 s; lampu yang tidak terlihat juga HOLD, kecuali latch hijau aktif).
@@ -1306,8 +1322,9 @@ void RoadCrossingFsmNode::onTimer()
         }
         RCLCPP_INFO_THROTTLE(
           get_logger(), *get_clock(), 2000,
-          "WAIT_GREEN: lampu %s status=%s — HOLD, menunggu hijau solid",
-          lightIdsText().c_str(), lightStatusName(interlock_.status_now));
+          "WAIT_GREEN: lampu %s status=%s%s — HOLD, menunggu hijau solid",
+          lightIdsText().c_str(), lightStatusName(interlock_.status_now),
+          manual == crossing_light::Manual::RED ? " (operator: MERAH manual)" : "");
         break;
       }
 
@@ -1319,9 +1336,10 @@ void RoadCrossingFsmNode::onTimer()
 
       RCLCPP_INFO(
         get_logger(), "WAIT_GREEN: lampu %s hijau (%s) — GO_GREEN", lightIdsText().c_str(),
-        !interlock_.allows_crossing ? "latch hijau, lampu tidak terlihat"
-        : interlock_.red_to_green  ? "merah -> hijau"
-                                   : "hijau solid >= threshold");
+        manual == crossing_light::Manual::GREEN ? "operator: HIJAU manual"
+        : !interlock_.allows_crossing           ? "latch hijau, lampu tidak terlihat"
+        : interlock_.red_to_green               ? "merah -> hijau"
+                                                : "hijau solid >= threshold");
       light_timeout_start_.reset();
       road_cross_is_green_ = true;   // persist GO_GREEN through CROSSING state
       crossing_timeout_start_ = now;  // arm CROSSING safety-timeout watchdog
@@ -1339,6 +1357,7 @@ void RoadCrossingFsmNode::onTimer()
       // Keep status_now following the light while crossing.
       updateLightInterlock("CROSSING");
       const bool green_latched = greenLatched(now);
+      const auto manual = manualNow(now);
 
       // Released by the light but base_link is still on the pre: the release only stands while
       // the light still allows it (or the green latch holds: dropouts / flicker do not count,
@@ -1368,10 +1387,14 @@ void RoadCrossingFsmNode::onTimer()
                              : interlock_.status_now == LightStatus::HIJAU
                                ? crossing_light::Status::HIJAU
                                : crossing_light::Status::NONE;
-      const bool light_ok = crossing_light::lightStillAllowsCrossing(
-        interlock_.allows_crossing, cl_status, green_phase_open, none_for,
-        param_.crossing_none_tolerance_sec);
-      if (!interlock_.allows_crossing && light_ok && road_cross_is_green_) {
+      // Operator override (arbiter): GREEN keeps going, RED revokes like a red light.
+      const bool light_ok = crossing_light::applyManual(
+        manual, crossing_light::lightStillAllowsCrossing(
+                  interlock_.allows_crossing, cl_status, green_phase_open, none_for,
+                  param_.crossing_none_tolerance_sec));
+      if (
+        manual == crossing_light::Manual::NONE && !interlock_.allows_crossing && light_ok &&
+        road_cross_is_green_) {
         RCLCPP_INFO_THROTTLE(
           get_logger(), *get_clock(), 500,
           "CROSSING: lampu %s status=%s (NONE %.1f s < %.1f s toleransi) — lanjut",
@@ -1379,7 +1402,8 @@ void RoadCrossingFsmNode::onTimer()
           param_.crossing_none_tolerance_sec);
       }
       const bool light_revoked =
-        road_cross_is_green_ && !light_ok && !green_latched && active_pre_id_ &&
+        road_cross_is_green_ && !light_ok &&
+        (!green_latched || manual == crossing_light::Manual::RED) && active_pre_id_ &&
         active_crossing_id_ && egoOnPre(*active_pre_id_) && !egoOnLanelet(*active_crossing_id_);
       bool can_stop = true;
       if (light_revoked) {
@@ -2635,6 +2659,25 @@ uint16_t saturatingIncrement(uint16_t v)
   return v == std::numeric_limits<uint16_t>::max() ? v : static_cast<uint16_t>(v + 1);
 }
 }  // namespace
+
+crossing_light::Manual RoadCrossingFsmNode::manualNow(const rclcpp::Time & now)
+{
+  const double age = manual_stamp_ ? (now - *manual_stamp_).seconds() : 0.0;
+  const auto m = crossing_light::manualOverride(
+    manual_stamp_.has_value(), manual_green_, age, param_.manual_light_timeout_sec);
+  if (m != manual_logged_) {
+    const auto name = [](crossing_light::Manual x) {
+      return x == crossing_light::Manual::GREEN ? "HIJAU manual"
+             : x == crossing_light::Manual::RED ? "MERAH manual"
+                                                : "AUTO (detector)";
+    };
+    RCLCPP_WARN(
+      get_logger(), "lampu: override operator %s -> %s (fsm_state %d)", name(manual_logged_),
+      name(m), static_cast<int>(state_));
+    manual_logged_ = m;
+  }
+  return m;
+}
 
 const char * RoadCrossingFsmNode::lightStatusName(LightStatus status)
 {

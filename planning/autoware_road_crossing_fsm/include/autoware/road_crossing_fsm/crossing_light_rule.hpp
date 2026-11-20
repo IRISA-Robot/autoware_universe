@@ -54,6 +54,25 @@ inline bool greenFollowsRed(const int ticks_since_red, const int max_gap_ticks)
   return max_gap_ticks < 0 || ticks_since_red <= max_gap_ticks;
 }
 
+// Operator override (pedestrian_light_arbiter, PedestrianLightState.source == SOURCE_MANUAL).
+// 2026-11-17: the operator decides, not the light-sequence rules: GREEN = go, RED = wait.
+enum class Manual { NONE, RED, GREEN };
+
+// Override in force: the last manual message, if younger than timeout_sec.  Anything but
+// green counts as RED (wait).  timeout_sec <= 0 = overrides ignored.
+inline Manual manualOverride(
+  const bool have_manual, const bool manual_green, const double age_sec, const double timeout_sec)
+{
+  if (!have_manual || timeout_sec <= 0.0 || age_sec > timeout_sec) return Manual::NONE;
+  return manual_green ? Manual::GREEN : Manual::RED;
+}
+
+// The light decision with the override applied: NONE keeps the detector-based decision.
+inline bool applyManual(const Manual manual, const bool auto_decision)
+{
+  return manual == Manual::NONE ? auto_decision : manual == Manual::GREEN;
+}
+
 }  // namespace autoware::road_crossing_fsm::crossing_light
 
 #endif  // AUTOWARE__ROAD_CROSSING_FSM__CROSSING_LIGHT_RULE_HPP_
