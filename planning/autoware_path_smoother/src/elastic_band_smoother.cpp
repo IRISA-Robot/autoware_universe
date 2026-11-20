@@ -21,6 +21,7 @@
 #include "rclcpp/time.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <string>
@@ -30,6 +31,33 @@ namespace autoware::path_smoother
 {
 namespace
 {
+// One non-finite value in the input (a NaN pose, velocity or bound point) makes the optimizer
+// crash the whole node (crazy_test fuzz: segfault 12/12). Such a message is dropped instead.
+bool isFinitePose(const geometry_msgs::msg::Pose & p)
+{
+  return std::isfinite(p.position.x) && std::isfinite(p.position.y) &&
+         std::isfinite(p.position.z) && std::isfinite(p.orientation.x) &&
+         std::isfinite(p.orientation.y) && std::isfinite(p.orientation.z) &&
+         std::isfinite(p.orientation.w);
+}
+
+bool isFinitePath(const autoware_planning_msgs::msg::Path & path)
+{
+  for (const auto & p : path.points) {
+    if (!isFinitePose(p.pose) || !std::isfinite(p.longitudinal_velocity_mps)) {
+      return false;
+    }
+  }
+  for (const auto * bound : {&path.left_bound, &path.right_bound}) {
+    for (const auto & p : *bound) {
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 template <class T>
 std::vector<T> concatVectors(const std::vector<T> & prev_vector, const std::vector<T> & next_vector)
 {
@@ -249,6 +277,20 @@ bool ElasticBandSmoother::isDataReady(
   if (path.left_bound.empty() || path.right_bound.empty()) {
     RCLCPP_INFO_SKIPFIRST_THROTTLE(
       get_logger(), clock, 5000, "Left or right bound in path is empty.");
+    return false;
+  }
+
+  if (!isFinitePath(path)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), clock, 5000, "Input path or bound has a NaN/Inf value. Dropping it.");
+    return false;
+  }
+
+  if (
+    !isFinitePose(ego_state_ptr->pose.pose) ||
+    !std::isfinite(ego_state_ptr->twist.twist.linear.x)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), clock, 5000, "Ego odometry has a NaN/Inf value. Skipping.");
     return false;
   }
 

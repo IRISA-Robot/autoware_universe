@@ -23,6 +23,7 @@
 #include "rclcpp/time.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -34,6 +35,33 @@ namespace autoware::path_optimizer
 {
 namespace
 {
+// One non-finite value in the input (a NaN pose, velocity or bound point) makes the optimizer
+// crash the whole node (crazy_test fuzz: segfault 12/12). Such a message is dropped instead.
+bool isFinitePose(const geometry_msgs::msg::Pose & p)
+{
+  return std::isfinite(p.position.x) && std::isfinite(p.position.y) &&
+         std::isfinite(p.position.z) && std::isfinite(p.orientation.x) &&
+         std::isfinite(p.orientation.y) && std::isfinite(p.orientation.z) &&
+         std::isfinite(p.orientation.w);
+}
+
+bool isFinitePath(const autoware_planning_msgs::msg::Path & path)
+{
+  for (const auto & p : path.points) {
+    if (!isFinitePose(p.pose) || !std::isfinite(p.longitudinal_velocity_mps)) {
+      return false;
+    }
+  }
+  for (const auto * bound : {&path.left_bound, &path.right_bound}) {
+    for (const auto & p : *bound) {
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 template <class T>
 std::vector<T> concatVectors(const std::vector<T> & prev_vector, const std::vector<T> & next_vector)
 {
@@ -245,6 +273,12 @@ void PathOptimizer::onPath(const Path::ConstSharedPtr path_ptr)
       get_logger(), *get_clock(), 5000, "Waiting for ego pose and twist.");
     return;
   }
+  if (
+    !isFinitePose(ego_odom_ptr->pose.pose) || !std::isfinite(ego_odom_ptr->twist.twist.linear.x)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000, "Ego odometry has a NaN/Inf value. Skipping.");
+    return;
+  }
 
   // 0. return if path is backward
   // TODO(murooka): support backward path
@@ -298,6 +332,12 @@ bool PathOptimizer::checkInputPath(const Path & path, rclcpp::Clock clock) const
   if (path.left_bound.empty() || path.right_bound.empty()) {
     RCLCPP_INFO_SKIPFIRST_THROTTLE(
       get_logger(), clock, 5000, "Left or right bound in path is empty.");
+    return false;
+  }
+
+  if (!isFinitePath(path)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), clock, 5000, "Input path or bound has a NaN/Inf value. Dropping it.");
     return false;
   }
 
