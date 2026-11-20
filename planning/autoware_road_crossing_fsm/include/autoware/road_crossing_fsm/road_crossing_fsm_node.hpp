@@ -27,6 +27,7 @@
 #include <autoware_map_msgs/msg/lanelet_map_bin.hpp>
 #include <autoware_active_route_window_msgs/msg/active_route_window.hpp>
 #include <autoware_planning_msgs/msg/lanelet_route.hpp>
+#include <autoware_perception_msgs/msg/predicted_objects.hpp>
 #include <autoware_planning_msgs/msg/trajectory.hpp>
 #include <autoware_road_crossing_msgs/msg/pedestrian_light_state.hpp>
 #include <autoware_road_crossing_msgs/msg/pedestrian_light_target.hpp>
@@ -39,9 +40,11 @@
 #include <tf2_ros/transform_listener.h>
 #include <std_msgs/msg/float32.hpp>
 #include <std_srvs/srv/set_bool.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 #include "autoware/road_crossing_fsm/crossing_light_rule.hpp"
 #include "autoware/road_crossing_fsm/direction_utils.hpp"
+#include "autoware/road_crossing_fsm/vehicle_check.hpp"
 
 #include <autoware/route_handler/route_handler.hpp>
 #include <autoware_lanelet2_extension/utility/message_conversion.hpp>
@@ -49,6 +52,7 @@
 #include <lanelet2_core/LaneletMap.h>
 #include <lanelet2_core/primitives/Lanelet.h>
 
+#include <array>
 #include <memory>
 #include <optional>
 #include <set>
@@ -213,6 +217,22 @@ private:
     // pedestrian_light_arbiter): valid while the last manual message is younger than this.
     // The arbiter re-sends it at 10 Hz; older = the override is gone, back to the detector.
     double manual_light_timeout_sec{0.5};
+    // Vehicle check before GO (vehicle_check.hpp): a vehicle of vehicle_check_labels whose
+    // footprint is within (robot width / 2 + vehicle_check_lateral_margin_m) of the planned
+    // path over the crossing holds the robot at the line.  Only before it starts (WAIT_GREEN),
+    // also on an operator GREEN and on crossings without a light.  false = off (old behaviour).
+    bool vehicle_check_enable{false};
+    std::string topic_objects{"/perception/object_recognition/objects"};
+    std::vector<std::string> vehicle_check_labels{"CAR", "TRUCK", "BUS", "TRAILER"};
+    double vehicle_check_lateral_margin_m{0.1};
+    // > 0: also sweep each vehicle's footprint along its velocity for this long (straight
+    // line) -- a car about to drive onto the path holds too.  0 = position now only.
+    double vehicle_check_lookahead_sec{0.0};
+    double vehicle_check_min_speed_mps{0.5};   // slower than this: no sweep (standing / noise)
+    double vehicle_check_clear_sec{1.0};       // path free this long before GO is allowed again
+    // Objects older than this (or none yet) = perception not running -> hold (fail safe).
+    double vehicle_check_objects_timeout_sec{1.0};
+    double vehicle_width_m{0.0};               // wheel_tread + left / right overhang
     // true: only turn the body to the light when it is NOT detected from where the body
     // faces now (any camera) for aim_unseen_grace_sec in WAIT_GREEN; a light already seen
     // (red or green) needs no turn -- saves rotary motor work.  Once turned, the aimer stays
@@ -269,6 +289,10 @@ private:
   // Subscriber output rotary aimer — untuk deteksi aimer sudah running (spam-enable).
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr sub_aim_cmd_;
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr sub_light_roi_offset_;
+  rclcpp::Subscription<autoware_perception_msgs::msg::PredictedObjects>::SharedPtr sub_objects_;
+  autoware_perception_msgs::msg::PredictedObjects::ConstSharedPtr last_objects_;
+  rclcpp::Time last_objects_rx_{0, 0, RCL_ROS_TIME};
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_vehicle_marker_;
 
   // AdAPI state subscribers
   rclcpp::Subscription<autoware_adapi_v1_msgs::msg::RouteState>::SharedPtr sub_route_state_;
@@ -417,6 +441,19 @@ private:
   std::optional<rclcpp::Time> manual_stamp_;
   bool manual_green_{false};
   crossing_light::Manual manual_logged_{crossing_light::Manual::NONE};
+
+  // Vehicle check (vehicle_check_enable): last tick a vehicle touched the path, object uuids
+  // seen as a vehicle this episode (a label that flips to UNKNOWN keeps counting), the logged
+  // state, and whether markers are on screen.
+  std::optional<rclcpp::Time> vehicle_last_hit_;
+  std::set<std::array<uint8_t, 16>> vehicle_uuids_;
+  bool vehicle_blocked_logged_{false};
+  bool vehicle_marker_shown_{false};
+  std::string vehicle_block_reason_;
+  // True = a vehicle is on / about to enter the path (or no fresh objects): hold the GO.
+  // Fills vehicle_block_reason_ and publishes the debug markers.
+  bool vehicleBlocksCrossing(const rclcpp::Time & now);
+  void clearVehicleMarkers();
 
   // CROSSING safety-timeout timer (defensive watchdog #1).
   // Set once at each WAIT_GREEN -> CROSSING transition (green / bypass / timeout-fallback).

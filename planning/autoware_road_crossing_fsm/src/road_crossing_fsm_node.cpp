@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -126,6 +127,20 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
     declare_parameter<double>("crossing_none_tolerance_sec", 1.0);
   param_.red_to_green_max_gap_sec = declare_parameter<double>("red_to_green_max_gap_sec", 1.0);
   param_.manual_light_timeout_sec = declare_parameter<double>("manual_light_timeout_sec", 0.5);
+  param_.vehicle_check_enable = declare_parameter<bool>("vehicle_check_enable", false);
+  param_.topic_objects =
+    declare_parameter<std::string>("topic_objects", "/perception/object_recognition/objects");
+  param_.vehicle_check_labels = declare_parameter<std::vector<std::string>>(
+    "vehicle_check_labels", std::vector<std::string>{"CAR", "TRUCK", "BUS", "TRAILER"});
+  param_.vehicle_check_lateral_margin_m =
+    declare_parameter<double>("vehicle_check_lateral_margin_m", 0.1);
+  param_.vehicle_check_lookahead_sec =
+    declare_parameter<double>("vehicle_check_lookahead_sec", 0.0);
+  param_.vehicle_check_min_speed_mps =
+    declare_parameter<double>("vehicle_check_min_speed_mps", 0.5);
+  param_.vehicle_check_clear_sec = declare_parameter<double>("vehicle_check_clear_sec", 1.0);
+  param_.vehicle_check_objects_timeout_sec =
+    declare_parameter<double>("vehicle_check_objects_timeout_sec", 1.0);
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
   param_.aim_only_if_light_unseen = declare_parameter<bool>("aim_only_if_light_unseen", true);
@@ -191,6 +206,37 @@ RoadCrossingFsmNode::RoadCrossingFsmNode(const rclcpp::NodeOptions & options)
                           declare_parameter<double>("front_overhang", 0.0);
   // base_link -> rear bumper: the leading edge while reversing.
   base_link_to_rear_m_ = declare_parameter<double>("rear_overhang", 0.0);
+  param_.vehicle_width_m = declare_parameter<double>("wheel_tread", 0.0) +
+                           declare_parameter<double>("left_overhang", 0.0) +
+                           declare_parameter<double>("right_overhang", 0.0);
+
+  // Vehicle check: tracked objects (map frame) and its debug markers.
+  if (param_.vehicle_check_enable) {
+    sub_objects_ = create_subscription<autoware_perception_msgs::msg::PredictedObjects>(
+      param_.topic_objects, rclcpp::QoS(1),
+      [this](const autoware_perception_msgs::msg::PredictedObjects::ConstSharedPtr msg) {
+        last_objects_ = msg;
+        last_objects_rx_ = now();
+      });
+    pub_vehicle_marker_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+      declare_parameter<std::string>(
+        "topic_vehicle_check_marker", "/planning/road_crossing/vehicle_check/markers"),
+      rclcpp::QoS(1));
+    std::string labels;
+    for (const auto & l : param_.vehicle_check_labels) labels += (labels.empty() ? "" : ",") + l;
+    RCLCPP_INFO(
+      get_logger(),
+      "vehicle check ON: %s di jalur (lebar robot %.2f m + margin %.2f m per sisi), "
+      "lookahead %.1f s, bersih %.1f s sebelum GO, objek dari %s",
+      labels.c_str(), param_.vehicle_width_m, param_.vehicle_check_lateral_margin_m,
+      param_.vehicle_check_lookahead_sec, param_.vehicle_check_clear_sec,
+      param_.topic_objects.c_str());
+    if (param_.vehicle_width_m <= 0.0) {
+      RCLCPP_WARN(
+        get_logger(), "vehicle check: lebar robot 0 (wheel_tread/overhang tidak ada) — "
+                      "jalur hanya selebar margin");
+    }
+  }
 
   // Planned trajectory: driving direction while standing still (see updateDrivingDirection()).
   sub_trajectory_ = create_subscription<autoware_planning_msgs::msg::Trajectory>(
@@ -558,6 +604,7 @@ void RoadCrossingFsmNode::onTimer()
 {
   publishFsmState();
   publishTargetLight();
+  if (state_ != FsmState::WAIT_GREEN) clearVehicleMarkers();
 
   // Guard: need map, route, and pose before FSM can do anything useful.
   if (!map_initialized_ || !route_initialized_ || !last_odom_) {
@@ -1246,6 +1293,9 @@ void RoadCrossingFsmNode::onTimer()
       const bool green_latched = greenLatched(now);
       const auto manual = manualNow(now);
       updateAimNeed(now);
+      // Vehicle check (only here, before ego starts; never stops it once CROSSING).  Every
+      // tick so the "free for vehicle_check_clear_sec" timer runs while the light is red.
+      const bool vehicle_blocked = vehicleBlocksCrossing(now);
 
       // No position gate: ego is on this crossing's pre (the membership check guarantees it),
       // so GO as soon as the light allows — the planner module then crosses without stopping
@@ -1277,6 +1327,14 @@ void RoadCrossingFsmNode::onTimer()
       if (
         (active_light_ids_.empty() || crossingHasTag("disable_tf_light_check")) &&
         manual != crossing_light::Manual::RED) {
+        if (vehicle_blocked) {
+          RCLCPP_INFO_THROTTLE(
+            get_logger(), *get_clock(), 2000,
+            "WAIT_GREEN: crossing %ld tanpa lampu — HOLD, %s",
+            active_crossing_id_ ? static_cast<long>(*active_crossing_id_) : -1L,
+            vehicle_block_reason_.c_str());
+          break;
+        }
         RCLCPP_INFO_THROTTLE(
           get_logger(), *get_clock(), 3000,
           "WAIT_GREEN: crossing %ld %s — skip lampu, GO (vehicle-scan governs)",
@@ -1326,6 +1384,16 @@ void RoadCrossingFsmNode::onTimer()
           lightIdsText().c_str(), lightStatusName(interlock_.status_now),
           manual == crossing_light::Manual::RED ? " (operator: MERAH manual)" : "");
         break;
+      }
+
+      // Light (or operator GREEN) allows it: still hold while a vehicle is on the path.
+      if (vehicle_blocked) {
+        RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 1000, "WAIT_GREEN: lampu %s boleh (%s) — HOLD, %s",
+          lightIdsText().c_str(),
+          manual == crossing_light::Manual::GREEN ? "operator: HIJAU manual" : "hijau",
+          vehicle_block_reason_.c_str());
+        break;  // road gate stays HOLD (published above)
       }
 
       // rotate_body_while_driving=false: the body goes back to 0 before ego moves, in both gears
@@ -2897,6 +2965,245 @@ void RoadCrossingFsmNode::resetEpisode()
   // (see reZeroAimerDirectionAware()). Idempotent — SetBool false aman dikirim
   // meski sudah disabled.
   reZeroAimerDirectionAware();
+
+  vehicle_last_hit_.reset();
+  vehicle_uuids_.clear();
+  vehicle_blocked_logged_ = false;
+  vehicle_block_reason_.clear();
+  clearVehicleMarkers();
+}
+
+// ---------------------------------------------------------------------------
+// Vehicle check (vehicle_check.hpp)
+// ---------------------------------------------------------------------------
+namespace
+{
+const char * objectLabelName(const uint8_t label)
+{
+  using C = autoware_perception_msgs::msg::ObjectClassification;
+  switch (label) {
+    case C::CAR:        return "CAR";
+    case C::TRUCK:      return "TRUCK";
+    case C::BUS:        return "BUS";
+    case C::TRAILER:    return "TRAILER";
+    case C::MOTORCYCLE: return "MOTORCYCLE";
+    case C::BICYCLE:    return "BICYCLE";
+    case C::PEDESTRIAN: return "PEDESTRIAN";
+    default:            return "UNKNOWN";
+  }
+}
+
+double quatYaw(const geometry_msgs::msg::Quaternion & q)
+{
+  return std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+}
+
+std::string uuidShort(const std::array<uint8_t, 16> & uuid)
+{
+  char buf[9];
+  std::snprintf(buf, sizeof(buf), "%02x%02x%02x%02x", uuid[0], uuid[1], uuid[2], uuid[3]);
+  return buf;
+}
+
+// Object footprint in the map frame from its shape and pose.
+vehicle_check::Polyline objectFootprint(const autoware_perception_msgs::msg::PredictedObject & obj)
+{
+  using S = autoware_perception_msgs::msg::Shape;
+  const auto & pose = obj.kinematics.initial_pose_with_covariance.pose;
+  const double yaw = quatYaw(pose.orientation);
+  const double cx = pose.position.x;
+  const double cy = pose.position.y;
+  const auto & dim = obj.shape.dimensions;
+  if (obj.shape.type == S::POLYGON && obj.shape.footprint.points.size() >= 3) {
+    const double c = std::cos(yaw);
+    const double s = std::sin(yaw);
+    vehicle_check::Polyline out;
+    for (const auto & p : obj.shape.footprint.points) {
+      out.push_back({cx + c * p.x - s * p.y, cy + s * p.x + c * p.y});
+    }
+    return out;
+  }
+  if (obj.shape.type == S::CYLINDER) {
+    return vehicle_check::boxFootprint(cx, cy, yaw, dim.x, dim.x);
+  }
+  return vehicle_check::boxFootprint(cx, cy, yaw, dim.x, dim.y);
+}
+}  // namespace
+
+bool RoadCrossingFsmNode::vehicleBlocksCrossing(const rclcpp::Time & now)
+{
+  if (!param_.vehicle_check_enable) return false;
+  using visualization_msgs::msg::Marker;
+  visualization_msgs::msg::MarkerArray markers;
+  bool hit_now = false;
+  std::string hit_text;
+  double hit_dist = std::numeric_limits<double>::max();
+  const double half_width =
+    0.5 * std::max(param_.vehicle_width_m, 0.0) + param_.vehicle_check_lateral_margin_m;
+
+  const double objects_age = last_objects_ ? (now - last_objects_rx_).seconds() : -1.0;
+  const bool objects_ok = last_objects_ && objects_age <= param_.vehicle_check_objects_timeout_sec;
+
+  // Corridor: planned trajectory (if fresh) from ego to the crossing exit.
+  vehicle_check::Polyline corridor;
+  if (objects_ok && last_odom_) {
+    vehicle_check::Polyline traj;
+    if (
+      last_trajectory_ &&
+      (now - rclcpp::Time(last_trajectory_->header.stamp)).seconds() <= 1.0) {
+      traj.reserve(last_trajectory_->points.size());
+      for (const auto & p : last_trajectory_->points) {
+        traj.push_back({p.pose.position.x, p.pose.position.y});
+      }
+    }
+    const auto & e = last_odom_->pose.pose.position;
+    vehicle_check::Polyline centerline;
+    if (active_crossing_id_) {
+      if (const auto line = routedCenterline(*active_crossing_id_)) centerline = *line;
+    }
+    corridor = vehicle_check::buildCorridor(traj, {e.x, e.y}, centerline);
+  }
+
+  if (!objects_ok) {
+    hit_now = true;
+    hit_text = last_objects_
+                 ? "objek perception basi (" + std::to_string(objects_age).substr(0, 4) + " s)"
+                 : "belum ada objek perception (" + param_.topic_objects + ")";
+  } else if (corridor.size() < 2) {
+    hit_now = true;
+    hit_text = "jalur (trajectory / crossing) tidak diketahui";
+  } else {
+    int id = 0;
+    for (const auto & obj : last_objects_->objects) {
+      if (obj.classification.empty()) continue;
+      const auto best = std::max_element(
+        obj.classification.begin(), obj.classification.end(),
+        [](const auto & a, const auto & b) { return a.probability < b.probability; });
+      const std::string label = objectLabelName(best->label);
+      std::array<uint8_t, 16> uuid{};
+      std::copy(obj.object_id.uuid.begin(), obj.object_id.uuid.end(), uuid.begin());
+      const bool listed =
+        std::find(param_.vehicle_check_labels.begin(), param_.vehicle_check_labels.end(), label) !=
+        param_.vehicle_check_labels.end();
+      if (listed) {
+        vehicle_uuids_.insert(uuid);
+      } else if (vehicle_uuids_.count(uuid) == 0) {
+        continue;  // not a vehicle (and never was one this episode)
+      }
+      const auto footprint = objectFootprint(obj);
+      const auto & pose = obj.kinematics.initial_pose_with_covariance.pose;
+      const auto & tw = obj.kinematics.initial_twist_with_covariance.twist.linear;
+      const double yaw = quatYaw(pose.orientation);
+      const double vx = std::cos(yaw) * tw.x - std::sin(yaw) * tw.y;
+      const double vy = std::sin(yaw) * tw.x + std::cos(yaw) * tw.y;
+      const auto r = vehicle_check::checkVehicle(
+        corridor, half_width, footprint, vx, vy, param_.vehicle_check_lookahead_sec,
+        param_.vehicle_check_min_speed_mps);
+      if (r.hit) {
+        hit_now = true;
+        if (r.distance < hit_dist) {
+          hit_dist = r.distance;
+          char buf[160];
+          std::snprintf(
+            buf, sizeof(buf), "%s%s %s %s (%.1f m dari tengah jalur, %.1f m/s)", label.c_str(),
+            listed ? "" : " (label kini bukan kendaraan)", uuidShort(uuid).c_str(),
+            r.by_motion ? "akan masuk jalur" : "di jalur", r.distance, std::hypot(vx, vy));
+          hit_text = buf;
+        }
+      }
+      // Marker: every vehicle footprint, red when it holds the robot.
+      Marker m;
+      m.header.frame_id = "map";
+      m.header.stamp = now;
+      m.ns = "vehicle";
+      m.id = id++;
+      m.type = Marker::LINE_STRIP;
+      m.action = Marker::ADD;
+      m.pose.orientation.w = 1.0;
+      m.scale.x = 0.15;
+      m.color.a = 1.0;
+      m.color.r = r.hit ? 1.0 : 0.2;
+      m.color.g = r.hit ? 0.1 : 0.8;
+      m.color.b = 0.2;
+      m.lifetime = rclcpp::Duration::from_seconds(0.5);
+      for (size_t k = 0; k <= footprint.size(); ++k) {
+        geometry_msgs::msg::Point p;
+        p.x = footprint[k % footprint.size()].x;
+        p.y = footprint[k % footprint.size()].y;
+        p.z = pose.position.z;
+        m.points.push_back(p);
+      }
+      markers.markers.push_back(m);
+    }
+  }
+
+  if (hit_now) vehicle_last_hit_ = now;
+  const double since_hit = vehicle_last_hit_ ? (now - *vehicle_last_hit_).seconds() : 1e9;
+  const bool blocked = since_hit < param_.vehicle_check_clear_sec || hit_now;
+  if (hit_now) {
+    vehicle_block_reason_ = "kendaraan: " + hit_text;
+  } else if (blocked) {
+    char buf[120];
+    std::snprintf(
+      buf, sizeof(buf), "kendaraan: jalur bersih %.1f / %.1f s", since_hit,
+      param_.vehicle_check_clear_sec);
+    vehicle_block_reason_ = buf;
+  } else {
+    vehicle_block_reason_ = "kendaraan: jalur bersih";
+  }
+  if (blocked != vehicle_blocked_logged_) {
+    if (blocked) {
+      RCLCPP_WARN(get_logger(), "vehicle check: TAHAN — %s", vehicle_block_reason_.c_str());
+    } else {
+      RCLCPP_WARN(
+        get_logger(), "vehicle check: jalur bersih %.1f s — boleh jalan (kalau lampu boleh)",
+        param_.vehicle_check_clear_sec);
+    }
+    vehicle_blocked_logged_ = blocked;
+  }
+
+  // Marker: the corridor (centre line drawn as wide as the checked band).
+  if (pub_vehicle_marker_) {
+    if (corridor.size() >= 2) {
+      Marker m;
+      m.header.frame_id = "map";
+      m.header.stamp = now;
+      m.ns = "corridor";
+      m.id = 0;
+      m.type = Marker::LINE_STRIP;
+      m.action = Marker::ADD;
+      m.pose.orientation.w = 1.0;
+      m.scale.x = 2.0 * half_width;
+      m.color.a = 0.35;
+      m.color.r = blocked ? 1.0 : 0.1;
+      m.color.g = blocked ? 0.2 : 0.9;
+      m.color.b = 0.1;
+      m.lifetime = rclcpp::Duration::from_seconds(0.5);
+      const double z = last_odom_ ? last_odom_->pose.pose.position.z : 0.0;
+      for (const auto & p : corridor) {
+        geometry_msgs::msg::Point q;
+        q.x = p.x;
+        q.y = p.y;
+        q.z = z;
+        m.points.push_back(q);
+      }
+      markers.markers.push_back(m);
+    }
+    pub_vehicle_marker_->publish(markers);
+    vehicle_marker_shown_ = true;
+  }
+  return blocked;
+}
+
+void RoadCrossingFsmNode::clearVehicleMarkers()
+{
+  if (!pub_vehicle_marker_ || !vehicle_marker_shown_) return;
+  visualization_msgs::msg::MarkerArray markers;
+  visualization_msgs::msg::Marker m;
+  m.action = visualization_msgs::msg::Marker::DELETEALL;
+  markers.markers.push_back(m);
+  pub_vehicle_marker_->publish(markers);
+  vehicle_marker_shown_ = false;
 }
 
 }  // namespace autoware::road_crossing_fsm

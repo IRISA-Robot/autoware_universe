@@ -22,6 +22,10 @@ if(BUILD_TESTING)
     test/test_crossing_light_rule.cpp
   )
   target_include_directories(test_${PROJECT_NAME}_crossing_light PRIVATE include)
+  ament_add_ros_isolated_gtest(test_${PROJECT_NAME}_vehicle_check
+    test/test_vehicle_check.cpp
+  )
+  target_include_directories(test_${PROJECT_NAME}_vehicle_check PRIVATE include)
 endif()
 
 ament_auto_package(INSTALL_TO_SHARE
