@@ -30,6 +30,7 @@
 #include <lanelet2_core/geometry/Polygon.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <memory>
@@ -231,6 +232,8 @@ void StuckRecoverySupervisorNode::load_parameters()
     "pathological_factor_topics", std::vector<std::string>{});
   p.legit_factor_topics =
     declare_parameter<std::vector<std::string>>("legit_factor_topics", std::vector<std::string>{});
+  p.unbounded_legit_factor_topics = declare_parameter<std::vector<std::string>>(
+    "unbounded_legit_factor_topics", std::vector<std::string>{"road_crossing", "common_crossing"});
 
   p.topic_odometry =
     declare_parameter<std::string>("topic_odometry", "/localization/kinematic_state");
@@ -881,8 +884,13 @@ void StuckRecoverySupervisorNode::classify_stop()
     stop_source_ = StuckDiagnosis::SOURCE_MAP_STOP;
     stop_source_module_ = map_stop_module;
     // A map stop that never releases is itself pathological, so the patience is
-    // long but finite.
-    if ((now - map_stop_since_).seconds() < param_.map_stop_patience_sec) {
+    // long but finite -- except for the modules that wait for traffic on purpose
+    // (unbounded_legit_factor_topics): 2026-11-23 the robot waited 72 s at a common_crossing
+    // with cars passing; past the patience recovery would drive it towards them.
+    const auto & unbounded = param_.unbounded_legit_factor_topics;
+    const bool no_patience_limit =
+      std::find(unbounded.begin(), unbounded.end(), map_stop_module) != unbounded.end();
+    if (no_patience_limit || (now - map_stop_since_).seconds() < param_.map_stop_patience_sec) {
       legit_stop_ = true;
       legit_reason_ = "map_stop:" + map_stop_module;
       return;
@@ -1038,17 +1046,30 @@ std::optional<lanelet::Id> StuckRecoverySupervisorNode::recovery_disabled_lanele
   if (!map) {
     return std::nullopt;
   }
-  const auto & p = odom_->pose.pose.position;
-  const lanelet::BasicPoint2d point(p.x, p.y);
+  // base_link AND both bumpers: a robot held at a crossing stands with base_link just before
+  // the tagged pre (2026-11-23: 0.02-0.32 m short of it, front bumper on it) -- checking
+  // base_link alone let recovery run there.  Any part of the robot on a tagged lanelet counts.
+  const auto & pose = odom_->pose.pose;
+  const auto & q = pose.orientation;
+  const double yaw =
+    std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+  const double c = std::cos(yaw);
+  const double s = std::sin(yaw);
+  const std::array<double, 3> offsets{0.0, base_to_front_m_, -base_to_rear_m_};
+  const size_t n_points = preset().disable_recovery_base_link_only ? 1 : offsets.size();
   constexpr double search_margin = 0.1;
-  const lanelet::BoundingBox2d bbox(
-    lanelet::BasicPoint2d(p.x - search_margin, p.y - search_margin),
-    lanelet::BasicPoint2d(p.x + search_margin, p.y + search_margin));
-  for (const auto & ll : map->laneletLayer.search(bbox)) {
-    if (
-      ll.attributeOr("disable_recovery", false) &&
-      !boost::geometry::disjoint(point, ll.polygon2d().basicPolygon())) {
-      return ll.id();
+  for (size_t k = 0; k < n_points; ++k) {
+    const double off = offsets[k];
+    const lanelet::BasicPoint2d point(pose.position.x + c * off, pose.position.y + s * off);
+    const lanelet::BoundingBox2d bbox(
+      lanelet::BasicPoint2d(point.x() - search_margin, point.y() - search_margin),
+      lanelet::BasicPoint2d(point.x() + search_margin, point.y() + search_margin));
+    for (const auto & ll : map->laneletLayer.search(bbox)) {
+      if (
+        ll.attributeOr("disable_recovery", false) &&
+        !boost::geometry::disjoint(point, ll.polygon2d().basicPolygon())) {
+        return ll.id();
+      }
     }
   }
   return std::nullopt;
@@ -1158,7 +1179,7 @@ void StuckRecoverySupervisorNode::step_suspect()
     return;
   }
 
-  const bool timer_elapsed = (now - state_since_).seconds() > param_.suspect_timeout_sec;
+  const bool timer_elapsed = (now - state_since_).seconds() > preset().suspect_timeout_sec;
   bool triggerable = stop_source_ == StuckDiagnosis::SOURCE_OBSTACLE_STOP ||
                      stop_source_ == StuckDiagnosis::SOURCE_STOP_BEHIND ||
                      stop_source_ == StuckDiagnosis::SOURCE_MAP_STOP;
@@ -2200,7 +2221,7 @@ void StuckRecoverySupervisorNode::relay_recovery_trajectory()
   {
     const double measured = velocity_ ? velocity_->longitudinal_velocity
                                       : (odom_ ? odom_->twist.twist.linear.x : 0.0);
-    const double limit = param_.recovery_speed_limit_mps;
+    const double limit = preset().speed_limit_mps;
     if (std::abs(measured) > limit * param_.recovery_overspeed_ratio) {
       if (!overspeed_braking_) {
         RCLCPP_WARN(
@@ -2301,7 +2322,7 @@ void StuckRecoverySupervisorNode::clamp_recovery_speed(
 {
   // Magnitude only: the sign carries the direction of travel and must survive, or the
   // MPC would read a reverse segment as a forward one.
-  const auto limit = static_cast<float>(param_.recovery_speed_limit_mps);
+  const auto limit = static_cast<float>(preset().speed_limit_mps);
   for (auto & point : traj.points) {
     point.longitudinal_velocity_mps =
       std::copysign(std::min(std::abs(point.longitudinal_velocity_mps), limit),
@@ -2474,7 +2495,7 @@ autoware_planning_msgs::msg::Trajectory StuckRecoverySupervisorNode::build_trans
     autoware_planning_msgs::msg::TrajectoryPoint point;
     point.pose = pose;
     point.longitudinal_velocity_mps =
-      static_cast<float>(sign * param_.recovery_speed_limit_mps);
+      static_cast<float>(sign * preset().speed_limit_mps);
     traj.points.push_back(point);
   };
 
@@ -3545,7 +3566,7 @@ double StuckRecoverySupervisorNode::plan_obstruction(
   for (auto it = nearest; it != traj.points.end(); ++it) {
     const double step = (it != nearest) ? distance2d(std::prev(it)->pose, it->pose) : 0.0;
     arc += step;
-    if (arc > param_.aeb_lookahead_m) {
+    if (arc > preset().aeb_lookahead_m) {
       break;
     }
     const auto [blocked, total] =
@@ -4001,6 +4022,9 @@ void StuckRecoverySupervisorNode::build_recovery_presets()
     preset.goal_shape_margin_m = param_.goal_shape_margin_m;
     preset.goal_retry_sec = param_.goal_retry_sec;
     preset.handback_margin_m = param_.handback_margin_m;
+    preset.suspect_timeout_sec = param_.suspect_timeout_sec;
+    preset.speed_limit_mps = param_.recovery_speed_limit_mps;
+    preset.aeb_lookahead_m = param_.aeb_lookahead_m;
     preset.pub_scenario = pub_scenario_;
     preset.pub_route = pub_route_;
     subscribe(preset, param_.topic_freespace_full_trajectory, param_.topic_recovery_is_completed);
@@ -4028,9 +4052,31 @@ void StuckRecoverySupervisorNode::build_recovery_presets()
       declare_parameter<double>(ns + "goal_retry_sec", param_.goal_retry_sec);
     preset.handback_margin_m =
       declare_parameter<double>(ns + "handback_margin_m", param_.handback_margin_m);
-    preset.pub_scenario = create_publisher<autoware_internal_planning_msgs::msg::Scenario>(
-      declare_parameter<std::string>(ns + "scenario_topic", param_.topic_out_scenario),
-      rclcpp::QoS{1});
+    preset.suspect_timeout_sec = std::max(
+      0.0, declare_parameter<double>(ns + "suspect_timeout_sec", param_.suspect_timeout_sec));
+    constexpr double kMaxPresetSpeedMps = 1.4;  // 5 km/h
+    const double speed =
+      declare_parameter<double>(ns + "speed_limit_mps", param_.recovery_speed_limit_mps);
+    preset.speed_limit_mps = std::clamp(speed, 0.05, kMaxPresetSpeedMps);
+    if (std::abs(preset.speed_limit_mps - speed) > 1e-9) {
+      RCLCPP_WARN(
+        get_logger(), "parameter '%sspeed_limit_mps' = %.3f clamped to %.3f", ns.c_str(), speed,
+        preset.speed_limit_mps);
+    }
+    preset.aeb_lookahead_m = std::max(
+      0.1, declare_parameter<double>(ns + "aeb_lookahead_m", param_.aeb_lookahead_m));
+    preset.disable_recovery_base_link_only =
+      declare_parameter<bool>(ns + "disable_recovery_base_link_only", false);
+    preset.scenario_topic =
+      declare_parameter<std::string>(ns + "scenario_topic", param_.topic_out_scenario);
+    // Presets may share a freespace instance (same topics): reuse its publisher.
+    for (const auto & other : presets_) {
+      if (other.scenario_topic == preset.scenario_topic) preset.pub_scenario = other.pub_scenario;
+    }
+    if (!preset.pub_scenario) {
+      preset.pub_scenario = create_publisher<autoware_internal_planning_msgs::msg::Scenario>(
+        preset.scenario_topic, rclcpp::QoS{1});
+    }
     preset.pub_route = create_publisher<autoware_planning_msgs::msg::LaneletRoute>(
       declare_parameter<std::string>(ns + "route_topic", param_.topic_out_route), latched);
     subscribe(
@@ -4042,9 +4088,11 @@ void StuckRecoverySupervisorNode::build_recovery_presets()
     RCLCPP_INFO(
       get_logger(),
       "recovery preset [%zu] \"%s\": aeb_margin %.3f m, goal_shape_margin %.3f m, goal_retry "
-      "%.1f s, handback_margin %.3f m",
+      "%.1f s, handback_margin %.3f m, suspect %.1f s, speed %.2f m/s, aeb_lookahead %.1f m%s",
       presets_.size(), name.c_str(), preset.aeb_margin_m, preset.goal_shape_margin_m,
-      preset.goal_retry_sec, preset.handback_margin_m);
+      preset.goal_retry_sec, preset.handback_margin_m, preset.suspect_timeout_sec,
+      preset.speed_limit_mps, preset.aeb_lookahead_m,
+      preset.disable_recovery_base_link_only ? ", disable_recovery at base_link only" : "");
     presets_.push_back(preset);
   }
 }
@@ -4115,8 +4163,14 @@ void StuckRecoverySupervisorNode::publish_recovery_arming(bool active)
   // background against a goal still latched on its own route topic.
   autoware_internal_planning_msgs::msg::Scenario idle;
   idle.current_scenario = autoware_internal_planning_msgs::msg::Scenario::EMPTY;
+  // Presets sharing a freespace instance share the publisher: only the active one's arming
+  // goes out on it, the others on it are skipped.
+  const auto & active_pub = presets_.at(active_preset_).pub_scenario;
   for (size_t i = 0; i < presets_.size(); ++i) {
     if (!presets_[i].pub_scenario) {
+      continue;
+    }
+    if (active && i != active_preset_ && presets_[i].pub_scenario == active_pub) {
       continue;
     }
     presets_[i].pub_scenario->publish((active && i == active_preset_) ? msg : idle);
@@ -4287,7 +4341,7 @@ void StuckRecoverySupervisorNode::record_footprint_debug(
         .first;
     FootprintVerdict verdict = FootprintVerdict::FREE;
     if (blocked > 0) {
-      if (arc > param_.aeb_lookahead_m) {
+      if (arc > preset().aeb_lookahead_m) {
         verdict = FootprintVerdict::BEYOND;
       } else if (blocked <= start_blocked) {
         verdict = FootprintVerdict::GRACED;

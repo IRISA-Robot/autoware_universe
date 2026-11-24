@@ -209,6 +209,11 @@ struct AvoidanceParameters
   bool use_static_detection_area{true};
   double object_check_min_forward_distance{0.0};
   double object_check_max_forward_distance{0.0};
+
+  // 2026-11-23: ego on a road_crossing / pre_road_crossing lanelet -> look at least this far
+  // ahead (crossings are 12-32 m; the road-crossing vehicle check covers the whole crossing,
+  // so an object it holds for must be one avoidance can shift around).  <= 0 = off.
+  double object_check_road_crossing_forward_distance{0.0};
   double object_check_backward_distance{0.0};
   double object_check_yaw_deviation{0.0};
 

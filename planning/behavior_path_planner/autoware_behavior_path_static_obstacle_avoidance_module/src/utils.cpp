@@ -1351,6 +1351,66 @@ bool isObjectPositionInTaggedLanelet(
 }
 
 /**
+ * @brief `disable_static_avoidance_labels` lanelet tag (2026-11-23): a comma separated list of
+ * object labels (car, truck, bus, trailer, motorcycle, bicycle, pedestrian, unknown) that are
+ * NOT avoided in that lanelet -- ego yields behind them.  Other labels are avoided as usual, and
+ * unlike `disable_static_avoidance=true` the lanelet is no avoidance-free zone: a shift may run
+ * through it.  Road crossings: "pedestrian,bicycle" -- a car nose in the zebra is passed, a
+ * person is waited for.
+ * @return true if the object's label is listed in the tag of the lanelet it overhangs or sits in.
+ */
+bool isObjectLabelDisabledByLaneletTag(
+  const ObjectData & object, const std::shared_ptr<const PlannerData> & planner_data)
+{
+  constexpr const char * tag = "disable_static_avoidance_labels";
+  const auto label = utils::getHighestProbLabel(object.object.classification);
+  const char * name = "unknown";
+  switch (label) {
+    case ObjectClassification::CAR:        name = "car"; break;
+    case ObjectClassification::TRUCK:      name = "truck"; break;
+    case ObjectClassification::BUS:        name = "bus"; break;
+    case ObjectClassification::TRAILER:    name = "trailer"; break;
+    case ObjectClassification::MOTORCYCLE: name = "motorcycle"; break;
+    case ObjectClassification::BICYCLE:    name = "bicycle"; break;
+    case ObjectClassification::PEDESTRIAN: name = "pedestrian"; break;
+    default:                               name = "unknown"; break;
+  }
+  const auto lists = [&](const lanelet::ConstLanelet & ll) {
+    const std::string value = ll.attributeOr(tag, "");
+    if (value.empty()) return false;
+    size_t start = 0;
+    while (start <= value.size()) {
+      const size_t end = std::min(value.find(',', start), value.size());
+      std::string item = value.substr(start, end - start);
+      item.erase(0, item.find_first_not_of(" \t"));
+      item.erase(item.find_last_not_of(" \t") + 1);
+      if (item == name) return true;
+      start = end + 1;
+    }
+    return false;
+  };
+  if (object.overhang_lanelet.id() != lanelet::InvalId && lists(object.overhang_lanelet)) {
+    return true;
+  }
+  const auto & route_handler = planner_data->route_handler;
+  if (!route_handler) return false;
+  const auto lanelet_map_ptr = route_handler->getLaneletMapPtr();
+  if (!lanelet_map_ptr) return false;
+  const auto object_position = object.getPosition();
+  const lanelet::BasicPoint2d point(object_position.x, object_position.y);
+  constexpr double search_margin = 0.1;
+  const lanelet::BoundingBox2d bbox(
+    lanelet::BasicPoint2d(object_position.x - search_margin, object_position.y - search_margin),
+    lanelet::BasicPoint2d(object_position.x + search_margin, object_position.y + search_margin));
+  for (const auto & ll : lanelet_map_ptr->laneletLayer.search(bbox)) {
+    if (lists(ll) && !boost::geometry::disjoint(point, ll.polygon2d().basicPolygon())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * @brief get avoidance lateral margin based on road width.
  * @param object data.
  * @param planner data, which includes ego vehicle footprint info.
@@ -1378,6 +1438,10 @@ std::optional<double> getAvoidMargin(
   if (
     object.overhang_lanelet.attributeOr("disable_static_avoidance", false) ||
     isObjectPositionInTaggedLanelet(object, planner_data, "disable_static_avoidance")) {
+    return std::nullopt;
+  }
+  // `disable_static_avoidance_labels`: only the listed labels are not avoided there.
+  if (isObjectLabelDisabledByLaneletTag(object, planner_data)) {
     return std::nullopt;
   }
 

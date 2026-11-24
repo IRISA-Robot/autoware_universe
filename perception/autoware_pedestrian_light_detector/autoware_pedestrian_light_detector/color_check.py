@@ -95,6 +95,31 @@ def crop_image_msg(data, width: int, height: int, step: int, encoding: str,
     return np.ascontiguousarray(crop)
 
 
+def override_safe(clf_color: str, clf_conf: float, verdict: Optional[str],
+                  keep_conf: float = 0.9, red_to_green: bool = False) -> str:
+    """
+    Safe override (2026-11-23).
+
+    The colour check never creates a GREEN by default:
+      classifier sure (conf >= keep_conf)       -> classifier (lamp 886: orange leaves at the
+                                                   box edge read 'red' on a GREEN 0.97)
+      classifier GREEN unsure + verdict 'red'   -> 'red'   (safe side: the robot waits)
+      classifier RED unsure + verdict 'green'   -> 'none'  (a false red no longer cancels a green
+                                                   phase; lamp 895 in the sun: RED 0.8 on green)
+                                                   ('green' only with red_to_green=True)
+      anything else                             -> classifier (UNKNOWN / NONE never changed)
+    """
+    if clf_color not in ('red', 'green') or verdict is None:
+        return clf_color
+    if clf_conf >= keep_conf:
+        return clf_color
+    if clf_color == 'green' and verdict == 'red':
+        return 'red'
+    if clf_color == 'red' and verdict == 'green':
+        return 'green' if red_to_green else 'none'
+    return clf_color
+
+
 def override(clf_color: str, verdict: Optional[str]) -> str:
     """clf_color / result in {'red', 'green', 'none'}; only a red/green classifier result is
     overridden (a NONE / UNKNOWN classifier result stays NONE)."""

@@ -134,6 +134,9 @@
           static: false                                 # [-]
           min_forward_distance: 50.0                    # [m]
           max_forward_distance: 150.0                   # [m]
+          # 2026-11-23: ego on a road_crossing / pre_road_crossing lanelet -> look at least this far
+          # ahead, automatically (crossings 12-32 m; the vehicle check covers the whole crossing).
+          road_crossing_forward_distance: 40.0 # [m] 0 = off
           backward_distance: 10.0                       # [m]
 
         # filtering parking objects

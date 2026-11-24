@@ -604,7 +604,9 @@ void RoadCrossingFsmNode::onTimer()
 {
   publishFsmState();
   publishTargetLight();
-  if (state_ != FsmState::WAIT_GREEN) clearVehicleMarkers();
+  if (state_ != FsmState::WAIT_GREEN && !(state_ == FsmState::CROSSING && vehicle_check_in_crossing_)) {
+    clearVehicleMarkers();
+  }
 
   // Guard: need map, route, and pose before FSM can do anything useful.
   if (!map_initialized_ || !route_initialized_ || !last_odom_) {
@@ -1473,8 +1475,15 @@ void RoadCrossingFsmNode::onTimer()
         road_cross_is_green_ && !light_ok &&
         (!green_latched || manual == crossing_light::Manual::RED) && active_pre_id_ &&
         active_crossing_id_ && egoOnPre(*active_pre_id_) && !egoOnLanelet(*active_crossing_id_);
+      // 2026-11-23: the vehicle check holds like the light does -- while ego is still on the pre
+      // (and can still stop before the crossing), a vehicle on the path sends it back to
+      // WAIT_GREEN; once on the crossing it is never stopped by this check.
+      const bool on_pre_only = active_pre_id_ && active_crossing_id_ &&
+                               egoOnPre(*active_pre_id_) && !egoOnLanelet(*active_crossing_id_);
+      vehicle_check_in_crossing_ = param_.vehicle_check_enable && on_pre_only;
+      const bool vehicle_revoked = vehicle_check_in_crossing_ && vehicleBlocksCrossing(now);
       bool can_stop = true;
-      if (light_revoked) {
+      if (light_revoked || vehicle_revoked) {
         // |v| and the leading bumper: the same in both gears.
         const double v = last_odom_ ? std::abs(last_odom_->twist.twist.linear.x) : 0.0;
         const double d = distanceToCrossingEntry();
@@ -1486,18 +1495,28 @@ void RoadCrossingFsmNode::onTimer()
           can_stop = false;
           RCLCPP_WARN_THROTTLE(
             get_logger(), *get_clock(), 1000,
-            "CROSSING: lampu %s tidak lagi mengizinkan (status=%s) tapi bumper %.2f m dari "
-            "crossing @ %.2f m/s (butuh %.2f m untuk berhenti) — tidak sempat berhenti, LANJUT",
-            lightIdsText().c_str(), lightStatusName(interlock_.status_now), gap, v, need);
+            "CROSSING: %s tapi bumper %.2f m dari crossing @ %.2f m/s (butuh %.2f m untuk "
+            "berhenti) — tidak sempat berhenti, LANJUT",
+            light_revoked ? ("lampu " + lightIdsText() + " tidak lagi mengizinkan (status=" +
+                             lightStatusName(interlock_.status_now) + ")").c_str()
+                          : vehicle_block_reason_.c_str(),
+            gap, v, need);
         }
       }
-      if (light_revoked && can_stop) {
-        RCLCPP_WARN(
-          get_logger(),
-          "CROSSING: ego masih di pre %ld dan lampu %s tidak lagi mengizinkan (status=%s) — "
-          "kembali ke WAIT_GREEN",
-          static_cast<long>(*active_pre_id_), lightIdsText().c_str(),
-          lightStatusName(interlock_.status_now));
+      if ((light_revoked || vehicle_revoked) && can_stop) {
+        if (light_revoked) {
+          RCLCPP_WARN(
+            get_logger(),
+            "CROSSING: ego masih di pre %ld dan lampu %s tidak lagi mengizinkan (status=%s) — "
+            "kembali ke WAIT_GREEN",
+            static_cast<long>(*active_pre_id_), lightIdsText().c_str(),
+            lightStatusName(interlock_.status_now));
+        } else {
+          RCLCPP_WARN(
+            get_logger(), "CROSSING: ego masih di pre %ld dan %s — kembali ke WAIT_GREEN",
+            static_cast<long>(*active_pre_id_), vehicle_block_reason_.c_str());
+        }
+        vehicle_check_in_crossing_ = false;
         road_cross_is_green_ = false;
         crossing_timeout_start_.reset();
         light_timeout_start_ = now;

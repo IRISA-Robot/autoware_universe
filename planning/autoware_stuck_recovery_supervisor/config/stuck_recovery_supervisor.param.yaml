@@ -455,6 +455,11 @@
       - "detection_area"
       - "virtual_traffic_light"
       - "road_crossing"
+      # 2026-11-23: the common_crossing module (sidewalk over a car lane) holds the robot at the
+      # pre while a vehicle is in its check area.  Missing here, that wait read as an unexplained
+      # stop with the corridor blocked -> RECOVERY drove the robot towards the cars (15:01:05,
+      # 15:03:39 on crossings 1317 / 1054).
+      - "common_crossing"
       - "traffic_light"
       - "intersection"
       - "blind_spot"
@@ -468,6 +473,12 @@
       - "lane_change_right"
       - "rear_collision_checker"
       - "intersection_collision_checker"
+
+    # 2026-11-23: legit stops of these modules never run out of map_stop_patience_sec -- they
+    # wait for traffic on purpose and may hold for minutes (common_crossing waited 72 s).
+    unbounded_legit_factor_topics:
+      - "road_crossing"
+      - "common_crossing"
 
     # road_crossing FSM states that mean "it is deliberately holding":
     # APPROACH_PRE(1), REROUTING_TO_ALT(3), ARMED_LIGHT(4), WAIT_GREEN(5),

@@ -137,6 +137,9 @@ void StaticObstacleAvoidanceModuleManager::updateModuleParams(
       parameters, ns + "min_forward_distance", p->object_check_min_forward_distance);
     update_param<double>(
       parameters, ns + "max_forward_distance", p->object_check_max_forward_distance);
+    update_param<double>(
+      parameters, ns + "road_crossing_forward_distance",
+      p->object_check_road_crossing_forward_distance);
     update_param<double>(parameters, ns + "backward_distance", p->object_check_backward_distance);
   }
 

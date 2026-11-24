@@ -283,6 +283,11 @@ class PedestrianLightDetectorNode(Node):
         self.declare_parameter('color_check_min_box_h', 8)
         self.declare_parameter('color_check_use_max', False)
         self.declare_parameter('color_check_min_aspect', 0.0)
+        # 2026-11-23 safe override (color_check.override_safe): a classifier result with conf >=
+        # keep_conf is never changed; an unsure RED the check calls 'green' becomes NONE (GREEN
+        # only with color_check_red_to_green).  keep_conf > 1 + red_to_green = the old override.
+        self.declare_parameter('color_check_keep_conf', 0.9)
+        self.declare_parameter('color_check_red_to_green', False)
 
         # ---------- parameters: Autoware backend (backend='autoware') ----------
         # autoware_light_id: traffic_light_id yang dikirim ke classifier dan
@@ -770,6 +775,8 @@ class PedestrianLightDetectorNode(Node):
             min_box_h=int(self.get_parameter('color_check_min_box_h').value),
             use_max=bool(self.get_parameter('color_check_use_max').value),
             min_aspect=float(self.get_parameter('color_check_min_aspect').value))
+        self._color_keep_conf = float(self.get_parameter('color_check_keep_conf').value)
+        self._color_red_to_green = bool(self.get_parameter('color_check_red_to_green').value)
         self._clf_sent_imgs = collections.OrderedDict()   # stamp -> Image sent to classifier
         self._clf_final_boxes = collections.OrderedDict()  # stamp -> (x, y, w, h) classifier box
         self._color_count = collections.Counter()          # per 100 classifier results
@@ -1548,16 +1555,18 @@ class PedestrianLightDetectorNode(Node):
         if self._color_check_enable:
             verdict, feat = self._color_verdict((msg.header.stamp.sec, msg.header.stamp.nanosec))
             clf_name = {STATE_RED: 'red', STATE_GREEN: 'green'}.get(state, 'none')
-            result = color_check.override(clf_name, verdict)
+            result = color_check.override_safe(
+                clf_name, conf, verdict, self._color_keep_conf, self._color_red_to_green)
             self._color_count[f'{clf_name}->{result}'] += 1
             if result != clf_name:
                 overridden = True
-                state = STATE_RED if result == 'red' else STATE_GREEN
-                conf = max(conf, self._autoware_min_confidence)
+                state = {'red': STATE_RED, 'green': STATE_GREEN}.get(result, STATE_NONE)
+                conf = max(conf, self._autoware_min_confidence) if state != STATE_NONE else 0.0
                 self.get_logger().info(
                     f'[color] classifier {clf_name.upper()} ({float(element.confidence):.2f}) '
-                    f'-> {result.upper()} (jendela atas: merah p90={feat.redness_p90:.0f} '
-                    f'sat={feat.sat_mean:.0f})', throttle_duration_sec=1.0)
+                    f'-> {result.upper()} (jendela atas: merah max={feat.redness_max:.0f} '
+                    f'p90={feat.redness_p90:.0f} sat={feat.sat_mean:.0f})',
+                    throttle_duration_sec=1.0)
             if sum(self._color_count.values()) >= 100:
                 self.get_logger().info('[color] 100 hasil terakhir: ' + ' '.join(
                     f'{k}={v}' for k, v in sorted(self._color_count.items())))

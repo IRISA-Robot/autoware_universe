@@ -205,6 +205,8 @@ AvoidanceParameters getParameter(rclcpp::Node * node)
       get_or_declare_parameter<double>(*node, ns + "min_forward_distance");
     p.object_check_max_forward_distance =
       get_or_declare_parameter<double>(*node, ns + "max_forward_distance");
+    p.object_check_road_crossing_forward_distance =
+      get_or_declare_parameter<double>(*node, ns + "road_crossing_forward_distance");
     p.object_check_backward_distance =
       get_or_declare_parameter<double>(*node, ns + "backward_distance");
   }

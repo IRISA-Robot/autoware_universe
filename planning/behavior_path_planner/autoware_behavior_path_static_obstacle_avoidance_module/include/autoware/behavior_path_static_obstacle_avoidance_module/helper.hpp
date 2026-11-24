@@ -309,6 +309,20 @@ public:
   double getForwardDetectionRange(
     const std::optional<lanelet::ConstLanelet> & closest_lanelet) const
   {
+    const double nominal = getNominalForwardDetectionRange(closest_lanelet);
+    // Road crossing (or its pre): see the whole crossing, automatically.
+    if (
+      closest_lanelet.has_value() && parameters_->object_check_road_crossing_forward_distance > 0.0 &&
+      (std::string(closest_lanelet->attributeOr("road_crossing", "false")) == "true" ||
+       std::string(closest_lanelet->attributeOr("pre_road_crossing", "false")) == "true")) {
+      return std::max(nominal, parameters_->object_check_road_crossing_forward_distance);
+    }
+    return nominal;
+  }
+
+  double getNominalForwardDetectionRange(
+    const std::optional<lanelet::ConstLanelet> & closest_lanelet) const
+  {
     if (parameters_->use_static_detection_area) {
       return parameters_->object_check_max_forward_distance;
     }

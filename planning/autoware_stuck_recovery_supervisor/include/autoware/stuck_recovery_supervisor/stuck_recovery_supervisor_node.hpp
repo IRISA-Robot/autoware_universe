@@ -387,6 +387,9 @@ private:
     // classification inputs
     std::vector<std::string> pathological_factor_topics{};
     std::vector<std::string> legit_factor_topics{};
+    // Legit factor topics whose STOP never runs out of map_stop_patience_sec: a module that
+    // waits for traffic on purpose (road_crossing, common_crossing) may hold for minutes.
+    std::vector<std::string> unbounded_legit_factor_topics{};
 
     // topics
     std::string topic_odometry;
@@ -791,6 +794,19 @@ private:
     /// Lateral clearance, obstacle to footprint, required before this preset may hand the
     /// robot back to lane driving.  See handback_clearance_ok().
     double handback_margin_m{};
+    /// 2026-11-23 per-preset timing and speed (default: the global values).  The road-crossing
+    /// preset recovers fast: a robot stopped on a live road must not stand there.
+    /// How long SUSPECT waits before recovering (after the 1 s stop debounce).
+    double suspect_timeout_sec{};
+    /// Recovery speed limit [m/s] (global recovery_speed_limit_mps is capped at 0.5; a preset
+    /// may go up to kMaxPresetSpeedMps).
+    double speed_limit_mps{};
+    /// Recovery AEB look-ahead along the plan [m]; longer for a faster preset.
+    double aeb_lookahead_m{};
+    /// true: `disable_recovery` is checked at base_link only (not the bumpers), so a robot on
+    /// the crossing whose rear bumper is still on the tagged pre may recover.
+    bool disable_recovery_base_link_only{false};
+    std::string scenario_topic{};
     rclcpp::Publisher<autoware_internal_planning_msgs::msg::Scenario>::SharedPtr pub_scenario{};
     rclcpp::Publisher<autoware_planning_msgs::msg::LaneletRoute>::SharedPtr pub_route{};
     rclcpp::Subscription<autoware_planning_msgs::msg::Trajectory>::SharedPtr sub_full_traj{};

@@ -449,6 +449,8 @@ private:
   std::set<std::array<uint8_t, 16>> vehicle_uuids_;
   bool vehicle_blocked_logged_{false};
   bool vehicle_marker_shown_{false};
+  // The vehicle check ran in CROSSING last tick (ego still on the pre): keep its markers.
+  bool vehicle_check_in_crossing_{false};
   std::string vehicle_block_reason_;
   // True = a vehicle is on / about to enter the path (or no fresh objects): hold the GO.
   // Fills vehicle_block_reason_ and publishes the debug markers.

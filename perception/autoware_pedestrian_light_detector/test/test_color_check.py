@@ -54,6 +54,23 @@ def test_override_only_red_green():
     assert color_check.override('none', 'green') == 'none'
 
 
+def test_override_safe_never_creates_green():
+    # sure classifier: never changed (lamp 886, leaves at the box edge, GREEN 0.97)
+    assert color_check.override_safe('green', 0.97, 'red') == 'green'
+    assert color_check.override_safe('red', 0.95, 'green') == 'red'
+    # unsure GREEN + red verdict -> RED (safe side)
+    assert color_check.override_safe('green', 0.86, 'red') == 'red'
+    # unsure RED + green verdict -> NONE, GREEN only when allowed (lamp 895, RED 0.8 on green)
+    assert color_check.override_safe('red', 0.80, 'green') == 'none'
+    assert color_check.override_safe('red', 0.80, 'green', red_to_green=True) == 'green'
+    # no opinion / UNKNOWN / agreeing: unchanged
+    assert color_check.override_safe('red', 0.5, None) == 'red'
+    assert color_check.override_safe('none', 0.3, 'green') == 'none'
+    assert color_check.override_safe('green', 0.86, 'green') == 'green'
+    # keep_conf > 1: every unsure result may be overridden (old behaviour for GREEN -> RED)
+    assert color_check.override_safe('green', 0.99, 'red', keep_conf=1.1) == 'red'
+
+
 def test_crop_image_msg_bgr_and_rgb_with_padding():
     h, w = 6, 5
     img = np.arange(h * w * 3, dtype=np.uint8).reshape(h, w, 3)
