@@ -112,6 +112,17 @@ struct AvoidanceParameters
 
   double force_deactivate_duration_time{0.0};
 
+  // [CROSSING-STANDSTILL-RESET 2026-11-24] Ego standing still on a road_crossing /
+  // pre_road_crossing lanelet, physically still on the reference path (prefer_lateral_ratio
+  // included), no avoidance target for clear_time: the registered shift lines are dropped and the
+  // path is straight again at once.  At standstill a shift line starts at ego, so "ego on the
+  // shift line" kept the module RUNNING and the return shift ran out into the crossing (cars
+  // passing on red shifted the path, it came back mid-crossing).  See getCurrentModuleState().
+  bool enable_crossing_standstill_reset{false};
+  double crossing_standstill_reset_max_speed{0.05};          // [m/s]
+  double crossing_standstill_reset_max_lateral_deviation{0.1};  // [m]
+  double crossing_standstill_reset_clear_time{1.0};          // [s]
+
   // If true, bypass every purely longitudinal-distance/timing-based rejection or cancellation
   // gate (wait-and-see start delay, "not enough prepare/avoidance distance" rejection, cancel
   // maneuver triggered solely by shrinking longitudinal room, etc.) and attempt to avoid ANY

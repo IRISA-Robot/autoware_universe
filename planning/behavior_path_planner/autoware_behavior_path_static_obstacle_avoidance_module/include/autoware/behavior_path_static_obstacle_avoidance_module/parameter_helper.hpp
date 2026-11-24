@@ -366,6 +366,14 @@ AvoidanceParameters getParameter(rclcpp::Node * node)
     p.enable_cancel_maneuver = get_or_declare_parameter<bool>(*node, ns + "enable");
     p.force_deactivate_duration_time =
       get_or_declare_parameter<double>(*node, ns + "force.duration_time");
+    p.enable_crossing_standstill_reset =
+      get_or_declare_parameter<bool>(*node, ns + "road_crossing_standstill_reset.enable");
+    p.crossing_standstill_reset_max_speed =
+      get_or_declare_parameter<double>(*node, ns + "road_crossing_standstill_reset.max_speed");
+    p.crossing_standstill_reset_max_lateral_deviation = get_or_declare_parameter<double>(
+      *node, ns + "road_crossing_standstill_reset.max_lateral_deviation");
+    p.crossing_standstill_reset_clear_time =
+      get_or_declare_parameter<double>(*node, ns + "road_crossing_standstill_reset.clear_time");
   }
 
   // yield

@@ -80,6 +80,12 @@ private:
    */
   AvoidanceState getCurrentModuleState(const AvoidancePlanningData & data) const;
 
+  /**
+   * @brief [CROSSING-STANDSTILL-RESET] update crossing_standstill_reset_ (see AvoidanceParameters::
+   * enable_crossing_standstill_reset).  Called every cycle before getCurrentModuleState().
+   */
+  void updateCrossingStandstillReset(const AvoidancePlanningData & data);
+
   bool canTransitSuccessState() override;
 
   bool canTransitFailureState() override { return false; }
@@ -545,6 +551,11 @@ private:
 
   // TODO(Satoshi OTA) create detected object manager.
   ObjectDataArray stored_objects_;
+
+  // [CROSSING-STANDSTILL-RESET] since when every reset condition but the clear time holds, and
+  // whether the shift lines are dropped this cycle.
+  std::optional<rclcpp::Time> crossing_standstill_clear_since_;
+  bool crossing_standstill_reset_{false};
 
   // Side each target object was passed on last cycle, by uuid (AvoidancePlanningData::
   // previous_avoid_side). Replaced every cycle with the current targets; deliberately not reset in

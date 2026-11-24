@@ -325,6 +325,15 @@
         enable: true                                    # [-]
         force:
           duration_time: 2.0                            # [s]
+        # [CROSSING-STANDSTILL-RESET 2026-11-24] ego standing still on a road_crossing / pre_road_crossing
+        # lanelet, still on the reference path (prefer_lateral_ratio included), no avoidance target
+        # for clear_time -> the shift lines are dropped, path straight again at once (no return shift
+        # out into the crossing).  Works without cancel.enable.
+        road_crossing_standstill_reset:
+          enable: true
+          max_speed: 0.05              # [m/s] slower = standing still
+          max_lateral_deviation: 0.1   # [m] ego further off the reference path = it drove the shift: normal return
+          clear_time: 1.0              # [s] no target this long before the reset (detections that blink)
 
       # For yield maneuver
       yield:

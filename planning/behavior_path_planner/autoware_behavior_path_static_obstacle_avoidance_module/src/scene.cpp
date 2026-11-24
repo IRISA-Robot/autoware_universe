@@ -27,9 +27,11 @@
 #include <autoware_lanelet2_extension/utility/message_conversion.hpp>
 #include <autoware_lanelet2_extension/utility/utilities.hpp>
 #include <autoware_utils/geometry/geometry.hpp>
+#include <autoware_utils/ros/uuid_helper.hpp>
 #include <autoware_utils/system/time_keeper.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -152,6 +154,13 @@ AvoidanceState StaticObstacleAvoidanceModule::getCurrentModuleState(
 
   if (has_avoidance_target) {
     return AvoidanceState::RUNNING;
+  }
+
+  // [CROSSING-STANDSTILL-RESET] Ego standing on a (pre) road crossing and still on the reference
+  // path: the shift was never driven, drop it now instead of running a return shift out into the
+  // crossing.  Before the "ego on the shift line" check below, which is exactly what held it.
+  if (crossing_standstill_reset_) {
+    return AvoidanceState::CANCEL;
   }
 
   // If the ego is on the shift line, keep RUNNING.
@@ -1973,6 +1982,9 @@ void StaticObstacleAvoidanceModule::updateData()
   // update shift line and check path safety.
   fillShiftLine(avoid_data_, debug_data_);
 
+  // [CROSSING-STANDSTILL-RESET] before fillEgoStatus(), which decides the module state.
+  updateCrossingStandstillReset(avoid_data_);
+
   // update ego behavior.
   fillEgoStatus(avoid_data_, debug_data_);
 
@@ -2015,6 +2027,95 @@ void StaticObstacleAvoidanceModule::processOnExit()
   initRTCStatus();
 }
 
+void StaticObstacleAvoidanceModule::updateCrossingStandstillReset(
+  const AvoidancePlanningData & data)
+{
+  crossing_standstill_reset_ = false;
+  const auto hold = [this]() { crossing_standstill_clear_since_.reset(); };
+
+  if (!parameters_->enable_crossing_standstill_reset || data.reference_path.points.empty()) {
+    return hold();
+  }
+
+  // Ego on a road_crossing / pre_road_crossing lanelet.
+  if (!data.closest_lanelet.has_value()) {
+    return hold();
+  }
+  const auto & ll = *data.closest_lanelet;
+  if (
+    (std::string(ll.attributeOr("road_crossing", "false")) != "true" &&
+     std::string(ll.attributeOr("pre_road_crossing", "false")) != "true")) {
+    return hold();
+  }
+
+  // Something to drop at all.
+  const bool has_shift_line = !path_shifter_.getShiftLines().empty();
+  const bool has_base_offset =
+    std::abs(path_shifter_.getBaseOffset()) > parameters_->lateral_execution_threshold;
+  if (!has_shift_line && !has_base_offset) {
+    return hold();
+  }
+
+  // Standing still.
+  if (helper_->getEgoSpeed() > parameters_->crossing_standstill_reset_max_speed) {
+    return hold();
+  }
+
+  // Physically still on the reference path (the prefer_lateral_ratio-biased one the module
+  // returns to): the straight path then runs through ego and nothing jumps.  A robot that
+  // stopped on a shifted path keeps the normal return.
+  // Segment by ego pose and yaw (a path folding back on itself must not give the other leg).
+  // calcLateralOffset() does not throw here: NaN on a degenerate path -> no reset.
+  if (data.reference_path.points.size() < 2) {
+    return hold();
+  }
+  const auto ego_position = getEgoPosition();
+  const size_t ego_seg_idx = planner_data_->findEgoSegmentIndex(data.reference_path.points);
+  const double deviation = std::abs(autoware::motion_utils::calcLateralOffset(
+    data.reference_path.points, ego_position, ego_seg_idx));
+  if (!std::isfinite(deviation)) {
+    return hold();
+  }
+  if (deviation > parameters_->crossing_standstill_reset_max_lateral_deviation) {
+    RCLCPP_INFO_THROTTLE(
+      getLogger(), *clock_, 5000,
+      "[CROSSING-STANDSTILL-RESET] not dropping the shift: ego is %.2f m off the reference path "
+      "(max %.2f), normal return.",
+      deviation, parameters_->crossing_standstill_reset_max_lateral_deviation);
+    return hold();
+  }
+
+  // No avoidance target (same test as getCurrentModuleState(), lost targets still compensated).
+  for (const auto & o : data.target_objects) {
+    if (helper_->isAbsolutelyNotAvoidable(o)) continue;
+    RCLCPP_INFO_THROTTLE(
+      getLogger(), *clock_, 2000,
+      "[CROSSING-STANDSTILL-RESET] blocked by target %s label=%u lost_time=%.1fs moving=%d "
+      "dist=%.1fm",
+      autoware_utils::to_hex_string(o.object.object_id).substr(0, 8).c_str(),
+      static_cast<unsigned>(utils::getHighestProbLabel(o.object.classification)), o.lost_time,
+      static_cast<int>(o.move_time > 0.0), o.longitudinal);
+    return hold();
+  }
+
+  const auto now = clock_->now();
+  if (!crossing_standstill_clear_since_) {
+    crossing_standstill_clear_since_ = now;
+  }
+  const double clear_for = (now - *crossing_standstill_clear_since_).seconds();
+  if (clear_for < parameters_->crossing_standstill_reset_clear_time) {
+    return;
+  }
+
+  crossing_standstill_reset_ = true;
+  RCLCPP_INFO(
+    getLogger(),
+    "[CROSSING-STANDSTILL-RESET] lanelet %ld: ego standing %.2f m off the reference path, no "
+    "target for %.1f s -> dropping %zu shift line(s) (base offset %.2f), path straight again.",
+    ll.id(), deviation, clear_for, path_shifter_.getShiftLines().size(),
+    path_shifter_.getBaseOffset());
+}
+
 void StaticObstacleAvoidanceModule::initVariables()
 {
   helper_->reset();
@@ -2026,6 +2127,8 @@ void StaticObstacleAvoidanceModule::initVariables()
   resetPathReference();
   arrived_path_end_ = false;
   ignore_signal_ids_.clear();
+  crossing_standstill_reset_ = false;
+  crossing_standstill_clear_since_.reset();
 }
 
 void StaticObstacleAvoidanceModule::initRTCStatus()

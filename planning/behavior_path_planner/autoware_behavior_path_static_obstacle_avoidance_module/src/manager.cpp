@@ -217,6 +217,18 @@ void StaticObstacleAvoidanceModuleManager::updateModuleParams(
   {
     const std::string ns = "avoidance.cancel.";
     update_param<double>(parameters, ns + "force.duration_time", p->force_deactivate_duration_time);
+    update_param<bool>(
+      parameters, ns + "road_crossing_standstill_reset.enable",
+      p->enable_crossing_standstill_reset);
+    update_param<double>(
+      parameters, ns + "road_crossing_standstill_reset.max_speed",
+      p->crossing_standstill_reset_max_speed);
+    update_param<double>(
+      parameters, ns + "road_crossing_standstill_reset.max_lateral_deviation",
+      p->crossing_standstill_reset_max_lateral_deviation);
+    update_param<double>(
+      parameters, ns + "road_crossing_standstill_reset.clear_time",
+      p->crossing_standstill_reset_clear_time);
   }
 
   {
